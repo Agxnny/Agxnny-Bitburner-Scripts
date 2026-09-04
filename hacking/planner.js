@@ -1,7 +1,7 @@
 import { publishPlannerState, readPlannerState } from "/lib/runtime-state.js";
 import { analyzeNetwork, getAvailablePortOpeners } from "/lib/network.js";
 import { rankEligibleTargets } from "/lib/targets.js";
-import { quietArgs, tprint } from "/lib/output.js";
+import { isQuiet, quietArgs, tprint } from "/lib/output.js";
 
 const WORKER_FILES = Object.freeze([
     "/hacking/workers/hack.js",
@@ -17,8 +17,11 @@ const WORKER_FILES = Object.freeze([
  * Netscript RAM costs themselves.
  *
  * A baseline refresh must not temporarily overwrite an already-valid economic
- * target. The baseline #1 is published separately, while the previous economic
+ * target. The baseline #1 is published separately, while any previous economic
  * winner is preserved until the economic selector replaces it with a fresh one.
+ *
+ * Internal kickstart runs stay quiet so the terminal is not flooded. A direct
+ * manual `run hacking/planner.js` still prints the full report.
  *
  * @param {NS} ns
  */
@@ -30,8 +33,7 @@ export async function main(ns) {
     const tools = getAvailablePortOpeners(ns);
 
     const previousEconomicHost = String(previous?.economicSelection?.hostname ?? "");
-    const previousWasEconomic = String(previous?.selectionModel ?? "").startsWith("GOAL_ETA_WITH_PREP_COST");
-    const preservedEconomicTarget = previousWasEconomic && previousEconomicHost
+    const preservedEconomicTarget = previousEconomicHost
         ? rankings.find((target) => target.hostname === previousEconomicHost) ?? null
         : null;
     const selectedTarget = preservedEconomicTarget ?? baselineSelectedTarget;
@@ -80,26 +82,29 @@ export async function main(ns) {
 
     publishPlannerState(ns, snapshot);
 
-    tprint(ns, "=== TARGET / RAM PLANNER ===");
+    const internalKickstart = ns.args.some((arg) => String(arg) === "--kickstart");
+    if (!internalKickstart && !isQuiet(ns)) {
+        tprint(ns, "=== TARGET / RAM PLANNER ===");
 
-    if (!baselineSelectedTarget) {
-        tprint(ns, "No currently-eligible money target found.");
-    } else {
-        tprint(ns, `Baseline: #${baselineSelectedTarget.rank} ${baselineSelectedTarget.hostname}`);
-        if (preservedEconomicTarget) {
-            tprint(ns, `Active:   ${preservedEconomicTarget.hostname} (preserved economic target pending refresh)`);
+        if (!baselineSelectedTarget) {
+            tprint(ns, "No currently-eligible money target found.");
+        } else {
+            tprint(ns, `Baseline: #${baselineSelectedTarget.rank} ${baselineSelectedTarget.hostname}`);
+            if (preservedEconomicTarget) {
+                tprint(ns, `Active:   ${preservedEconomicTarget.hostname} (preserved economic target pending refresh)`);
+            }
+            tprint(ns, `Score:    ${ns.format.number(baselineSelectedTarget.score, 2)}`);
+            tprint(ns, `Chance:   ${(baselineSelectedTarget.hacking.chance * 100).toFixed(1)}%`);
+            tprint(ns, `Hack time:${(baselineSelectedTarget.timing.hackMs / 1000).toFixed(1)}s`);
+            tprint(ns, `Money:    ${(baselineSelectedTarget.money.percent * 100).toFixed(1)}% of max`);
+            tprint(ns, `Security: +${baselineSelectedTarget.security.delta.toFixed(2)} above minimum`);
         }
-        tprint(ns, `Score:    ${ns.format.number(baselineSelectedTarget.score, 2)}`);
-        tprint(ns, `Chance:   ${(baselineSelectedTarget.hacking.chance * 100).toFixed(1)}%`);
-        tprint(ns, `Hack time:${(baselineSelectedTarget.timing.hackMs / 1000).toFixed(1)}s`);
-        tprint(ns, `Money:    ${(baselineSelectedTarget.money.percent * 100).toFixed(1)}% of max`);
-        tprint(ns, `Security: +${baselineSelectedTarget.security.delta.toFixed(2)} above minimum`);
-    }
 
-    const totalRam = executionHosts.reduce((sum, host) => sum + host.maxRam, 0);
-    tprint(ns, `RAM hosts: ${executionHosts.length} (${ns.format.ram(totalRam)} total max RAM)`);
-    tprint(ns, `Network:   ${network.discovered} discovered | ${network.rooted} rooted | ${network.hgwTargets} HGW target(s)`);
-    tprint(ns, "Planner snapshot published.");
+        const totalRam = executionHosts.reduce((sum, host) => sum + host.maxRam, 0);
+        tprint(ns, `RAM hosts: ${executionHosts.length} (${ns.format.ram(totalRam)} total max RAM)`);
+        tprint(ns, `Network:   ${network.discovered} discovered | ${network.rooted} rooted | ${network.hgwTargets} HGW target(s)`);
+        tprint(ns, "Planner snapshot published.");
+    }
 
     if (String(ns.args[0] ?? "") === "--kickstart") {
         const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 1)));
