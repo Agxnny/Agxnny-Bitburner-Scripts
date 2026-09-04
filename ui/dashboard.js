@@ -1,4 +1,5 @@
 import {
+    RuntimePort,
     isControllerStateStale,
     publishManualMoneyGoalState,
     readCloudPurchaseState,
@@ -22,8 +23,10 @@ let activeTab = "Overview";
 let requestedTab = "Overview";
 let requestedTest = null;
 let requestedGoalAction = null;
+let requestedControllerAction = null;
 let actionStatus = "Ready";
 let goalStatus = "Ready";
+let controllerActionStatus = "Ready";
 let goalInput = "";
 let goalLabelInput = "";
 let cachedState = null;
@@ -56,6 +59,16 @@ export async function main(ns) {
             requestedTest = null;
             ns.writePort(TEST_REQUEST_PORT, JSON.stringify({ test: test.id, requestedAt: now }));
             actionStatus = `${test.label} queued`;
+            dirty = true;
+        }
+
+        if (requestedControllerAction) {
+            const action = requestedControllerAction;
+            requestedControllerAction = null;
+            ns.writePort(RuntimePort.CONTROL_REQUESTS, JSON.stringify({ ...action, requestedAt: now }));
+            controllerActionStatus = action.action === "PREP_TARGET"
+                ? `Prep request queued for ${action.target || "current target"}`
+                : "Resume automatic HGW request queued";
             dirty = true;
         }
 
@@ -150,6 +163,7 @@ function header(s) {
     const live = Boolean(s.controller) && !isControllerStateStale(s.controller);
     const target = s.economic?.selectedTarget;
     const locked = Boolean(s.manualGoal?.active);
+    const prep = c.prep ?? {};
     return el("div", { style: styles.header },
         el("div", null,
             el("div", { style: styles.eyebrow }, "AGXNNY AUTOMATION"),
@@ -161,6 +175,8 @@ function header(s) {
         el("div", { style: styles.badges },
             badge(live ? "CONTROLLER ONLINE" : "CONTROLLER WAITING", live ? "good" : "dim"),
             badge(String(c.phase ?? "BOOTING"), live ? "accent" : "dim"),
+            prep.active ? badge(`PREP ${prep.stage || "ACTIVE"}`, "warn") : null,
+            prep.hold ? badge("PREPARED HOLD", "good") : null,
             badge(locked ? "SPENDING LOCKED" : "AUTO SPEND", locked ? "warn" : "good"),
         ),
     );
@@ -198,6 +214,7 @@ function overviewView(s) {
             heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} execution hosts`),
             heroMetric("CASH GOAL", moneyFmt(goal.remaining), goal.title ?? "No active goal"),
         ),
+        card("Target prep controls", prepControls(s), true),
         grid(
             card("Active HGW", el("div", null,
                 kv("Desired money", pct(m.desiredPercent)),
@@ -217,6 +234,39 @@ function overviewView(s) {
             card("Economy", economySummary(s)),
             card("System health", healthSummary(s)),
         ),
+    );
+}
+
+function prepControls(s) {
+    const c = s.controller ?? {};
+    const prep = c.prep ?? {};
+    const target = String(c.hostname ?? "");
+    const mode = prep.hold ? "PREPARED / HOLDING"
+        : prep.active ? `PREP ${prep.stage || "ACTIVE"}`
+            : "AUTOMATIC HGW";
+    const noTarget = !target;
+
+    return el("div", null,
+        el("div", { style: styles.controlGrid },
+            el("div", null,
+                kv("Target", target || "waiting"),
+                kv("Mode", mode),
+                kv("Goal", "100% money → minimum security"),
+            ),
+            el("div", { style: styles.controlActions },
+                el("button", {
+                    disabled: noTarget,
+                    onClick: () => { requestedControllerAction = { action: "PREP_TARGET", target }; },
+                    style: { ...styles.primaryButton, ...(noTarget ? styles.disabledButton : {}) },
+                }, "Prep target to 100%"),
+                el("button", {
+                    onClick: () => { requestedControllerAction = { action: "RESUME_AUTO" }; },
+                    style: styles.clearButton,
+                }, "Resume auto HGW"),
+            ),
+        ),
+        el("div", { style: styles.goalHint }, "Prep mode deliberately keeps growing even as security rises. Once money reaches 100%, it switches to weaken-only until minimum security, then holds the target prepared for batching."),
+        el("div", { style: styles.goalStatus }, prep.lastMessage || controllerActionStatus),
     );
 }
 
@@ -552,9 +602,12 @@ const styles = {
     actionButton: { fontFamily: "monospace", marginRight: "8px", marginBottom: "8px", padding: "7px 10px", borderRadius: "5px", border: "1px solid #32536a", background: "#112334", color: "#b8dcf4", cursor: "pointer" },
     actionStatus: { color: "#7f8e9c", fontSize: "10px", marginTop: "4px" },
     goalForm: { display: "grid", gridTemplateColumns: "1.25fr 1fr auto auto", gap: "8px", alignItems: "center" },
+    controlGrid: { display: "grid", gridTemplateColumns: "1fr auto", gap: "16px", alignItems: "center" },
+    controlActions: { display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "flex-end" },
     input: { minWidth: 0, fontFamily: "monospace", color: "#d8e1e9", background: "#0b1117", border: "1px solid #2b3945", borderRadius: "5px", padding: "8px 9px", outline: "none", fontSize: "11px" },
     primaryButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #2e5c7d", background: "#12304a", color: "#bfe4ff", cursor: "pointer", whiteSpace: "nowrap" },
     clearButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #5b4930", background: "#271e11", color: "#f0cf91", cursor: "pointer", whiteSpace: "nowrap" },
+    disabledButton: { opacity: 0.45, cursor: "default" },
     goalHint: { color: "#687888", fontSize: "9px", marginTop: "8px" },
     goalStatus: { color: "#9dc7e4", fontSize: "10px", marginTop: "7px" },
     command: { marginBottom: "9px" },
