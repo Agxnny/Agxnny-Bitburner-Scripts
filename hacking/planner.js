@@ -58,6 +58,6 @@ export async function main(ns) {
 
     if (String(ns.args[0] ?? "") === "--kickstart") {
         const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 1)));
-        ns.spawn("/kickstart.js", 1, nextStage);
+        ns.spawn("/kickstart.js", { threads: 1, spawnDelay: 0 }, nextStage);
     }
 }
