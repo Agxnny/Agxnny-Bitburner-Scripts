@@ -9,6 +9,7 @@
     "network/inspect.js",
     "network/root.js",
     "diagnostics/dashboard.js",
+    "gitpull-self-update.js",
     "gitpull.js"
   ]
 }
