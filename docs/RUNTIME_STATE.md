@@ -19,9 +19,10 @@ The project uses Netscript ports as lightweight shared transport between persist
 | 9 | Root/tool state | Latest-value snapshot |
 | 10 | Cloud capacity action state | Latest-value snapshot |
 | 11 | Manual money-goal state | Latest-value snapshot |
-| 12 | Batch state | Latest-value snapshot |
+| 12 | Current batch state | Latest-value snapshot |
 | 13 | Controller requests | Event queue |
 | 14 | Batch timing events | Event queue |
+| 15 | Latest completed batch | Latest-value snapshot |
 
 Snapshot writers replace the prior value. Ports 13 and 14 are intentionally consumed as queues.
 
@@ -47,36 +48,22 @@ lastBatchId: latest completed batch id
 lastMessage: user-facing controller explanation
 ```
 
-## Port 2 — planner state
+## Ports 2–11
 
-Published by the network/target planner and augmented by economic selection. Important data includes analyzed/ranked targets, selected target, execution hosts, worker RAM information, network/root capability summary, and `economicSelection`.
-
-## Port 3 — tactical plan
-
-Published by `hacking/tactical-planner.js`. Includes target hostname, controller request id, requested action, calculated threads, timing/security/money analysis, planner host, and optional forced tactical mode.
-
-## Ports 4 and 5 — hack events and income telemetry
-
-Hack workers/telemetry attach batch metadata where applicable.
-
-```text
-standalone HGW HACK completion
-    → may trigger strategic review
-
-batch-associated HACK completion
-    → must NOT trigger strategic review yet
-    → wait for Port 12 full batch COMPLETE
-```
-
-## Ports 7–11
-
+- Port 2: planner state, rankings, execution hosts, and economic selection.
+- Port 3: tactical plan state.
+- Port 4: HACK completion events used by income/strategic telemetry.
+- Port 5: income telemetry snapshot.
+- Port 6: diagnostic request queue.
 - Port 7: economy/progression state.
 - Port 8: economic target state and post-batch review freshness timestamp.
 - Port 9: root/tool state.
 - Port 10: cloud-capacity action state.
 - Port 11: manual money-goal / spending-lock state.
 
-## Port 12 — batch state
+Batch-associated HACK completion must not trigger standalone strategic review; the system waits for the full Port 12 batch completion boundary.
+
+## Port 12 — current batch state
 
 Published by `hacking/batch-runner.js`.
 
@@ -132,9 +119,9 @@ landingErrorMs
 complete
 ```
 
-A stage may be allocated across several hosts. Its `actualLandingAt` is therefore the latest completion timestamp among all allocations for that stage; `firstCompletionAt` and `allocationSpreadMs` expose how widely split allocations completed.
+A stage may be allocated across several hosts. Its `actualLandingAt` is the latest completion timestamp among all allocations for that stage; `firstCompletionAt` and `allocationSpreadMs` expose how widely split allocations completed.
 
-Port 12 remains a latest-value snapshot, not a historical batch log.
+Port 12 is intentionally the **current/latest batch** slot. Once another batch begins it may replace the just-completed state.
 
 ## Port 13 — controller command queue
 
@@ -172,6 +159,14 @@ The batch runner drains this queue while its worker jobs are active and aggregat
 Port 14 is deliberately separate from Port 4 so timing events from GROW/WEAKEN cannot interfere with strategic HACK completion handling.
 
 Because batching is currently serialized, the runner clears stale Port 14 events immediately before launching a new batch. This queue-handling rule must change before overlapping/pipelined batches are allowed.
+
+## Port 15 — latest completed batch state
+
+Whenever a synchronized batch reaches `COMPLETE`, `hacking/batch-runner.js` copies the complete Port 12 payload to Port 15.
+
+Port 15 is not a historical log. It retains exactly one completed batch so the GUI can continue displaying recovery and landing measurements after Port 12 advances to the next planning/running batch.
+
+The dedicated Batch tab reads Port 12 for **current batch** status and Port 15 for **last completed batch** telemetry. The same `landing.stages[]` data is used for the planned-vs-actual visual timeline.
 
 ## Queue design rule
 
