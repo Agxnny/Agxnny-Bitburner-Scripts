@@ -1,4 +1,5 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
+import { publishControllerState } from "/lib/runtime-state.js";
 
 /**
  * Foundation controller.
@@ -18,6 +19,7 @@ export async function main(ns) {
     while (true) {
         updateObservedState(ns, state);
         chooseFoundationAction(state);
+        publishControllerState(ns, state);
 
         ns.clearLog();
         ns.print(JSON.stringify(state, null, 2));
