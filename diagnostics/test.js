@@ -132,6 +132,7 @@ function testProgressionAdvisor(ns) {
         const ram = Number(ns.getServerMaxRam(hostname)) || 0;
         return ram > 0 && ram < advice.context.cloud.ramLimit;
     });
+    const homeCore = advice.context.homeCore;
 
     lines.push(`Mode:       ${advice.mode}`);
     lines.push(`Goal:       ${goal.title}`);
@@ -141,14 +142,17 @@ function testProgressionAdvisor(ns) {
     lines.push(`Income:     $${ns.format.number(goal.incomePerSecond, 2)}/s (${goal.incomeSource})`);
     lines.push(`Candidates: ${advice.candidates.length}`);
     lines.push(`Selected:   ${goal.type} | value ${Number(goal.valueScore ?? 0).toFixed(2)}`);
+    lines.push(`Home core:  ${advice.context.homeRam}GB / ${homeCore.thresholdRam}GB | ${homeCore.belowThreshold ? "BOOSTED" : "normal"}`);
+    lines.push(`Core need:  ${homeCore.scriptRam.toFixed(2)}GB + ${homeCore.reserveRam.toFixed(2)}GB reserve = ${homeCore.requiredRam.toFixed(2)}GB`);
     lines.push(`Cloud fleet:${advice.context.cloud.owned}/${advice.context.cloud.serverLimit} | max ${advice.context.cloud.ramLimit}GB`);
-    if (home) lines.push(`Home RAM:   $${ns.format.number(home.cost, 2)} | +${home.addedRam}GB | value ${home.valueScore.toFixed(2)}`);
+    if (home) lines.push(`Home RAM:   $${ns.format.number(home.cost, 2)} | +${home.addedRam}GB | weight ${home.valueMetrics.roleWeight.toFixed(2)}x | value ${home.valueScore.toFixed(2)}`);
     if (cloud) lines.push(`Cloud new:  $${ns.format.number(cloud.cost, 2)} | +${cloud.addedRam}GB | value ${cloud.valueScore.toFixed(2)}`);
     if (cloudUpgrade) lines.push(`Cloud up:   ${cloudUpgrade.metadata.hostname} ${cloudUpgrade.metadata.currentRam}GB -> ${cloudUpgrade.metadata.targetRam}GB | $${ns.format.number(cloudUpgrade.cost, 2)} | value ${cloudUpgrade.valueScore.toFixed(2)}`);
     else lines.push("Cloud up:   no eligible owned server yet");
 
+    const expectedHomeWeight = homeCore.belowThreshold ? 3.0 : 1.5;
     const checks = [
-        [Number(advice.version) >= 3, "advisor schema version >= 3"],
+        [Number(advice.version) >= 4, "advisor schema version >= 4"],
         [Array.isArray(advice.candidates) && advice.candidates.length >= 2, "multiple progression candidates"],
         [Boolean(goal.id), "selected goal id"],
         [Number.isFinite(Number(goal.cost)) && Number(goal.cost) >= 0, "goal cost"],
@@ -159,6 +163,8 @@ function testProgressionAdvisor(ns) {
         [Boolean(cloud) || advice.context.cloud.owned >= advice.context.cloud.serverLimit, "PURCHASED_SERVER candidate or fleet full"],
         [GoalType.CLOUD_SERVER_UPGRADE === "CLOUD_SERVER_UPGRADE", "CLOUD_SERVER_UPGRADE goal type"],
         [!eligibleUpgradeExists || Boolean(cloudUpgrade), "cloud upgrade candidate when an owned server is upgradeable"],
+        [Number.isFinite(homeCore.thresholdRam) && homeCore.thresholdRam >= homeCore.requiredRam, "dynamic home core threshold"],
+        [Number(home?.valueMetrics?.roleWeight) === expectedHomeWeight, "home RAM threshold weighting"],
         [Boolean(goal.model?.valueModel), "value-model metadata"],
     ];
 
@@ -167,7 +173,7 @@ function testProgressionAdvisor(ns) {
         lines.push(`Missing/invalid: ${failures.join(", ")}`);
         return { ok: false, lines };
     }
-    lines.push("Advisor can rank home RAM, new cloud capacity, and the best next cloud-server upgrade through one shared schema.");
+    lines.push("Advisor boosts home RAM while below the dynamically measured core-script threshold, then returns to normal weighting after it is met.");
     return { ok: true, lines };
 }
 
@@ -181,7 +187,7 @@ function printTestList(ns) {
     ns.tprint("Tests:");
     ns.tprint("  controller-state     Validate live controller target/money/security state");
     ns.tprint("  telemetry-state      Validate the income telemetry collector snapshot");
-    ns.tprint("  progression-advisor  Validate home/new-server/server-upgrade progression ranking");
+    ns.tprint("  progression-advisor  Validate progression ranking and dynamic home-RAM weighting");
     ns.tprint("  all                  Run every available test (default)");
 }
 
