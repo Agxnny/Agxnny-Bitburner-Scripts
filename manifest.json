@@ -3,6 +3,7 @@
     "hacking/controller.js",
     "hacking/dispatch.js",
     "hacking/planner.js",
+    "hacking/tactical-planner.js",
     "hacking/targets.js",
     "hacking/thread-plan.js",
     "hacking/workers/hack.js",
