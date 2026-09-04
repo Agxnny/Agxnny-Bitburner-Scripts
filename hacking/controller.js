@@ -169,12 +169,18 @@ export async function main(ns) {
                 state.execution.lastDispatch = dispatch;
                 state.threads.launched = dispatch.launched;
                 state.threads.remaining = dispatch.remaining;
+                const startedAt = Date.now();
+                const expectedDurationMs = Math.max(0, getEstimatedActionTimeMs(state, state.action));
+                const expectedFinishAt = expectedDurationMs > 0 ? startedAt + expectedDurationMs : 0;
                 activeJobs = dispatch.allocations.map((allocation) => ({
                     hostname: allocation.hostname,
                     pid: allocation.pid,
                     threads: allocation.threads,
                     action: state.action,
                     target: state.hostname,
+                    startedAt,
+                    expectedDurationMs,
+                    expectedFinishAt,
                 }));
 
                 if (dispatch.launched > 0) {
@@ -188,7 +194,9 @@ export async function main(ns) {
                         target: state.hostname,
                         threads: dispatch.launched,
                         jobs: activeJobs.length,
-                        startedAt: Date.now(),
+                        startedAt,
+                        expectedDurationMs,
+                        expectedFinishAt,
                     };
                 } else {
                     state.tactical.status = "READY";
@@ -219,6 +227,7 @@ export async function main(ns) {
         syncPrepState(state, prep);
         syncTargetControlState(state, targetControl);
         syncExecutionModeState(state, executionMode, batchJob);
+        updateExecutionState(ns, state, planner, activeJobs);
         state.updatedAt = Date.now();
         publishControllerState(ns, state);
         if (!quiet) {
@@ -592,6 +601,23 @@ function updateObservedState(ns, state) {
 
 function updateExecutionState(ns, state, planner, activeJobs) {
     const pool = summarizeExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB);
+    const workers = activeJobs.map((job) => ({
+        pid: job.pid,
+        hostname: job.hostname,
+        threads: job.threads,
+        action: job.action,
+        target: job.target,
+        startedAt: Number(job.startedAt ?? 0),
+        expectedDurationMs: Number(job.expectedDurationMs ?? 0),
+        expectedFinishAt: Number(job.expectedFinishAt ?? 0),
+    }));
+    const expectedFinishAt = workers.reduce((latest, job) => Math.max(latest, job.expectedFinishAt || 0), 0);
+    const startedAt = workers.reduce((earliest, job) => {
+        const value = Number(job.startedAt ?? 0);
+        if (!(value > 0)) return earliest;
+        return earliest > 0 ? Math.min(earliest, value) : value;
+    }, 0);
+
     state.execution.homeReserveGb = pool.homeReserveGb;
     state.execution.hostCount = pool.hostCount;
     state.execution.maxRam = pool.maxRam;
@@ -600,6 +626,14 @@ function updateExecutionState(ns, state, planner, activeJobs) {
     state.execution.usableRam = pool.usableRam;
     state.execution.activeJobs = activeJobs.length;
     state.execution.activeThreads = activeJobs.reduce((sum, job) => sum + job.threads, 0);
+    state.execution.activeWorkers = workers;
+    state.execution.currentAction = workers.length ? {
+        action: String(workers[0].action ?? ""),
+        target: String(workers[0].target ?? ""),
+        startedAt,
+        expectedFinishAt,
+        expectedDurationMs: expectedFinishAt > 0 && startedAt > 0 ? Math.max(0, expectedFinishAt - startedAt) : 0,
+    } : null;
 }
 
 function launchBatchRunner(ns, planner, state) {
