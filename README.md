@@ -27,7 +27,9 @@ Tabs: **Overview, Targets, Economy, Batch, Network, Diagnostics**.
 
 The dashboard mounts its React tree once. Tab selection is React-local and immediate; Netscript I/O stays in the asynchronous dashboard loop. React callbacks remain Netscript-free.
 
-The dedicated **Batch** tab separates synchronized-HWGW telemetry from the main Overview page. It shows the current batch, the latest completed batch, recovery-model error, timing/order measurements, per-stage landing details, and a planned-vs-actual landing timeline.
+The dedicated **Batch** tab separates synchronized-HWGW telemetry from the main Overview page. It shows the current batch, planned H/W1/G/W2 landing countdowns, W2 ETA, planned total duration, the latest completed batch, recovery-model error, timing/order measurements, per-stage landing details, and a planned-vs-actual landing timeline.
+
+Overview now also exposes standalone execution observability: current action ETA plus an **Active Workers** panel showing action/target, host, threads, elapsed time, and remaining estimate. Workers may be highlighted `LATE` after an observational grace margin, but automatic killing is intentionally not enabled yet.
 
 ## Architecture summary
 
@@ -38,6 +40,7 @@ The dedicated **Batch** tab separates synchronized-HWGW telemetry from the main 
 - Manual target override, prep-and-hold, and manual money-goal/spending-lock controls are available in the GUI.
 - Automatic cloud capacity actions follow the progression advisor and respect the manual spending lock.
 - Batch-associated HACK telemetry does not trigger strategic review until the full batch is complete.
+- Execution-mode changes pause new scheduling and finish already-running target-side work before applying the new mode.
 
 ## Current batching status
 
@@ -123,4 +126,5 @@ run hacking/batch-runner.js n00dles 0.10 200 1
 2. measure worst landing error, allocation spread, and minimum stage spacing;
 3. decide whether the 200 ms gap needs tuning/adaptation;
 4. implement overlapping/pipelined batches only after timing is understood;
-5. later optimize global RAM scheduling and multi-target execution.
+5. after batch timing is stable, design watchdog kill/recovery rules from observed worker timing;
+6. later optimize global RAM scheduling and multi-target execution.
