@@ -7,6 +7,7 @@ import {
     readControllerState,
     readEconomyState,
     readEconomyTargetState,
+    readLastCompletedBatchState,
     readManualMoneyGoalState,
     readPlannerState,
     readRootState,
@@ -16,7 +17,7 @@ import { readTelemetryState } from "/lib/telemetry.js";
 
 const TEST_REQUEST_PORT = 6;
 const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
-const TABS = Object.freeze(["Overview", "Targets", "Economy", "Network", "Diagnostics"]);
+const TABS = Object.freeze(["Overview", "Targets", "Economy", "Batch", "Network", "Diagnostics"]);
 const UI_SYNC_MS = 100;
 const MAIN_TICK_MS = 25;
 const DATA_REFRESH_MS = 1000;
@@ -45,10 +46,6 @@ export async function main(ns) {
     stateVersion += 1;
     lastDataRefresh = Date.now();
 
-    // Mount the React tree once. Repeated clearLog()/printRaw() calls remount the
-    // entire dashboard, which makes navigation and controls compete with the
-    // Netscript refresh loop. DashboardRoot owns presentation-only UI state and
-    // observes cached snapshots through stateVersion; callbacks remain Netscript-free.
     ns.clearLog();
     ns.printRaw(el(DashboardRoot));
 
@@ -126,6 +123,7 @@ function snapshot(ns) {
         purchase: readCloudPurchaseState(ns),
         manualGoal: readManualMoneyGoalState(ns),
         batch: readBatchState(ns),
+        lastCompletedBatch: readLastCompletedBatchState(ns),
     };
 }
 
@@ -200,6 +198,7 @@ function nav(activeTab, setActiveTab) {
 function activeView(s, activeTab) {
     if (activeTab === "Targets") return targetsView(s);
     if (activeTab === "Economy") return economyView(s);
+    if (activeTab === "Batch") return batchView(s);
     if (activeTab === "Network") return networkView(s);
     if (activeTab === "Diagnostics") return diagnosticsView(s);
     return overviewView(s);
@@ -272,7 +271,7 @@ function executionModeControls(s) {
         batch.status ? el("div", { style: styles.miniGrid },
             kv("Batch status", batch.status),
             kv("Batch target", batch.target || "—"),
-            kv("Threads", `${Number(batchThreads.hack ?? 0)}H / ${Number(batchThreads.weakenHack ?? 0)}W / ${Number(batchThreads.grow ?? 0)}G / ${Number(batchThreads.weakenGrow ?? 0)}W`),
+            kv("Threads", batchThreadsText(batchThreads)),
         ) : null,
     );
 }
@@ -458,6 +457,133 @@ function economyView(s) {
     );
 }
 
+function batchView(s) {
+    const current = s.batch ?? {};
+    const last = s.lastCompletedBatch ?? null;
+    const currentThreads = current.threads ?? {};
+    const mode = s.controller?.executionMode ?? {};
+
+    return el("div", null,
+        el("div", { style: styles.heroGrid },
+            heroMetric("CURRENT", current.status ?? "IDLE", current.target || "no active batch"),
+            heroMetric("THREADS", current.status ? batchThreadsText(currentThreads) : "—", current.status ? `${Number(current.launchedJobs ?? 0)} worker allocations` : "waiting"),
+            heroMetric("GAP", `${Number(current.gapMs ?? mode.batchGapMs ?? 200)} ms`, mode.awaitingReview ? "post-batch review waiting" : "review barrier ready"),
+            heroMetric("LAST COMPLETE", last ? age(last.finishedAt) : "none", last?.target || "waiting for completed batch"),
+        ),
+        card("Current batch", el("div", null,
+            kv("Status", current.status ?? "IDLE"),
+            kv("Batch ID", current.batchId ?? "—"),
+            kv("Target", current.target ?? "—"),
+            kv("Threads", current.status ? batchThreadsText(currentThreads) : "—"),
+            kv("Hack fraction", Number.isFinite(Number(current.actualHackFraction)) ? `${(Number(current.actualHackFraction) * 100).toFixed(2)}%` : "—"),
+            kv("Reserved RAM", Number.isFinite(Number(current.totalRam)) ? ramFmt(current.totalRam) : "—"),
+            kv("Landing window", Number.isFinite(Number(current.timing?.landingWindowMs)) ? msFmt(current.timing.landingWindowMs) : "—"),
+            kv("Review barrier", mode.awaitingReview ? "WAITING" : "READY"),
+            note(current.reason || mode.lastMessage || "Waiting for batch state"),
+        ), true),
+        last ? card("Planned vs actual landing timeline", batchTimingGraph(last), true) : null,
+        last ? grid(
+            card("Last completed recovery", batchRecovery(last)),
+            card("Last completed timing", batchTiming(last)),
+        ) : card("Last completed batch", note("No retained completed batch yet. The next completed batch will remain visible here even after another batch begins."), true),
+        last ? card("Stage landing detail", batchStageDetails(last), true) : null,
+        last ? card("Adjacent landing spacing", batchSpacingDetails(last), true) : null,
+    );
+}
+
+function batchTimingGraph(batch) {
+    const stages = Array.isArray(batch.landing?.stages) ? batch.landing.stages : [];
+    const usable = stages.filter((stage) => Number(stage.plannedLandingAt) > 0 && Number(stage.actualLandingAt) > 0);
+    if (!usable.length) return note("No completed stage timing is available for the retained batch yet.");
+
+    const allTimes = usable.flatMap((stage) => [Number(stage.plannedLandingAt), Number(stage.actualLandingAt)]);
+    const minTime = Math.min(...allTimes);
+    const maxTime = Math.max(...allTimes);
+    const naturalSpan = Math.max(1, maxTime - minTime);
+    const padding = Math.max(30, Number(batch.gapMs ?? 200) * 0.35);
+    const axisStart = minTime - padding;
+    const axisEnd = maxTime + padding;
+    const axisSpan = Math.max(1, axisEnd - axisStart);
+    const position = (time) => `${Math.max(0, Math.min(100, ((Number(time) - axisStart) / axisSpan) * 100)).toFixed(2)}%`;
+
+    return el("div", null,
+        el("div", { style: styles.timelineLegend },
+            el("span", { style: styles.timelineLegendItem }, el("span", { style: styles.timelinePlannedLegend }), " planned"),
+            el("span", { style: styles.timelineLegendItem }, el("span", { style: styles.timelineActualLegend }), " actual"),
+            el("span", { style: styles.timelineLegendHint }, `window ${naturalSpan.toFixed(0)} ms`),
+        ),
+        ...usable.map((stage) => el("div", { key: stage.name, style: styles.timelineRow },
+            el("div", { style: styles.timelineLabel }, stageShort(stage.name)),
+            el("div", { style: styles.timelineTrack },
+                el("div", { style: styles.timelineBaseline }),
+                el("div", { title: `planned ${stage.plannedLandingAt}`, style: { ...styles.timelineMarkerPlanned, left: position(stage.plannedLandingAt) } }),
+                el("div", { title: `actual ${stage.actualLandingAt}`, style: { ...styles.timelineMarkerActual, left: position(stage.actualLandingAt) } }),
+            ),
+            el("div", { style: styles.timelineError }, signedMs(stage.landingErrorMs)),
+        )),
+        el("div", { style: styles.timelineAxis },
+            el("span", null, `-${Math.round(minTime - axisStart)}ms`),
+            el("span", null, "planned window →"),
+            el("span", null, `+${Math.round(axisEnd - maxTime)}ms`),
+        ),
+        note("Planned marker left of actual = late landing. Actual left of planned = early landing. Near-overlap means the stage landed close to schedule."),
+    );
+}
+
+function batchRecovery(batch) {
+    const predicted = batch.predicted ?? {};
+    const final = batch.final ?? {};
+    const comparison = batch.comparison ?? {};
+    return el("div", null,
+        kv("Batch", batch.batchId ?? "—"),
+        kv("Target", batch.target ?? "—"),
+        kv("Threads", batchThreadsText(batch.threads ?? {})),
+        kv("Predicted money", pctFine(predicted.finalMoneyPercent)),
+        kv("Actual money", pctFine(final.moneyPercent)),
+        kv("Money error", signedPp(comparison.moneyPercentError)),
+        kv("Predicted security Δ", signedNum(predicted.finalSecurityDelta, 3)),
+        kv("Actual security Δ", signedNum(final.securityDelta, 3)),
+        kv("Security error", signedNum(comparison.securityDeltaError, 3)),
+        kv("Duration", msFmt(batch.durationMs)),
+    );
+}
+
+function batchTiming(batch) {
+    const landing = batch.landing ?? {};
+    const order = Array.isArray(landing.actualOrder) && landing.actualOrder.length
+        ? landing.actualOrder.map(stageShort).join(" → ")
+        : "—";
+    return el("div", null,
+        kv("Order", `${order}${landing.orderCorrect ? " ✓" : landing.actualOrder ? " ✕" : ""}`),
+        kv("Minimum spacing", msFmt(landing.minimumSpacingMs)),
+        kv("Maximum drift", msFmt(landing.maxAbsLandingErrorMs)),
+        kv("Worker events", `${Number(landing.reportedJobs ?? 0)} / ${Number(landing.expectedJobs ?? 0)}`),
+        kv("Missing events", String(landing.missingJobs ?? 0)),
+        kv("Completed", age(batch.finishedAt)),
+        note(landing.orderCorrect
+            ? "Observed stage order matches H → W1 → G → W2. Use minimum spacing and maximum drift to judge the 200 ms safety margin."
+            : "Timing data is incomplete or the observed stage order differs from the planned H → W1 → G → W2 sequence."),
+    );
+}
+
+function batchStageDetails(batch) {
+    const stages = Array.isArray(batch.landing?.stages) ? batch.landing.stages : [];
+    if (!stages.length) return note("No stage landing telemetry recorded for this completed batch.");
+    return el("div", null, ...stages.map((stage) => kv(
+        stageShort(stage.name),
+        `error ${signedMs(stage.landingErrorMs)} · spread ${msFmt(stage.allocationSpreadMs)} · jobs ${Number(stage.reportedJobs ?? 0)}/${Number(stage.expectedJobs ?? 0)}`,
+    )));
+}
+
+function batchSpacingDetails(batch) {
+    const spacing = Array.isArray(batch.landing?.adjacentSpacing) ? batch.landing.adjacentSpacing : [];
+    if (!spacing.length) return note("No adjacent landing-spacing telemetry recorded for this completed batch.");
+    return el("div", null, ...spacing.map((entry) => kv(
+        `${stageShort(entry.from)} → ${stageShort(entry.to)}`,
+        msFmt(entry.spacingMs),
+    )));
+}
+
 function networkView(s) {
     const n = s.planner?.network ?? {};
     const root = s.root ?? {};
@@ -501,6 +627,7 @@ function diagnosticsView(s) {
             kv("Target strategy", age(s.economic?.updatedAt)),
             kv("Cloud capacity", age(s.purchase?.updatedAt)),
             kv("Batch", age(s.batch?.updatedAt)),
+            kv("Last complete", age(s.lastCompletedBatch?.finishedAt)),
         )),
         card("Commands", el("div", null,
             command("RAM audit", "run diagnostics/mem-audit.js"),
@@ -609,6 +736,47 @@ function command(label, value) {
     );
 }
 
+function batchThreadsText(threads) {
+    return `${Number(threads?.hack ?? 0)}H / ${Number(threads?.weakenHack ?? 0)}W / ${Number(threads?.grow ?? 0)}G / ${Number(threads?.weakenGrow ?? 0)}W`;
+}
+
+function stageShort(name) {
+    if (name === "WEAKEN_HACK") return "W1";
+    if (name === "WEAKEN_GROW") return "W2";
+    if (name === "HACK") return "H";
+    if (name === "GROW") return "G";
+    return String(name ?? "?");
+}
+
+function msFmt(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? `${n.toFixed(0)} ms` : "—";
+}
+
+function signedMs(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "—";
+    return `${n >= 0 ? "+" : ""}${n.toFixed(0)} ms`;
+}
+
+function signedNum(value, digits = 3) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "—";
+    return `${n >= 0 ? "+" : ""}${n.toFixed(digits)}`;
+}
+
+function signedPp(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "—";
+    const pp = n * 100;
+    return `${pp >= 0 ? "+" : ""}${pp.toFixed(3)} pp`;
+}
+
+function pctFine(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? `${(n * 100).toFixed(2)}%` : "—";
+}
+
 function parseMoney(value) {
     const text = String(value ?? "").trim().toLowerCase().replaceAll(",", "").replaceAll("$", "");
     const match = text.match(/^([0-9]+(?:\.[0-9]+)?)([kmbt]?)$/);
@@ -699,6 +867,19 @@ const styles = {
     controlGrid: { display: "grid", gridTemplateColumns: "1fr auto", gap: "16px", alignItems: "center" },
     controlActions: { display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "flex-end" },
     miniGrid: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: "10px", marginTop: "8px" },
+    timelineLegend: { display: "flex", alignItems: "center", gap: "16px", marginBottom: "10px", fontSize: "10px", color: "#8090a0" },
+    timelineLegendItem: { display: "inline-flex", alignItems: "center", gap: "5px" },
+    timelineLegendHint: { marginLeft: "auto", color: "#617181" },
+    timelinePlannedLegend: { width: "9px", height: "9px", borderRadius: "50%", border: "2px solid #8ed0ff", background: "transparent", display: "inline-block" },
+    timelineActualLegend: { width: "9px", height: "9px", borderRadius: "50%", background: "#ffd479", display: "inline-block" },
+    timelineRow: { display: "grid", gridTemplateColumns: "40px 1fr 80px", gap: "10px", alignItems: "center", margin: "9px 0" },
+    timelineLabel: { color: "#dbe5ee", fontWeight: 700, fontSize: "11px" },
+    timelineTrack: { position: "relative", height: "18px" },
+    timelineBaseline: { position: "absolute", left: 0, right: 0, top: "8px", height: "2px", background: "#24303b" },
+    timelineMarkerPlanned: { position: "absolute", top: "3px", width: "10px", height: "10px", marginLeft: "-6px", borderRadius: "50%", border: "2px solid #8ed0ff", background: "#10161d", zIndex: 2 },
+    timelineMarkerActual: { position: "absolute", top: "5px", width: "10px", height: "10px", marginLeft: "-5px", borderRadius: "50%", background: "#ffd479", boxShadow: "0 0 0 2px #10161d", zIndex: 3 },
+    timelineError: { color: "#9fb0bf", fontSize: "10px", textAlign: "right" },
+    timelineAxis: { display: "flex", justifyContent: "space-between", color: "#5f7080", fontSize: "9px", margin: "2px 80px 0 50px" },
     input: { minWidth: 0, fontFamily: "monospace", color: "#d8e1e9", background: "#0b1117", border: "1px solid #2b3945", borderRadius: "5px", padding: "8px 9px", outline: "none", fontSize: "11px" },
     primaryButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #2e5c7d", background: "#12304a", color: "#bfe4ff", cursor: "pointer", whiteSpace: "nowrap" },
     clearButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #5b4930", background: "#271e11", color: "#f0cf91", cursor: "pointer", whiteSpace: "nowrap" },
