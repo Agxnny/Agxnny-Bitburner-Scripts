@@ -53,4 +53,9 @@ export async function main(ns) {
 
     ns.tprint(`Deployment complete: ${success}/${remoteHosts.length} host(s).`);
     ns.tprint(`Files per host: ${files.length} (workers + tactical planner dependencies)`);
+
+    if (String(ns.args[0] ?? "") === "--kickstart") {
+        const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 2)));
+        ns.spawn("/kickstart.js", 1, nextStage);
+    }
 }
