@@ -1,5 +1,13 @@
 # Architecture
 
+## Documentation and source of truth
+
+The GitHub `main` branch is the source of truth. Before modifying an existing script, fetch/read the current repository version rather than relying on an older chat snippet.
+
+For a new development chat, read `docs/HANDOFF.md` first. The rest of the documentation set is indexed in `docs/README.md`.
+
+After major architectural changes, refresh the affected docs before considering the change complete.
+
 ## Core principle
 
 Game logic and presentation stay separate. Home is the **control plane**: orchestration, state coordination, GUI/dashboard, updater, and lightweight persistent services belong there. Rooted and cloud servers are the **execution plane**: HGW workers, tactical analysis, and timed batch execution should run remotely whenever possible.
@@ -128,7 +136,7 @@ Batch state is published on Port 12 with thread counts, landing timestamps, allo
 
 Batch-internal HACK telemetry is not treated as a standalone strategic checkpoint. `hacking/refresh.js` waits for Port 12 to report the entire batch as `COMPLETE` before running the strategic chain.
 
-The controller now enforces the other half of this boundary: when its batch runner exits successfully, it enters `BATCH_REVIEW` and refuses to launch another batch until Port 8 has a newer economic-target snapshot than the completed batch.
+The controller enforces the other half of this boundary: when its batch runner exits successfully, it enters `BATCH_REVIEW` and refuses to launch another batch until Port 8 has a newer economic-target snapshot than the completed batch.
 
 ```text
 batch COMPLETE
@@ -145,6 +153,31 @@ next batch may launch
 ```
 
 This prevents a second batch from launching using strategy state calculated before the previous batch finished recovering.
+
+## Current batch correctness issue
+
+The automatic batch control path is integrated, but **single-batch security recovery is not yet correct enough for pipelining**.
+
+Latest live observation on `sigma-cosmetics`:
+
+```text
+25H / 1W / 298G / 1W
+final money: 100%
+final security: +1.13
+```
+
+The controller correctly detected the remaining security and launched a standalone weaken correction after strategic review. That repair path is a safety mechanism, not the desired steady-state result.
+
+Before overlapping batches are implemented, investigate the batch runner's security-effect formulas and exact current Bitburner API semantics for:
+
+- `hackAnalyzeSecurity`;
+- `growthAnalyzeSecurity`;
+- `weakenAnalyze`;
+- core/thread arguments and worker allocation behavior.
+
+The desired single-batch steady state is recovery to the intended money baseline and approximately minimum security without an inter-batch repair phase.
+
+See `docs/HANDOFF.md` and `docs/TESTING.md` for the current evidence and acceptance criteria.
 
 ## Progression and cloud capacity
 
@@ -207,6 +240,8 @@ The spender does not override non-cloud progression priorities. If home RAM or a
 | 12 | synchronized batch state |
 | 13 | controller command queue |
 
+See `docs/RUNTIME_STATE.md` for the detailed state/command contract.
+
 ## Development stages
 
 ### Stage 1 — foundation
@@ -235,9 +270,10 @@ The spender does not override non-cloud progression priorities. If home RAM or a
 - one-shot HWGW runner
 - full-batch RAM reservation
 - batch runtime state
-- timing/recovery validation
 - controller automatic single-batch handoff
 - strict post-batch review barrier
+- **current: correct and validate security recovery**
+- predicted-vs-actual batch recovery telemetry
 
 ### Stage 5 — pipelined batching
 - landing drift monitoring
@@ -249,5 +285,8 @@ The spender does not override non-cloud progression priorities. If home RAM or a
 
 ### Stage 6 — future systems
 - controller/dispatcher RAM split
-- predicted-versus-actual calibration
+- service RAM reservation
+- predicted-versus-actual economic calibration
 - stock runtime state and independent stock GUI
+
+See `docs/ROADMAP.md` for the prioritized roadmap.
