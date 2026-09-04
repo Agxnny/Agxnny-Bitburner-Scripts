@@ -40,8 +40,9 @@ export async function main(ns) {
 
         if (!manualTarget && activeJobs.length === 0 && !tacticalJob) {
             const previousTarget = state.hostname;
+            const previousMoneyTarget = state.money.desiredPercent;
             state = adoptLatestPlannerTarget(planner, state);
-            if (state.hostname !== previousTarget) pendingRequestId = "";
+            if (state.hostname !== previousTarget || state.money.desiredPercent !== previousMoneyTarget) pendingRequestId = "";
         }
 
         updateObservedState(ns, state);
@@ -95,7 +96,7 @@ export async function main(ns) {
                     state.reason += " | calculated plan ready, waiting for deployable RAM";
                 }
             } else if (!tacticalJob) {
-                const request = launchTacticalPlanner(ns, planner, state.hostname, ++requestSequence);
+                const request = launchTacticalPlanner(ns, planner, state, ++requestSequence);
                 if (request.pid > 0) {
                     tacticalJob = request;
                     pendingRequestId = request.requestId;
@@ -131,6 +132,9 @@ function createManualState(hostname) {
     const state = createTargetState(hostname);
     state.selection.mode = "MANUAL";
     state.selection.rank = 0;
+    state.strategy.hackPercent = 0.10;
+    state.strategy.growTargetPercent = 1;
+    state.money.desiredPercent = 1;
     return state;
 }
 
@@ -139,6 +143,7 @@ function createStateFromPlanner(planner) {
     if (!selected?.hostname) return null;
     const state = createTargetState(selected.hostname);
     applyPlannerAnalysis(state, selected);
+    applyEconomicStrategy(state, planner);
     return state;
 }
 
@@ -148,9 +153,11 @@ function adoptLatestPlannerTarget(planner, currentState) {
     if (selected.hostname !== currentState.hostname) {
         const nextState = createTargetState(selected.hostname);
         applyPlannerAnalysis(nextState, selected);
+        applyEconomicStrategy(nextState, planner);
         return nextState;
     }
     applyPlannerAnalysis(currentState, selected);
+    applyEconomicStrategy(currentState, planner);
     return currentState;
 }
 
@@ -167,6 +174,20 @@ function applyPlannerAnalysis(state, analysis) {
     state.analysis.growth = Number(analysis.growth ?? 0);
     state.strategy.score = state.selection.score;
     state.strategy.expectedIncomePerSecond = state.selection.score;
+}
+
+function applyEconomicStrategy(state, planner) {
+    const economic = planner?.economicSelection;
+    const applies = economic?.hostname === state.hostname;
+    const hackFraction = applies ? Number(economic?.hackFraction ?? 0.10) : 0.10;
+    const moneyTargetPercent = applies ? Number(economic?.moneyTargetPercent ?? 1) : 1;
+
+    state.strategy.hackPercent = clamp(hackFraction, 0.001, 0.99);
+    state.strategy.growTargetPercent = clamp(moneyTargetPercent, 0.01, 1);
+    state.money.desiredPercent = state.strategy.growTargetPercent;
+    if (applies) {
+        state.strategy.expectedIncomePerSecond = Number(economic?.steadyIncomePerSecond ?? state.strategy.expectedIncomePerSecond ?? 0);
+    }
 }
 
 function updateObservedState(ns, state) {
@@ -189,13 +210,27 @@ function updateExecutionState(ns, state, planner, activeJobs) {
     state.execution.activeThreads = activeJobs.reduce((sum, job) => sum + job.threads, 0);
 }
 
-function launchTacticalPlanner(ns, planner, target, sequence) {
+function launchTacticalPlanner(ns, planner, state, sequence) {
     const scriptRam = ns.getScriptRam(TACTICAL_PLANNER_SCRIPT, "home");
     const requestId = `tactical-${Date.now()}-${sequence}`;
+    const target = state.hostname;
     if (scriptRam <= 0) return { pid: 0, hostname: "", requestId, target };
+
+    const hackFraction = clamp(Number(state.strategy.hackPercent ?? 0.10), 0.001, 0.99);
+    const moneyTargetPercent = clamp(Number(state.money.desiredPercent ?? 1), 0.01, 1);
+
     for (const host of getExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB)) {
         if (host.usableRam < scriptRam) continue;
-        const pid = ns.exec(TACTICAL_PLANNER_SCRIPT, host.hostname, 1, target, requestId, ...quietArgs(ns));
+        const pid = ns.exec(
+            TACTICAL_PLANNER_SCRIPT,
+            host.hostname,
+            1,
+            target,
+            requestId,
+            hackFraction,
+            moneyTargetPercent,
+            ...quietArgs(ns),
+        );
         if (pid > 0) return { pid, hostname: host.hostname, requestId, target, scriptRam };
     }
     return { pid: 0, hostname: "", requestId, target, scriptRam };
@@ -209,8 +244,8 @@ function applyTacticalPlan(state, plan) {
     state.phase = String(plan.next?.phase ?? state.phase);
     state.action = String(plan.next?.action ?? ActionType.NONE);
     state.reason = String(plan.next?.reason ?? "Tactical plan ready");
-    state.strategy.hackPercent = Number(plan.options?.hackFraction ?? 0);
-    state.strategy.growTargetPercent = Number(plan.options?.moneyTargetPercent ?? 1);
+    state.strategy.hackPercent = Number(plan.options?.hackFraction ?? state.strategy.hackPercent ?? 0.10);
+    state.strategy.growTargetPercent = Number(plan.options?.moneyTargetPercent ?? state.money.desiredPercent ?? 1);
     state.money.desiredPercent = state.strategy.growTargetPercent;
     state.threads.hack = Number(plan.threads?.hack ?? 0);
     state.threads.grow = Number(plan.threads?.grow ?? 0);
@@ -256,12 +291,12 @@ function chooseFoundationAction(state) {
     if (state.money.max > 0 && state.money.current < moneyTarget) {
         state.phase = TargetPhase.MONEY_PREP;
         state.action = ActionType.GROW;
-        state.reason = "Money is below the current desired level";
+        state.reason = `Money is below the ${(state.money.desiredPercent * 100).toFixed(0)}% strategy target`;
         return;
     }
     state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.HACK;
-    state.reason = "Target is prepared; awaiting tactical production calculation";
+    state.reason = `Target is prepared to ${(state.money.desiredPercent * 100).toFixed(0)}%; awaiting tactical production calculation`;
 }
 
 function createCompletionEvent(operation, state) {
@@ -289,7 +324,7 @@ function getEstimatedActionTimeMs(state, action) {
 function printControllerState(ns, state) {
     ns.print("=== CONTROLLER STATE ===");
     ns.print(`Target:    ${state.hostname} | ${state.phase} | ${state.action}`);
-    ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%)`);
+    ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%) | desired ${(state.money.desiredPercent * 100).toFixed(0)}%`);
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
     ns.print(`Threads:   ${state.execution.activeThreads} active | ${state.execution.activeJobs} job(s)`);
     ns.print(`Tactical:  ${state.tactical.status}`);
@@ -297,7 +332,7 @@ function printControllerState(ns, state) {
 }
 
 function formatTargetState(state) {
-    return `${state.hostname} | money $${formatCompactNumber(state.money.current)}/$${formatCompactNumber(state.money.max)} (${moneyPercent(state).toFixed(1)}%) | security ${state.security.current.toFixed(2)}/${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`;
+    return `${state.hostname} | money $${formatCompactNumber(state.money.current)}/$${formatCompactNumber(state.money.max)} (${moneyPercent(state).toFixed(1)}%, desired ${(state.money.desiredPercent * 100).toFixed(0)}%) | security ${state.security.current.toFixed(2)}/${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`;
 }
 
 function moneyPercent(state) {
@@ -341,4 +376,9 @@ function formatDuration(milliseconds) {
 
 function formatNumber(value) {
     return Number(value).toFixed(2);
+}
+
+function clamp(value, minimum, maximum) {
+    if (!Number.isFinite(value)) return minimum;
+    return Math.min(maximum, Math.max(minimum, value));
 }
