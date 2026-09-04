@@ -3,22 +3,16 @@ import {
     drainHackEvents,
     publishTelemetryState,
 } from "/lib/telemetry.js";
+import { isQuiet } from "/lib/output.js";
 
 const ONE_MINUTE_MS = 60_000;
 const FIVE_MINUTES_MS = 5 * ONE_MINUTE_MS;
 const MAX_RECENT_HACKS = 12;
 
-/**
- * Persistent low-RAM HGW income collector.
- *
- * Runs on a rooted remote RAM host. Hack workers publish actual ns.hack() return
- * values to Port 4; this collector consumes them and publishes an aggregate
- * snapshot on Port 5 for controllers, diagnostics, guidance, and the dashboard.
- *
- * @param {NS} ns
- */
+/** Persistent low-RAM HGW income collector. */
 export async function main(ns) {
     ns.disableLog("sleep");
+    const quiet = isQuiet(ns);
 
     const startedAt = Date.now();
     let totalMoney = 0;
@@ -111,14 +105,16 @@ export async function main(ns) {
 
         publishTelemetryState(ns, snapshot);
 
-        ns.clearLog();
-        ns.print("=== HGW INCOME TELEMETRY ===");
-        ns.print(`Total:       $${ns.format.number(totalMoney, 2)}`);
-        ns.print(`Lifetime:    $${ns.format.number(snapshot.incomePerSecond, 2)}/s`);
-        ns.print(`Last 1 min:  $${ns.format.number(snapshot.incomePerSecond1m, 2)}/s`);
-        ns.print(`Last 5 min:  $${ns.format.number(snapshot.incomePerSecond5m, 2)}/s`);
-        ns.print(`Hack events: ${hackEvents} (${successfulEvents} successful / ${failedEvents} zero)`);
-        ns.print(`RAM usage:   ${(snapshot.execution.utilization * 100).toFixed(1)}%`);
+        if (!quiet) {
+            ns.clearLog();
+            ns.print("=== HGW INCOME TELEMETRY ===");
+            ns.print(`Total:       $${ns.format.number(totalMoney, 2)}`);
+            ns.print(`Lifetime:    $${ns.format.number(snapshot.incomePerSecond, 2)}/s`);
+            ns.print(`Last 1 min:  $${ns.format.number(snapshot.incomePerSecond1m, 2)}/s`);
+            ns.print(`Last 5 min:  $${ns.format.number(snapshot.incomePerSecond5m, 2)}/s`);
+            ns.print(`Hack events: ${hackEvents} (${successfulEvents} successful / ${failedEvents} zero)`);
+            ns.print(`RAM usage:   ${(snapshot.execution.utilization * 100).toFixed(1)}%`);
+        }
 
         await ns.sleep(1000);
     }
