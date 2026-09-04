@@ -5,6 +5,7 @@
     "hacking/workers/grow.js",
     "hacking/workers/weaken.js",
     "lib/network.js",
+    "lib/runtime-state.js",
     "lib/state.js",
     "network/inspect.js",
     "network/root.js",
