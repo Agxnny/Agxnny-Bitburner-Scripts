@@ -28,15 +28,17 @@ export async function main(ns) {
     const branch = String(flags.branch);
     const baseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
     const manifestPath = "repo-manifest.json";
-    const cacheBust = Date.now();
 
     ns.tprint(`Pulling ${owner}/${repo}@${branch}...`);
+    ns.tprint("Clean pull: existing managed files will be removed and replaced.");
+    ns.tprint("");
 
     if (ns.fileExists(manifestPath, "home")) {
-        ns.rm(manifestPath, "home");
+        const removedManifest = ns.rm(manifestPath, "home");
+        if (removedManifest) ns.tprint(`REMOVED   ${manifestPath}`);
     }
 
-    const manifestUrl = `${baseUrl}/manifest.json?ts=${cacheBust}`;
+    const manifestUrl = `${baseUrl}/manifest.json?ts=${Date.now()}`;
     const manifestOk = await ns.wget(manifestUrl, manifestPath, "home");
 
     if (!manifestOk) {
@@ -44,6 +46,9 @@ export async function main(ns) {
         ns.tprint(`Tried: ${manifestUrl}`);
         return;
     }
+
+    ns.tprint(`DOWNLOADED ${manifestPath}`);
+    ns.tprint("");
 
     let manifest;
     try {
@@ -69,6 +74,8 @@ export async function main(ns) {
     ];
 
     let succeeded = 0;
+    let replaced = 0;
+    let added = 0;
     const failed = [];
 
     for (const file of orderedFiles) {
@@ -78,11 +85,12 @@ export async function main(ns) {
             const removed = ns.rm(file, "home");
             if (!removed) {
                 failed.push(file);
-                ns.tprint(`FAIL ${file}`);
-                ns.tprint("     Could not remove existing file.");
+                ns.tprint(`FAILED    ${file}`);
+                ns.tprint("          Could not remove existing file.");
                 continue;
             }
-            ns.tprint(`DEL  ${file}`);
+
+            ns.tprint(`REMOVED   ${file}`);
         }
 
         const url = `${baseUrl}/${file}?ts=${Date.now()}`;
@@ -90,22 +98,35 @@ export async function main(ns) {
 
         if (ok) {
             succeeded++;
-            ns.tprint(`${existed ? "NEW " : "ADD "} ${file}`);
+
+            if (existed) {
+                replaced++;
+                ns.tprint(`REPLACED  ${file}`);
+            } else {
+                added++;
+                ns.tprint(`ADDED     ${file}`);
+            }
         } else {
             failed.push(file);
-            ns.tprint(`FAIL ${file}`);
-            ns.tprint(`     ${url}`);
+            ns.tprint(`FAILED    ${file}`);
+            ns.tprint(`          ${url}`);
         }
     }
 
     ns.rm(manifestPath, "home");
 
     ns.tprint("");
-    ns.tprint(`Pull complete: ${succeeded}/${files.length} file(s) installed fresh.`);
+    ns.tprint("========== CLEAN PULL COMPLETE ==========");
+    ns.tprint(`Successful : ${succeeded}/${files.length}`);
+    ns.tprint(`Replaced   : ${replaced}`);
+    ns.tprint(`Added      : ${added}`);
+    ns.tprint(`Failed     : ${failed.length}`);
 
-    if (failed.length > 0) {
-        ns.tprint(`Failed: ${failed.join(", ")}`);
-        ns.tprint("WARNING: Failed files may now be missing because clean pull removes the old copy first.");
+    if (failed.length === 0) {
+        ns.tprint("CONFIRMED: All managed files were freshly installed.");
+    } else {
+        ns.tprint(`Failed files: ${failed.join(", ")}`);
+        ns.tprint("WARNING: Failed files may be missing because clean pull removes the old copy first.");
     }
 }
 
