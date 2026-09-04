@@ -83,10 +83,11 @@ export async function main(ns) {
         return;
     }
 
+    const preferredGoal = goal.title ?? goalType ?? "another goal";
     publishCloudPurchaseState(ns, {
         ...baseState,
         status: "NO_CLOUD_CAPACITY_GOAL",
-        reason: `Progression advisor currently prefers ${String(goal.title ?? goalType || "another goal")}; no automatic cloud spend is authorized.`,
+        reason: `Progression advisor currently prefers ${String(preferredGoal)}; no automatic cloud spend is authorized.`,
     });
 }
 
