@@ -13,6 +13,13 @@ const PREP_PENALTY_SCALE_SECONDS = 30 * 60;
 const PREP_PENALTY_MAX_EXPONENT = 8;
 const MONEY_TARGET_CANDIDATES = Object.freeze([0.25, 0.40, 0.55, 0.70, 0.85, 1.00]);
 
+// If player cash is at least 200% ABOVE a server's maximum money (3x its max),
+// that server is normally too small to materially advance the current economy.
+// We exclude it when at least one larger viable target remains. If every target
+// would be excluded, the filter falls back instead of leaving AUTO mode targetless.
+const PLAYER_CASH_EXCESS_IGNORE_PERCENT = 200;
+const PLAYER_CASH_TO_SERVER_MAX_LIMIT = 1 + PLAYER_CASH_EXCESS_IGNORE_PERCENT / 100;
+
 /**
  * Short-lived economic strategy selector.
  *
@@ -22,9 +29,9 @@ const MONEY_TARGET_CANDIDATES = Object.freeze([0.25, 0.40, 0.55, 0.70, 0.85, 1.0
  * distributed thread capacity available right now. Long prep is penalized
  * exponentially, then the strategy is compared by progression-goal ETA.
  *
- * The winner therefore answers two questions at once:
- *   1. which server should we attack?
- *   2. how far should we prepare its money before production?
+ * Targets that are trivial relative to current player cash are filtered out when
+ * a larger viable alternative exists. The rejected-target reasoning is published
+ * so diagnostics can explain why a server was ignored.
  *
  * @param {NS} ns
  */
@@ -50,6 +57,7 @@ export async function main(ns) {
     const weakenPerThread = Math.max(0.000001, Number(ns.weakenAnalyze(1)) || 0.05);
     const goalRemaining = Math.max(0, Number(economy?.goal?.remaining ?? 0));
     const hasCashGoal = goalRemaining > 0;
+    const playerCash = Math.max(0, Number(economy?.cash ?? 0));
 
     const context = {
         goalRemaining,
@@ -60,25 +68,34 @@ export async function main(ns) {
         weakenPerThread,
     };
 
-    const candidates = rankings
+    const evaluated = rankings
         .map((target) => evaluateBestTargetStrategy(ns, target, context))
         .filter(Boolean);
 
-    candidates.sort(compareStrategies);
+    const valueFiltered = applyCashValueFilter(evaluated, playerCash);
+    const candidates = valueFiltered.candidates.sort(compareStrategies);
 
     const selected = candidates[0] ?? null;
     const updatedAt = Date.now();
     publishEconomyTargetState(ns, {
-        version: 5,
+        version: 6,
         updatedAt,
         plannerUpdatedAt: Number(planner?.analysisUpdatedAt ?? planner?.updatedAt ?? 0),
         economyUpdatedAt: Number(economy?.updatedAt ?? 0),
         goal: economy?.goal ?? null,
-        cash: Math.max(0, Number(economy?.cash ?? 0)),
+        cash: playerCash,
         usableRam: execution.usableRam,
         executionCapacity: execution,
         controllerUpdatedAt: Number(controller?.updatedAt ?? 0),
         moneyTargetCandidates: MONEY_TARGET_CANDIDATES,
+        cashValueFilter: {
+            model: "PLAYER_CASH_VS_SERVER_MAX_V1",
+            ignoreWhenCashPercentAboveServerMax: PLAYER_CASH_EXCESS_IGNORE_PERCENT,
+            cashToServerMaxLimit: PLAYER_CASH_TO_SERVER_MAX_LIMIT,
+            fallbackUsed: valueFiltered.fallbackUsed,
+            rejectedCount: valueFiltered.rejected.length,
+        },
+        rejectedTargets: valueFiltered.rejected,
         prepPenalty: {
             model: "EXPONENTIAL_30M_V1",
             scaleSeconds: PREP_PENALTY_SCALE_SECONDS,
@@ -95,7 +112,7 @@ export async function main(ns) {
                 ...planner,
                 updatedAt,
                 selectedTarget: selectedAnalysis,
-                selectionModel: "GOAL_ETA_ADAPTIVE_MONEY_V5",
+                selectionModel: "GOAL_ETA_ADAPTIVE_MONEY_VALUE_FILTER_V6",
                 economicSelection: {
                     hostname: selected.hostname,
                     baselineRank: selected.baselineRank,
@@ -110,13 +127,52 @@ export async function main(ns) {
                     reason: selected.reason,
                     strategyAlternatives: selected.strategyAlternatives,
                     goalRemaining,
-                    cash: Math.max(0, Number(economy?.cash ?? 0)),
+                    cash: playerCash,
                     goal: economy?.goal ?? null,
                     executionCapacity: execution,
+                    cashValueFilter: {
+                        ignoreWhenCashPercentAboveServerMax: PLAYER_CASH_EXCESS_IGNORE_PERCENT,
+                        fallbackUsed: valueFiltered.fallbackUsed,
+                    },
                 },
             });
         }
     }
+}
+
+function applyCashValueFilter(candidates, playerCash) {
+    const accepted = [];
+    const rejected = [];
+
+    for (const candidate of candidates) {
+        const serverMaxMoney = Math.max(0, Number(candidate.serverMaxMoney ?? 0));
+        const cashToServerMaxRatio = serverMaxMoney > 0 ? playerCash / serverMaxMoney : Infinity;
+        const shouldReject = playerCash > 0
+            && serverMaxMoney > 0
+            && cashToServerMaxRatio >= PLAYER_CASH_TO_SERVER_MAX_LIMIT;
+
+        if (!shouldReject) {
+            accepted.push(candidate);
+            continue;
+        }
+
+        rejected.push({
+            hostname: candidate.hostname,
+            baselineRank: candidate.baselineRank,
+            serverMaxMoney,
+            playerCash,
+            cashToServerMaxRatio,
+            cashPercentAboveServerMax: (cashToServerMaxRatio - 1) * 100,
+            reason: `ignored: player cash is ${((cashToServerMaxRatio - 1) * 100).toFixed(0)}% above server max money`,
+        });
+    }
+
+    if (accepted.length > 0 || candidates.length === 0) {
+        return { candidates: accepted, rejected, fallbackUsed: false };
+    }
+
+    // Avoid deadlocking AUTO mode if every currently accessible server is small.
+    return { candidates: [...candidates], rejected, fallbackUsed: true };
 }
 
 function evaluateBestTargetStrategy(ns, target, context) {
@@ -222,6 +278,7 @@ function evaluateTargetStrategy(ns, target, context, moneyTargetPercent) {
     return {
         hostname,
         baselineRank: Number(target.rank ?? 0),
+        serverMaxMoney: moneyMax,
         moneyPercent,
         moneyTargetPercent,
         desiredMoney,
