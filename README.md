@@ -31,7 +31,7 @@ run ui/dashboard.js
 
 The dashboard is intentionally simple and state-driven. It uses a restrained dark control-panel layout with status badges, headline metrics, compact cards, progress bars, and a small tab set instead of trying to put every script output on one screen.
 
-Current tabs are **Overview, Targets, Economy, Network, and Diagnostics**. The older `diagnostics/dashboard.js` remains a focused troubleshooting panel.
+Current tabs are **Overview, Targets, Economy, Network, and Diagnostics**. The Overview tab now includes target-prep controls, and the Economy tab includes the manual money-goal controls. The older `diagnostics/dashboard.js` remains a focused troubleshooting panel.
 
 ## Stock trading workspace
 
@@ -54,9 +54,19 @@ Both are currently non-trading placeholders for a later stock subsystem.
 - **Controlled cloud purchasing** can buy one advisor-approved server per strategic refresh with deterministic names `hgw-001`, `hgw-002`, ... .
 - **Manual money goal** overrides the automatic cash goal and hard-locks automated purchasing until explicitly cleared.
 - **Economic strategy selector** compares live target state, remote-only worker capacity, prep waves, exponential prep cost, desired-money percentages, progression distance, and cash-relative target value.
-- **Controller** still runs the normal production loop sequentially while the new synchronized HWGW batch path is validated separately.
+- **Controller** still runs the normal production loop sequentially while the synchronized HWGW path is validated separately.
+- **Prep-and-hold mode** can be requested from the GUI. It grows the current controller target all the way to 100% money without switching to weaken when security rises, then performs weaken-only recovery to minimum security and holds the prepared target for batch testing.
 - **Telemetry** records real hack returns and rolling income rates.
-- **Main GUI** consumes cached state and presents it without owning strategy logic.
+- **Main GUI** consumes cached state and sends lightweight controller commands without owning strategy logic.
+
+## Target prep mode
+
+The **Overview** tab provides two controller actions:
+
+- **Prep target to 100%** — keeps issuing grow work until the current target reaches full money, then switches to weaken-only until security is back at minimum.
+- **Resume auto HGW** — releases the prepared hold and returns control to the normal economic HGW strategy.
+
+Prep mode intentionally does **not** alternate grow/weaken during the money-fill phase. Once preparation is complete, the controller holds the target at 100% money / minimum security instead of immediately hacking it again. This makes it convenient for manual HWGW batch validation.
 
 ## Manual money goal / spending lock
 
@@ -85,6 +95,7 @@ While active, the goal is persisted on home, published on Port 11, used by targe
 | 10 | automated cloud-purchase state |
 | 11 | manual money-goal / spending lock |
 | 12 | latest synchronized HWGW batch state |
+| 13 | controller command queue (GUI prep/resume actions) |
 
 ## Current HGW flow
 
@@ -96,11 +107,13 @@ The main controller is still sequential while batching is validated:
 4. weaken/grow/hack using remote workers only;
 5. after HACK completion, run the strategic review chain.
 
+When prep mode is active, the tactical planner is explicitly forced into either `PREP_GROW` or `PREP_WEAKEN`, preventing its normal security-first decision rule from causing grow/weaken oscillation.
+
 There is deliberately no home worker fallback.
 
 ## First HWGW batching milestone
 
-`hacking/batch-runner.js` now provides an experimental **single synchronized HWGW batch** for a prepared target. It is not yet wired into the controller automatically.
+`hacking/batch-runner.js` provides an experimental **single synchronized HWGW batch** for a prepared target. It is not yet wired into the controller automatically.
 
 The landing order is:
 
@@ -118,7 +131,7 @@ The default gap is **200 ms**. All workers are launched up front and use the v3 
 
 The worker scripts remain backward compatible with sequential execution. Their fourth argument is now an optional `additionalMsec`, and batch metadata can be supplied in later arguments.
 
-The batch runner currently requires the target to already be prepared: security must be near minimum and money must be at the chosen desired-money level. This makes the first batching step conservative while we validate timing and recovery accuracy.
+The batch runner currently requires the target to already be prepared: security must be near minimum and money must be at the chosen desired-money level. The GUI prep mode provides a convenient way to prepare and hold the controller target at the strict 100% / minimum-security state for this test path.
 
 Example when connected to a sufficiently large remote execution host:
 
@@ -173,6 +186,7 @@ run diagnostics/progression.js
 run economy/manual-goal.js status
 run network/inspect.js
 run network/root.js
+run hacking/batch-runner.js n00dles 0.10 200 1
 ```
 
 ## Repository layout
@@ -243,11 +257,11 @@ docs/
 
 ## RAM philosophy
 
-Home RAM is control-plane capacity, not worker capacity. Persistent home processes should be small and useful; expensive short-lived analysis and timed batch execution belong on remote hosts. The GUI remains state-driven so visibility does not add expensive Netscript APIs to home.
+Home RAM is control-plane capacity, not worker capacity. Persistent home processes should be small and useful; expensive short-lived analysis and timed batch execution belong on remote hosts. The GUI remains state-driven so visibility and low-cost command controls do not add expensive analysis APIs to home.
 
 ## Roadmap
 
-1. validate single synchronized HWGW landing order and recovery accuracy;
+1. validate prep-and-hold behavior on larger targets and confirm it does not oscillate between grow/weaken;
 2. expose batch health/timing state in the main GUI;
 3. integrate the batch runner into production after targets are prepared;
 4. add a strict post-batch strategic review barrier;
