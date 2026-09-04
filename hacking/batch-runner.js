@@ -167,7 +167,12 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
     if (!(weakenPerThread > 0)) return fail(baseState, "weakenAnalyze returned zero");
 
     const hackSecurity = Math.max(0, ns.hackAnalyzeSecurity(hackThreads, target));
-    const growSecurity = Math.max(0, ns.growthAnalyzeSecurity(growThreads, target, 1));
+    // Do not pass target here. growthAnalyzeSecurity(threads, host, cores) caps
+    // the result to the grow threads needed from the target's CURRENT money.
+    // Batch planning happens while the target is prepared at max money, but the
+    // GROW stage runs only after HACK has removed money. We therefore need the
+    // uncapped per-thread security increase for every planned grow thread.
+    const growSecurity = Math.max(0, ns.growthAnalyzeSecurity(growThreads));
     const weakenHackThreads = Math.max(1, Math.ceil(hackSecurity / weakenPerThread));
     const weakenGrowThreads = Math.max(1, Math.ceil(growSecurity / weakenPerThread));
 
