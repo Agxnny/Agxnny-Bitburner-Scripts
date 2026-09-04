@@ -26,6 +26,7 @@ export async function main(ns) {
     let successfulEvents = 0;
     let failedEvents = 0;
     const recentHacks = [];
+    const rateEvents = [];
     const targets = {};
 
     while (true) {
@@ -35,13 +36,7 @@ export async function main(ns) {
             const money = Math.max(0, Number(event.money ?? 0));
             const target = String(event.target ?? "unknown");
             const finishedAt = Number(event.finishedAt ?? Date.now());
-
-            hackEvents += 1;
-            totalMoney += money;
-            if (money > 0) successfulEvents += 1;
-            else failedEvents += 1;
-
-            recentHacks.push({
+            const normalized = {
                 target,
                 money,
                 threads: Math.max(0, Number(event.threads ?? 0)),
@@ -49,8 +44,15 @@ export async function main(ns) {
                 jobId: String(event.jobId ?? ""),
                 durationMs: Math.max(0, Number(event.durationMs ?? 0)),
                 finishedAt,
-            });
+            };
 
+            hackEvents += 1;
+            totalMoney += money;
+            if (money > 0) successfulEvents += 1;
+            else failedEvents += 1;
+
+            recentHacks.push(normalized);
+            rateEvents.push(normalized);
             while (recentHacks.length > MAX_RECENT_HACKS) recentHacks.shift();
 
             if (!targets[target]) {
@@ -71,10 +73,14 @@ export async function main(ns) {
         }
 
         const now = Date.now();
+        while (rateEvents.length > 0 && rateEvents[0].finishedAt < now - FIVE_MINUTES_MS) {
+            rateEvents.shift();
+        }
+
         const controller = readControllerState(ns);
         const elapsedSeconds = Math.max(1, (now - startedAt) / 1000);
-        const money1m = recentMoney(recentHacks, now - ONE_MINUTE_MS);
-        const money5m = recentMoney(recentHacks, now - FIVE_MINUTES_MS);
+        const money1m = recentMoney(rateEvents, now - ONE_MINUTE_MS);
+        const money5m = recentMoney(rateEvents, now - FIVE_MINUTES_MS);
         const elapsed1mSeconds = Math.max(1, Math.min(60, elapsedSeconds));
         const elapsed5mSeconds = Math.max(1, Math.min(300, elapsedSeconds));
 
