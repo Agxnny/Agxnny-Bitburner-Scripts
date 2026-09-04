@@ -4,11 +4,11 @@
 
 Game logic and presentation stay separate. Home is the **control plane**: orchestration, state coordination, GUI/dashboard, updater, and other lightweight persistent services belong there. Rooted and cloud servers are the **execution plane**: HGW workers and expensive short-lived analysis should run remotely whenever possible.
 
-The main GUI consumes structured runtime state; it does not perform expensive target analysis or own HGW policy. That keeps visibility cheap and lets the same planner/controller state feed both diagnostics and future interfaces.
+The main GUI consumes structured runtime state; it does not perform expensive target analysis or own HGW policy. That keeps visibility cheap and lets the same planner/controller state feed diagnostics and future interfaces.
 
 ## Startup/control-plane entrypoint
 
-`startup.js` is now the normal human-facing entrypoint:
+`startup.js` is the normal human-facing entrypoint:
 
 ```text
 startup.js
@@ -19,21 +19,37 @@ startup.js
 planner -> deploy remote services -> economy/target ready -> controller
 ```
 
-This deliberately separates startup UX from automation bootstrap internals. `kickstart.js` remains the staged engine used after clean pulls or for low-level testing, while `startup.js` is the simple day-to-day command.
+Quiet mode is unconditional from `startup.js`. Background automation still publishes state, but presentation belongs to the GUI rather than terminal spam.
 
 ## Main GUI architecture
 
-`ui/dashboard.js` is the primary control-plane interface. It reads cached state only and currently exposes five views:
+`ui/dashboard.js` is the primary control-plane interface. It uses a simple dark control-panel layout rather than trying to reproduce every script log. The visual hierarchy is intentionally small:
 
-- **Overview** — live controller phase/action, target state, remote RAM, telemetry, economy, and system health.
-- **Targets** — economic winner, selected money percentage, prep/ETA reasoning, rankings, and filtered targets.
-- **Economy** — progression goal, manual savings lock, cloud-purchase result, and common goal commands.
-- **Network** — discovered/rooted state, port tools, recent rooting result, and remote execution hosts.
-- **Diagnostics** — live state health, test-request buttons via Port 6, state ages, and common diagnostic commands.
+- header with controller/phase/spending status badges;
+- four headline metrics on major views;
+- compact two-column cards;
+- a restrained tab bar;
+- progress/health indicators where they add meaning;
+- detailed diagnostic text only on the Diagnostics tab.
 
-The GUI uses the same cached Ports 1/2/3/5/7/8/9/10/11 already produced by the automation stack. Interactive diagnostic buttons write requests to Port 6 rather than importing expensive test APIs into the GUI.
+Current views are **Overview, Targets, Economy, Network, and Diagnostics**. All expensive work remains outside the GUI. Interactive diagnostics continue to use Port 6 requests rather than direct heavy script launches.
 
-`diagnostics/dashboard.js` remains a focused troubleshooting panel. It is not replaced by the main GUI because diagnostics and daily operation have different presentation goals.
+`diagnostics/dashboard.js` remains a focused troubleshooting panel and is not merged into the main GUI.
+
+## Separate stock workspace
+
+Stock trading is intentionally a separate subsystem and is **not part of the main dashboard or normal startup**.
+
+The reserved surfaces are:
+
+```text
+stocks/terminal.js   -> future trading-engine logs, decisions and order events
+ui/stocks.js         -> future portfolio, signals, positions, risk and controls
+```
+
+Both are currently non-trading placeholders. This boundary is deliberate: stock APIs, trading state, and stock-specific GUI features should be able to grow without increasing the persistent RAM cost or complexity of the HGW control plane.
+
+Future stock work should introduce its own runtime-state contract and only bridge into the main control plane if there is a genuinely useful high-level summary.
 
 ## Home/control-plane policy
 
@@ -47,7 +63,7 @@ Consequences:
 - controller RAM totals represent remote execution capacity rather than mixed control + worker capacity;
 - economic strategy calculations exclude home from hack/grow/weaken thread capacity so predicted waves match real dispatch behavior.
 
-This leaves home RAM for controller/orchestration, the GUI, updater, and future lightweight scheduling/control services. A later controller/dispatcher split should reduce persistent home RAM further.
+This leaves home RAM for controller/orchestration, GUI, updater, and future lightweight scheduling/control services.
 
 ## Target lifecycle
 
@@ -138,11 +154,7 @@ remote-only worker pool
 
 The shared state model is the contract between automation and presentation. Current channels cover controller, planner, tactical plan, telemetry, economy, target strategy, rooting, cloud purchasing, manual spending lock, and diagnostic requests.
 
-New GUI features should prefer extending structured state or low-cost command queues instead of directly importing expensive APIs into home-resident presentation scripts.
-
-## Guidance engine
-
-Guidance owns **what should be purchased**. Short-lived action scripts own **how to execute approved purchases**. The manual money-goal layer can revoke automatic spending authority entirely. Home RAM represents control/UI headroom; rooted/cloud RAM represents worker throughput.
+New GUI features should prefer extending structured state or low-cost command queues instead of directly importing expensive APIs into home-resident presentation scripts. The future stock subsystem should follow the same pattern with its own state contract.
 
 ## Development stages
 
@@ -170,14 +182,21 @@ Guidance owns **what should be purchased**. Short-lived action scripts own **how
 - multi-target resource allocation
 
 ### Stage 4 — control-plane GUI and guidance
-- unified tabbed GUI
-- one-command startup
+- polished unified GUI
+- one-command quiet startup
 - richer target/progression/network presentation
 - safe GUI command channels
 - progression recommendations and controlled actions
 - actual-versus-predicted metrics
 
-### Stage 5 — batching
+### Stage 5 — stock subsystem
+- dedicated stock runtime state
+- independent stock terminal
+- independent stock GUI
+- risk controls and trade execution
+- optional high-level summary bridge to control plane
+
+### Stage 6 — batching
 - timed HWGW batches
 - timing/drift monitoring
 - batch health
