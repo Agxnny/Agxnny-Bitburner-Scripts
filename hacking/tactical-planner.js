@@ -12,7 +12,8 @@ import { positionalArgs, tprint } from "/lib/output.js";
  * Positional args:
  *   [0] target hostname
  *   [1] request id supplied by the controller
- *   [2] optional hack fraction (defaults inside lib/threads.js)
+ *   [2] optional hack fraction
+ *   [3] optional desired money percentage
  * Shared flags such as --quiet are ignored for positional parsing.
  *
  * @param {NS} ns
@@ -22,6 +23,7 @@ export async function main(ns) {
     const hostname = String(args[0] ?? "");
     const requestId = String(args[1] ?? "");
     const hackFractionArg = args[2];
+    const moneyTargetPercentArg = args[3];
 
     if (!hostname) {
         tprint(ns, "ERROR: tactical-planner.js requires a target hostname.");
@@ -34,9 +36,8 @@ export async function main(ns) {
     }
 
     const options = {};
-    if (hackFractionArg !== undefined) {
-        options.hackFraction = Number(hackFractionArg);
-    }
+    if (hackFractionArg !== undefined) options.hackFraction = Number(hackFractionArg);
+    if (moneyTargetPercentArg !== undefined) options.moneyTargetPercent = Number(moneyTargetPercentArg);
 
     const plan = calculateThreadPlan(ns, hostname, options);
     const snapshot = {
