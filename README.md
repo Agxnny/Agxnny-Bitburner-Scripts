@@ -28,6 +28,14 @@ run gitpull.js
 run kickstart.js
 ```
 
+For dashboard/GUI-style operation, start the stack quietly:
+
+```text
+run kickstart.js --quiet
+```
+
+`--quiet` suppresses explicit controller/planner/service printouts while leaving state publication, telemetry, planning, and HGW work active. `kickstart.js` propagates the flag through planner, deployment, remote refresh services, the controller, and tactical-planner launches. One-off diagnostic/report scripts remain explicit tools and can continue to print when you run them manually.
+
 `kickstart.js` performs a zero-delay handoff sequence:
 
 1. refresh `hacking/planner.js`,
@@ -86,18 +94,7 @@ max money × hack percent per thread × hack chance / hack time
 
 That answers which server looks strongest in isolation. The economic selector answers a more useful early-game question: **which server is likely to get us to the current cash goal fastest from its present state?**
 
-For each eligible target it estimates:
-
-- current money percentage,
-- security prep required,
-- grow threads needed to refill the server,
-- weaken needed after growth,
-- how many RAM-limited waves those prep actions would require,
-- estimated prep time before useful production,
-- a small production-cycle hack fraction,
-- recovery grow/weaken cost,
-- estimated steady cash/sec,
-- estimated time to reach the current progression goal.
+For each eligible target it estimates current money, security prep, grow/weaken work, RAM-limited prep waves, expected cash/sec, recovery cost, and estimated time to reach the active progression goal.
 
 When a progression goal still needs cash, targets are primarily ordered by estimated goal ETA. This allows a smaller, already-prepared target to beat a high-max-money server whose grow/weaken investment would delay cash for too long. When there is no outstanding cash goal, the selector falls back toward steady income rate while still accounting for prep cost.
 
@@ -105,26 +102,13 @@ This is still a first-pass economic model. Future strategy tuning will compare m
 
 ## Progression advisor
 
-`lib/progression.js` currently compares:
-
-- home RAM upgrades,
-- buying a new cloud server,
-- the best next RAM-doubling upgrade across owned cloud servers.
-
-The shared value model is RAM gained per dollar with role weights. Home normally receives a control-node utility premium and receives a larger temporary weight when home is below the RAM tier required to host the core controller + tactical-planner stack with reserve.
+`lib/progression.js` currently compares home RAM upgrades, buying a new cloud server, and the best next RAM-doubling upgrade across owned cloud servers. The shared value model is RAM gained per dollar with role weights, with extra home-RAM weight while home is below the core automation threshold.
 
 Future candidates are intended to include port-opening programs and explicit save/hold recommendations without changing the consumer interface.
 
 ## Telemetry
 
-Distributed hack workers publish their actual `ns.hack()` return value to Port 4. `hacking/telemetry.js` runs on a rooted remote host, aggregates those events, and publishes Port 5 with:
-
-- total HGW money,
-- lifetime income/sec,
-- rolling 1-minute and 5-minute income/sec,
-- successful and zero-return hack counts,
-- recent hacks and per-target totals,
-- execution-pool utilization copied from controller state.
+Distributed hack workers publish their actual `ns.hack()` return value to Port 4. `hacking/telemetry.js` runs on a rooted remote host, aggregates those events, and publishes Port 5 with total HGW money, rolling income rates, hack-event outcomes, recent/per-target history, and execution-pool utilization copied from controller state.
 
 This avoids measuring player-money deltas, so unrelated income sources do not contaminate HGW performance data.
 
@@ -134,10 +118,13 @@ Useful commands include:
 
 ```text
 run diagnostics/dashboard.js
+run diagnostics/mem-audit.js
+run diagnostics/mem-audit.js --path
 run diagnostics/test.js --list
 run diagnostics/test.js controller-state
 run diagnostics/test.js telemetry-state
 run diagnostics/test.js progression-advisor
+run diagnostics/economy-targets.js
 run diagnostics/income.js
 run diagnostics/progression.js
 run network/inspect.js
@@ -145,6 +132,8 @@ run network/root.js
 run hacking/thread-plan.js
 run hacking/dispatch.js weaken foodnstuff 5
 ```
+
+`diagnostics/mem-audit.js` reads the managed manifest and prints the current RAM cost of every managed `.js` file. By default it sorts highest RAM first; `--path` sorts alphabetically. Imported library RAM is already included in the runnable script totals reported by Bitburner.
 
 The dashboard is intended for **live function checks only**, not as a home for every diagnostic. Expensive/manual tests stay explicit. Dashboard buttons write a request to Port 6, and the remote `diagnostics/test-launcher.js` launches the selected test off home.
 
@@ -158,42 +147,45 @@ gitpull-self-update.js
 manifest.json
 
 hacking/
-  controller.js             persistent HGW controller
-  planner.js                full network / baseline target / RAM planner
-  refresh.js                remote periodic refresh coordinator
-  economy-planner.js        short-lived cash/progression snapshot builder
-  economy-targets.js        prep-aware goal-ETA target selector
-  tactical-planner.js       short-lived expensive HGW calculation
-  dispatch.js               manual distributed-dispatch diagnostic
-  targets.js                target-ranking diagnostic
-  telemetry.js              remote income collector
-  thread-plan.js            manual HGW thread-plan diagnostic
+  controller.js
+  planner.js
+  refresh.js
+  economy-planner.js
+  economy-targets.js
+  tactical-planner.js
+  dispatch.js
+  targets.js
+  telemetry.js
+  thread-plan.js
   workers/
     hack.js
     grow.js
     weaken.js
 
 lib/
-  execution.js              RAM pool + distributed thread dispatch
-  network.js                discovery / access analysis helpers
-  progression.js            progression candidate ranking
-  runtime-state.js          Ports 1-3 and 7-8 snapshot transport
-  state.js                  target/controller state model
-  targets.js                target analysis/ranking
-  telemetry.js              Ports 4-5 telemetry transport
-  threads.js                expensive HGW thread calculator
+  execution.js
+  network.js
+  output.js                 shared --quiet / argument helpers
+  progression.js
+  runtime-state.js
+  state.js
+  targets.js
+  telemetry.js
+  threads.js
 
 network/
-  deploy.js                 copy execution/support files + start remote services
-  inspect.js                read-only network/capability diagnostic
-  root.js                   lightweight rooting pass
+  deploy.js
+  inspect.js
+  root.js
 
 diagnostics/
-  dashboard.js              lightweight cached-state live dashboard
-  income.js                 income telemetry printout
-  progression.js            progression-advisor printout
-  test.js                   named smoke/functional tests
-  test-launcher.js          remote Port-6 manual-test launcher
+  dashboard.js
+  economy-targets.js
+  income.js
+  mem-audit.js              manifest-wide RAM report
+  progression.js
+  test.js
+  test-launcher.js
 
 docs/
   architecture.md
@@ -208,7 +200,7 @@ RAM optimization is treated by lifetime and role, not by raw script size alone. 
 Current examples from Bitburner v3.0.1 testing:
 
 - `diagnostics/dashboard.js` has been reduced to cached-state-only behavior and should remain close to base script RAM.
-- `hacking/telemetry.js` is a base-cost persistent remote service.
+- `hacking/telemetry.js` is a low-cost persistent remote service and can run silently under `--quiet`.
 - `hacking/tactical-planner.js`, `hacking/planner.js`, and the economic analysis scripts are intentionally kept off the persistent home controller.
 - `hacking/controller.js` remains the next important persistent-home optimization target; a future dispatcher split can move its `exec` cost off home.
 
@@ -217,12 +209,12 @@ Current examples from Bitburner v3.0.1 testing:
 The next major layers are:
 
 1. validate periodic economic target switching against real gameplay,
-2. continue reducing persistent home RAM usage,
-3. add more progression candidate types such as port openers,
-4. use real hack-income telemetry to calibrate predicted target income,
-5. build an adaptive strategy evaluator for hack %, grow target %, recovery cost, and money/sec/GB,
-6. optimize the whole RAM pool across multiple targets,
-7. add predicted-vs-actual performance metrics,
+2. add live-state target comparisons and target-switch hysteresis,
+3. evaluate partial grow targets instead of assuming every server should reach 100%,
+4. continue reducing persistent home RAM usage,
+5. add more progression candidate types such as port openers,
+6. use real hack-income telemetry to calibrate predicted target income,
+7. optimize the whole RAM pool across multiple targets,
 8. transition from sequential HGW to timed HWGW batches,
 9. expand the persistent dashboard as new structured state becomes useful.
 
