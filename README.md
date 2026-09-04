@@ -1,14 +1,15 @@
 # Agxnny Bitburner Scripts
 
-A modular Bitburner automation project for v3.x, currently focused on an early-game distributed HGW system with low-RAM control, remote tactical planning, runtime telemetry, progression guidance, economic target selection, automatic rooting, adaptive money targeting, diagnostics, and a path toward multi-target HWGW batching.
+A modular Bitburner automation project for v3.x, currently focused on an early-game distributed HGW system with low-RAM control, remote tactical planning, runtime telemetry, progression guidance, economic target selection, automatic rooting, adaptive money targeting, automated cloud-server purchasing, diagnostics, and a path toward multi-target HWGW batching.
 
 ## Current architecture
 
 - **Workers** stay minimal and only perform assigned `hack`, `grow`, or `weaken` actions.
 - **Planner** performs expensive network discovery and baseline target ranking, then publishes cached state for lightweight consumers.
-- **Refresh coordinator** runs remotely. It performs a lightweight rooting/tool check every 30 seconds, but only runs the heavy target/RAM planner after a completed `HACK` or when new root access expands the execution pool.
+- **Refresh coordinator** runs remotely. It performs a lightweight rooting/tool check every 30 seconds, but only runs the heavy target/RAM planner after a completed `HACK` or when the execution pool expands.
 - **Automatic rooting** detects newly owned port-opening programs, roots every immediately rootable server, publishes the result on Port 9, then triggers a fresh planner/economy pass only when new servers were gained.
-- **New-host sync** copies execution/support files to newly rooted RAM hosts without rerunning the heavy startup deploy on the 8GB home node.
+- **Automated cloud purchasing** follows the progression advisor. When the selected progression goal is an affordable new cloud server, one server may be purchased per strategic refresh using the deterministic `hgw-001`, `hgw-002`, ... naming scheme. Existing manually named cloud servers are left unchanged.
+- **New-host sync** copies execution/support files to newly rooted or newly purchased RAM hosts without rerunning the heavy startup deploy on home.
 - **Economic strategy selector** compares live target state, real distributed thread capacity, preparation waves, exponentially weighted prep time, expected production rate, the current progression cash goal, and multiple desired-money percentages. Small targets below the partial-prep threshold are forced to 100% money before production.
 - **Controller** runs persistently, adopts the selected server *and* desired-money strategy, requests tactical plans, dispatches workers across the rooted RAM pool, and publishes state.
 - **Tactical planner** performs the expensive HGW thread calculation remotely and receives both the chosen hack fraction and chosen desired-money percentage.
@@ -44,6 +45,7 @@ The clean updater intentionally stops active automation, so run `kickstart.js` a
 | 7 | latest economy/progression snapshot |
 | 8 | latest economic target/strategy ranking snapshot |
 | 9 | latest rooting/tool-discovery snapshot |
+| 10 | latest automated cloud-purchase snapshot |
 
 ## Hacking flow
 
@@ -58,7 +60,7 @@ The current controller is sequential HGW rather than timed batching:
 
 Partial dispatches are safe: if only part of a requested action fits, the controller waits for that work to finish and recalculates from live state.
 
-## Event-driven planning, rooting, and RAM-pool growth
+## Event-driven planning, rooting, purchasing, and RAM-pool growth
 
 The heavy `hacking/planner.js` is not timer-driven during normal operation. `hacking/refresh.js` performs two meaningful refresh paths:
 
@@ -67,7 +69,20 @@ The heavy `hacking/planner.js` is not timer-driven during normal operation. `hac
 
 If a rooting pass gains one or more servers, the system immediately refreshes the planner, syncs runtime files to the new hosts, and recalculates the economic strategy using the expanded execution pool.
 
-Buying a new port-opening program therefore does not require restarting the stack.
+The progression refresh can also trigger `network/cloud-buy.js`. It only purchases when the current advisor goal is `PURCHASED_SERVER` and that goal is affordable. At most **one** cloud server is bought in a single strategic pass, preventing a large cash balance from being drained by a purchase loop. After a purchase, the planner and sync pass run again so the new server joins the execution pool before target selection finishes.
+
+Automated cloud servers use this naming scheme:
+
+```text
+hgw-001
+hgw-002
+hgw-003
+...
+```
+
+The purchaser chooses the first unused managed name, so numbering remains stable even if older managed servers are missing. Existing manually named purchased servers are not renamed.
+
+Bitburner v3.0.1 uses the `ns.cloud` purchased-server API; the purchaser uses `ns.cloud.purchaseServer(hostname, ram)` and follows the RAM size selected by the progression advisor.
 
 ## Adaptive economic strategy selection
 
@@ -118,6 +133,8 @@ The economic diagnostic shows the winning server, chosen money percentage, targe
 ## Progression advisor
 
 `lib/progression.js` currently compares home RAM upgrades, buying a new cloud server, and the best next RAM-doubling upgrade across owned cloud servers. Home RAM receives extra weight while home is below the measured core-automation requirement.
+
+When a new-cloud-server candidate is selected and affordable, automation may now execute that recommendation. Cloud-server **upgrades are still advisory only**; automatic upgrade spending has not been enabled yet.
 
 Future candidates are intended to include port-opening programs and explicit save/hold recommendations without changing the consumer interface.
 
@@ -179,6 +196,7 @@ lib/
   threads.js
 
 network/
+  cloud-buy.js
   deploy.js
   inspect.js
   root.js
@@ -203,9 +221,10 @@ RAM optimization is treated by lifetime and role, not raw file size alone. Persi
 
 Current design examples:
 
-- the heavy target/RAM planner runs only after a completed HACK or genuine root-pool expansion;
+- the heavy target/RAM planner runs only after a completed HACK or genuine execution-pool expansion;
 - the lightweight root check runs remotely every 30 seconds;
-- newly rooted hosts are synced remotely;
+- newly rooted and newly purchased hosts are synced remotely;
+- cloud purchasing is a short-lived remote action rather than controller logic;
 - economic strategy calculation is short-lived and remote;
 - the controller remains the next major persistent-home RAM optimization target.
 
@@ -213,14 +232,14 @@ Current design examples:
 
 The next major layers are:
 
-1. validate adaptive money-target choices, the $5m full-prep floor, and cash-relative value filtering against real gameplay;
+1. validate adaptive money-target choices, the $5m full-prep floor, cash-relative value filtering, and advisor-driven server purchases against real gameplay;
 2. tune the cash/server-max ignore threshold after testing;
-3. add target/strategy-switch hysteresis so small score changes do not cause churn;
-4. reduce persistent controller RAM with a dispatcher split;
-5. calibrate predicted income against real telemetry;
-6. expand progression candidate types;
-7. optimize the whole RAM pool across multiple targets;
-8. transition from sequential HGW to timed HWGW batches;
-9. expand the persistent dashboard as structured state becomes useful.
+3. add the strict post-HACK review barrier;
+4. add target/strategy-switch hysteresis so small score changes do not cause churn;
+5. reduce persistent controller RAM with a dispatcher split;
+6. calibrate predicted income against real telemetry;
+7. expand progression candidate types and decide whether cloud upgrades should also be automated;
+8. optimize the whole RAM pool across multiple targets;
+9. transition from sequential HGW to timed HWGW batches.
 
 See `docs/architecture.md` for the architectural direction.
