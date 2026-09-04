@@ -12,10 +12,10 @@ const PREP_SECURITY_TOLERANCE = 0.001;
 /** @param {NS} ns */
 export async function main(ns) {
     const args = positionalArgs(ns);
-    const manualTarget = args.length > 0 ? String(args[0]) : null;
+    let manualTarget = args.length > 0 ? String(args[0]) : null;
     const quiet = isQuiet(ns);
     let planner = readPlannerState(ns);
-    let state = manualTarget ? createManualState(manualTarget) : createStateFromPlanner(planner);
+    let state = manualTarget ? createManualState(manualTarget, findPlannerTarget(planner, manualTarget)) : createStateFromPlanner(planner);
     if (!state) {
         if (!quiet) {
             ns.tprint("ERROR: AUTO mode has no planner snapshot.");
@@ -33,11 +33,12 @@ export async function main(ns) {
     let jobSequence = 0;
     const recentEvents = [];
     const prep = createPrepMode();
+    const targetControl = createTargetControl(manualTarget);
 
     while (true) {
         planner = readPlannerState(ns);
 
-        if (consumeControllerRequests(ns, state, prep)) {
+        if (consumeControllerRequests(ns, state, prep, targetControl)) {
             pendingRequestId = "";
         }
 
@@ -46,6 +47,13 @@ export async function main(ns) {
         const operationJustFinished = hadActiveJobs && activeJobs.length === 0 && activeOperation;
 
         if (tacticalJob && !ns.isRunning(tacticalJob.pid, tacticalJob.hostname)) tacticalJob = null;
+
+        if (targetControl.pending && activeJobs.length === 0 && !tacticalJob) {
+            const result = applyTargetCommand(planner, state, prep, targetControl);
+            state = result.state;
+            manualTarget = targetControl.manualTarget;
+            pendingRequestId = "";
+        }
 
         if (!manualTarget && !prep.active && !prep.hold && activeJobs.length === 0 && !tacticalJob) {
             const previousTarget = state.hostname;
@@ -61,6 +69,7 @@ export async function main(ns) {
         else chooseFoundationAction(state);
         if (prep.stage !== previousPrepStage) pendingRequestId = "";
         syncPrepState(state, prep);
+        syncTargetControlState(state, targetControl);
         updateExecutionState(ns, state, planner, activeJobs);
 
         if (operationJustFinished) {
@@ -135,6 +144,7 @@ export async function main(ns) {
         }
 
         syncPrepState(state, prep);
+        syncTargetControlState(state, targetControl);
         state.updatedAt = Date.now();
         publishControllerState(ns, state);
         if (!quiet) {
@@ -158,7 +168,17 @@ function createPrepMode() {
     };
 }
 
-function consumeControllerRequests(ns, state, prep) {
+function createTargetControl(manualTarget) {
+    return {
+        manualTarget: manualTarget || "",
+        pending: null,
+        lastMessage: manualTarget
+            ? `Manual target active: ${manualTarget}`
+            : "Automatic economic target selection",
+    };
+}
+
+function consumeControllerRequests(ns, state, prep, targetControl) {
     const port = ns.getPortHandle(RuntimePort.CONTROL_REQUESTS);
     let changed = false;
 
@@ -193,16 +213,68 @@ function consumeControllerRequests(ns, state, prep) {
         }
 
         if (action === "RESUME_AUTO") {
-            prep.active = false;
-            prep.hold = false;
-            prep.stage = "";
-            prep.target = "";
+            resetPrep(prep);
             prep.lastMessage = "Automatic HGW resumed";
+            changed = true;
+        }
+
+        if (action === "SET_MANUAL_TARGET") {
+            const target = String(request?.target ?? "").trim();
+            if (target) {
+                targetControl.pending = { action, target, requestedAt: Number(request?.requestedAt ?? Date.now()) };
+                targetControl.lastMessage = `Manual target change queued: ${target}`;
+                changed = true;
+            }
+        }
+
+        if (action === "CLEAR_MANUAL_TARGET") {
+            targetControl.pending = { action, requestedAt: Number(request?.requestedAt ?? Date.now()) };
+            targetControl.lastMessage = "Return to automatic target selection queued";
             changed = true;
         }
     }
 
     return changed;
+}
+
+function applyTargetCommand(planner, currentState, prep, targetControl) {
+    const command = targetControl.pending;
+    targetControl.pending = null;
+    if (!command) return { state: currentState };
+
+    if (command.action === "CLEAR_MANUAL_TARGET") {
+        targetControl.manualTarget = "";
+        resetPrep(prep);
+        const automatic = createStateFromPlanner(planner);
+        if (automatic) {
+            targetControl.lastMessage = `Automatic target selection restored: ${automatic.hostname}`;
+            return { state: automatic };
+        }
+        targetControl.lastMessage = "Automatic target selection restored; waiting for planner target";
+        return { state: currentState };
+    }
+
+    const target = String(command.target ?? "").trim();
+    const analysis = findPlannerTarget(planner, target);
+    if (!analysis) {
+        targetControl.lastMessage = `Manual target rejected: ${target} is not currently an eligible planner target`;
+        return { state: currentState };
+    }
+
+    resetPrep(prep);
+    const next = createManualState(target, analysis);
+    targetControl.manualTarget = target;
+    targetControl.lastMessage = `Manual target active: ${target}`;
+    return { state: next };
+}
+
+function resetPrep(prep) {
+    prep.active = false;
+    prep.hold = false;
+    prep.stage = "";
+    prep.target = "";
+    prep.requestedAt = 0;
+    prep.completedAt = 0;
 }
 
 function syncPrepState(state, prep) {
@@ -215,6 +287,15 @@ function syncPrepState(state, prep) {
         completedAt: prep.completedAt,
         lastMessage: prep.lastMessage,
         mode: prep.hold ? "HOLDING" : prep.active ? "PREP" : "AUTO",
+    };
+}
+
+function syncTargetControlState(state, targetControl) {
+    state.targetControl = {
+        mode: targetControl.manualTarget ? "MANUAL" : "AUTO",
+        manualTarget: targetControl.manualTarget,
+        pending: targetControl.pending ? String(targetControl.pending.action ?? "") : "",
+        lastMessage: targetControl.lastMessage,
     };
 }
 
@@ -257,14 +338,20 @@ function choosePrepHoldAction(state, prep) {
     state.reason = `Prep complete: ${prep.target || state.hostname} is held at 100% money / minimum security until Resume Auto`;
 }
 
-function createManualState(hostname) {
+function createManualState(hostname, analysis = null) {
     const state = createTargetState(hostname);
+    if (analysis) applyPlannerAnalysis(state, analysis);
     state.selection.mode = "MANUAL";
-    state.selection.rank = 0;
+    state.selection.rank = Number(analysis?.rank ?? 0);
     state.strategy.hackPercent = 0.10;
     state.strategy.growTargetPercent = 1;
     state.money.desiredPercent = 1;
     return state;
+}
+
+function findPlannerTarget(planner, hostname) {
+    const rankings = Array.isArray(planner?.rankings) ? planner.rankings : [];
+    return rankings.find((target) => String(target?.hostname ?? "") === hostname) ?? null;
 }
 
 function createStateFromPlanner(planner) {
@@ -457,6 +544,7 @@ function getEstimatedActionTimeMs(state, action) {
 function printControllerState(ns, state) {
     ns.print("=== CONTROLLER STATE ===");
     ns.print(`Target:    ${state.hostname} | ${state.phase} | ${state.action}`);
+    ns.print(`Targeting: ${state.targetControl?.mode ?? "AUTO"}${state.targetControl?.manualTarget ? ` / ${state.targetControl.manualTarget}` : ""}`);
     ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%) | desired ${(state.money.desiredPercent * 100).toFixed(0)}%`);
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
     ns.print(`Threads:   ${state.execution.activeThreads} active | ${state.execution.activeJobs} job(s)`);
