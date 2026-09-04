@@ -4,13 +4,13 @@ A modular Bitburner automation project for v3.x, currently focused on an early-g
 
 ## Quick start
 
-After pulling the repo, normal startup is now one command:
+Normal startup is one command:
 
 ```text
 run startup.js
 ```
 
-`startup.js` opens the main GUI on home and then hands automation startup to `kickstart.js` in quiet mode. Background services therefore stay quiet while the GUI becomes the primary control surface.
+`startup.js` always opens the main GUI on home and launches the automation stack through `kickstart.js --quiet`. Background services keep publishing state, but terminal output stays quiet so the GUI is the primary presentation surface.
 
 For maintenance/update:
 
@@ -23,21 +23,39 @@ run startup.js
 
 ## Main GUI
 
-The main interface is:
+The primary day-to-day interface is:
 
 ```text
 run ui/dashboard.js
 ```
 
-It is a cached-state consumer only: expensive game analysis stays in remote planners and services rather than being duplicated inside the GUI. The current GUI has five tabs:
+The dashboard is intentionally simple and state-driven. It uses a restrained dark control-panel layout with status badges, headline metrics, compact cards, progress bars, and a small tab set instead of trying to put every script output on one screen.
 
-- **Overview** — current HGW target/action, target state, remote execution RAM, income, economy goal, and system summary.
-- **Targets** — selected economic strategy, target reasoning, economic ranking, and targets rejected by value filters.
-- **Economy** — progression goal, manual money lock, cloud-purchase state, and useful money-goal commands.
-- **Network** — discovery/rooting status, port tools, and the remote RAM pool.
-- **Diagnostics** — cached health checks, manual smoke/progression-test buttons, state ages, and common diagnostic commands.
+Current tabs:
 
-The older `diagnostics/dashboard.js` remains a focused diagnostic panel. The new `ui/dashboard.js` is the primary day-to-day control-plane GUI and is intended to grow into the main interface for the whole automation stack.
+- **Overview** — target, 5-minute income, remote RAM, active money goal, live HGW state, execution state, economy, and system health.
+- **Targets** — selected economic strategy, prep/weighted prep, expected income, economic ETA, rankings, and filtered targets.
+- **Economy** — progression goal, manual savings lock, cloud-purchase state, and common money-goal commands.
+- **Network** — discovery/rooting metrics, port tools, and remote execution hosts.
+- **Diagnostics** — cached health checks, manual test buttons, state ages, and common diagnostic commands.
+
+The older `diagnostics/dashboard.js` remains a focused troubleshooting panel. `ui/dashboard.js` is the main control-plane GUI.
+
+## Stock trading workspace
+
+Stock trading is deliberately isolated from the HGW control plane and is **not started by `startup.js`**. It has its own terminal and GUI placeholders so it can be developed later without bloating the main dashboard or mixing trading logic into HGW orchestration.
+
+```text
+run stocks/terminal.js
+run ui/stocks.js
+```
+
+At present both are display-only placeholders and **do not place trades**. The intended future split is:
+
+```text
+stocks/terminal.js   -> trading-engine logs / decisions / order events
+ui/stocks.js         -> portfolio, signals, positions, risk and controls
+```
 
 ## Current architecture
 
@@ -51,7 +69,8 @@ The older `diagnostics/dashboard.js` remains a focused diagnostic panel. The new
 - **Economic strategy selector** compares live target state, remote-only worker capacity, prep waves, exponential prep cost, desired-money percentages, progression distance, and cash-relative target value.
 - **Controller** runs persistently on home and orchestrates HGW while tactical calculation and worker execution remain remote.
 - **Telemetry** records real hack returns and rolling income rates.
-- **Main GUI** consumes Ports 1/2/3/5/7/8/9/10/11 and presents the state without owning strategy logic.
+- **Main GUI** consumes cached state and presents it without owning strategy logic.
+- **Stock subsystem** is a separate future workspace with its own terminal and GUI.
 
 ## Manual money goal / spending lock
 
@@ -122,6 +141,8 @@ At most one is purchased per strategic refresh. Manual money-goal mode disables 
 ```text
 run startup.js
 run ui/dashboard.js
+run stocks/terminal.js
+run ui/stocks.js
 run diagnostics/dashboard.js
 run diagnostics/mem-audit.js
 run diagnostics/economy-targets.js
@@ -143,6 +164,10 @@ manifest.json
 
 ui/
   dashboard.js
+  stocks.js
+
+stocks/
+  terminal.js
 
 economy/
   manual-goal.js
@@ -197,15 +222,18 @@ docs/
 
 Home RAM is control-plane capacity, not worker capacity. Persistent home processes should be small and useful; expensive short-lived analysis belongs on remote hosts. The GUI is intentionally state-driven so adding more visibility does not require adding expensive Netscript APIs to home.
 
+The stock subsystem is also kept separate so enabling stock trading later does not automatically increase the footprint of the main HGW dashboard.
+
 ## Roadmap
 
-1. validate the new unified GUI and one-command startup;
-2. add the strict post-HACK strategic review barrier;
-3. add target/strategy hysteresis;
-4. split dispatch/scheduling out of the controller to reduce persistent home RAM;
-5. expose more progression controls safely through GUI command/state channels;
+1. validate the polished unified GUI and one-command quiet startup;
+2. add safe GUI controls through low-RAM command/state channels;
+3. add the strict post-HACK strategic review barrier;
+4. add target/strategy hysteresis;
+5. split dispatch/scheduling out of the controller to reduce persistent home RAM;
 6. calibrate predicted income against real telemetry;
-7. optimize the whole remote RAM pool across multiple targets;
-8. transition from sequential HGW to timed HWGW batches.
+7. flesh out the independent stock terminal/GUI and stock runtime-state contract;
+8. optimize the whole remote RAM pool across multiple targets;
+9. transition from sequential HGW to timed HWGW batches.
 
 See `docs/architecture.md` for the architectural direction.
