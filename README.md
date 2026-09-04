@@ -9,12 +9,12 @@ A modular Bitburner automation project for v3.x, currently focused on an early-g
 - **Refresh coordinator** runs remotely. It performs a lightweight rooting/tool check every 30 seconds, but only runs the heavy target/RAM planner after a completed `HACK` or when new root access expands the execution pool.
 - **Automatic rooting** detects newly owned port-opening programs, roots every immediately rootable server, publishes the result on Port 9, then triggers a fresh planner/economy pass only when new servers were gained.
 - **New-host sync** copies execution/support files to newly rooted RAM hosts without rerunning the heavy startup deploy on the 8GB home node.
-- **Economic strategy selector** compares live target state, real distributed thread capacity, preparation waves, exponentially weighted prep time, expected production rate, the current progression cash goal, and multiple desired-money percentages.
+- **Economic strategy selector** compares live target state, real distributed thread capacity, preparation waves, exponentially weighted prep time, expected production rate, the current progression cash goal, and multiple desired-money percentages. Small targets below the partial-prep threshold are forced to 100% money before production.
 - **Controller** runs persistently, adopts the selected server *and* desired-money strategy, requests tactical plans, dispatches workers across the rooted RAM pool, and publishes state.
-- **Tactical planner** performs the expensive HGW thread calculation remotely and now receives both the chosen hack fraction and chosen desired-money percentage.
+- **Tactical planner** performs the expensive HGW thread calculation remotely and receives both the chosen hack fraction and chosen desired-money percentage.
 - **Telemetry** records actual `ns.hack()` returns and rolling income rates from distributed hack workers.
 - **Progression advisor** ranks home RAM, new cloud-server capacity, and cloud-server upgrades through one candidate schema.
-- **Diagnostic dashboard** remains deliberately lightweight and consumes cached state only.
+- **Diagnostic dashboard** remains deliberately lightweight and consumes cached state only. Its target-reasoning section explains the economic winner, controller mismatch/stall state, value-filter exclusions, and selected-strategy reasoning.
 
 ## Quick start
 
@@ -81,13 +81,15 @@ That baseline answers which server looks strongest in isolation. The economic st
 
 > Which server, prepared to what money level, is expected to reach the current progression goal fastest with the RAM we can actually dispatch?
 
-For each eligible target the selector currently evaluates these desired-money levels:
+For targets large enough to justify partial preparation, the selector evaluates:
 
 ```text
 25%, 40%, 55%, 70%, 85%, 100%
 ```
 
-For every server/percentage combination it:
+There is also a **small-server full-prep floor**. The initial test value is **$5,000,000 server max money**. If a server's maximum money is at or below that threshold, the partial percentages are not considered and the server is forced to **100% money before hacking**. This prevents a cheap early target from being attacked at 25% simply because its prep is short. The threshold is deliberately a single tuning constant so it can be adjusted after observing real gameplay.
+
+For every allowed server/percentage combination the selector:
 
 - reads live money and security;
 - calculates the grow amount needed only to reach that desired percentage;
@@ -98,17 +100,20 @@ For every server/percentage combination it:
 - applies the 30-minute exponential prep penalty to long preparation commitments;
 - estimates steady cash/sec and progression-goal ETA.
 
-Each server keeps its best percentage strategy, then those best strategies compete globally. This allows, for example, a partially prepared `sigma-cosmetics` strategy to compete against a fully prepared `n00dles` strategy rather than forcing both targets to 100% money.
+Each server keeps its best allowed percentage strategy, then those strategies compete globally. This allows a partially prepared larger server to compete against a fully prepared small server without making tiny targets artificially under-prepared.
 
-The selected `moneyTargetPercent` is stored in Port 2/Port 8 state, adopted by the controller, and passed into `hacking/tactical-planner.js`. `lib/threads.js` already supports arbitrary money-target percentages, so the tactical grow phase stops at the chosen threshold instead of automatically growing to max.
+The selector also has a cash-relative target-value filter. It compares **player cash against the server's maximum money**, not the server's current money. The current test threshold ignores a target when player cash is at least 200% above that server's max (3x its max), provided another viable target remains. If every target would be filtered, AUTO mode falls back instead of becoming targetless.
+
+The selected `moneyTargetPercent` is stored in Port 2/Port 8 state, adopted by the controller, and passed into `hacking/tactical-planner.js`. `lib/threads.js` supports arbitrary money-target percentages, so tactical execution follows the economic decision rather than automatically growing to max.
 
 Run:
 
 ```text
 run diagnostics/economy-targets.js
+run diagnostics/dashboard.js
 ```
 
-to see the winning server, chosen money percentage, top target strategies, and all candidate money percentages for the selected target.
+The economic diagnostic shows the winning server, chosen money percentage, target strategies, and alternatives. The dashboard's **Target Reasoning** section is intended for live troubleshooting: it shows why the economic selector chose the target, whether the controller matches that choice, current tactical state, prep/grow load, low-value targets that were ignored, and whether a small-server full-prep rule affected the selected strategy.
 
 ## Progression advisor
 
@@ -137,7 +142,7 @@ run network/root.js
 run hacking/thread-plan.js
 ```
 
-`diagnostics/mem-audit.js` scans the live `.js` files installed on home and reports their current RAM cost. The dashboard remains focused on live function checks rather than becoming a giant report screen.
+`diagnostics/mem-audit.js` scans the live `.js` files installed on home and reports their current RAM cost. The dashboard remains focused on live function checks and target reasoning rather than becoming a giant report screen.
 
 ## Repository layout
 
@@ -208,13 +213,14 @@ Current design examples:
 
 The next major layers are:
 
-1. validate adaptive money-target choices against real gameplay;
-2. add target/strategy-switch hysteresis so small score changes do not cause churn;
-3. reduce persistent controller RAM with a dispatcher split;
-4. calibrate predicted income against real telemetry;
-5. expand progression candidate types;
-6. optimize the whole RAM pool across multiple targets;
-7. transition from sequential HGW to timed HWGW batches;
-8. expand the persistent dashboard as structured state becomes useful.
+1. validate adaptive money-target choices, the $5m full-prep floor, and cash-relative value filtering against real gameplay;
+2. tune the cash/server-max ignore threshold after testing;
+3. add target/strategy-switch hysteresis so small score changes do not cause churn;
+4. reduce persistent controller RAM with a dispatcher split;
+5. calibrate predicted income against real telemetry;
+6. expand progression candidate types;
+7. optimize the whole RAM pool across multiple targets;
+8. transition from sequential HGW to timed HWGW batches;
+9. expand the persistent dashboard as structured state becomes useful.
 
 See `docs/architecture.md` for the architectural direction.
