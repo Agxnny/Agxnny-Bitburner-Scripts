@@ -1,10 +1,13 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
-import { publishControllerState, readPlannerState, readTacticalPlanState } from "/lib/runtime-state.js";
+import { RuntimePort, publishControllerState, readPlannerState, readTacticalPlanState } from "/lib/runtime-state.js";
 import { DEFAULT_HOME_RESERVE_GB, WORKER_SCRIPTS, distributeThreads, getExecutionPool, summarizeExecutionPool } from "/lib/execution.js";
 import { isQuiet, positionalArgs, quietArgs } from "/lib/output.js";
 
 const TACTICAL_PLANNER_SCRIPT = "/hacking/tactical-planner.js";
 const MAX_RECENT_EVENTS = 8;
+const EMPTY_PORT = "NULL PORT DATA";
+const PREP_MONEY_RATIO = 0.999999;
+const PREP_SECURITY_TOLERANCE = 0.001;
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -29,16 +32,22 @@ export async function main(ns) {
     let requestSequence = 0;
     let jobSequence = 0;
     const recentEvents = [];
+    const prep = createPrepMode();
 
     while (true) {
         planner = readPlannerState(ns);
+
+        if (consumeControllerRequests(ns, state, prep)) {
+            pendingRequestId = "";
+        }
+
         const hadActiveJobs = activeJobs.length > 0;
         activeJobs = activeJobs.filter((job) => ns.isRunning(job.pid, job.hostname));
         const operationJustFinished = hadActiveJobs && activeJobs.length === 0 && activeOperation;
 
         if (tacticalJob && !ns.isRunning(tacticalJob.pid, tacticalJob.hostname)) tacticalJob = null;
 
-        if (!manualTarget && activeJobs.length === 0 && !tacticalJob) {
+        if (!manualTarget && !prep.active && !prep.hold && activeJobs.length === 0 && !tacticalJob) {
             const previousTarget = state.hostname;
             const previousMoneyTarget = state.money.desiredPercent;
             state = adoptLatestPlannerTarget(planner, state);
@@ -46,7 +55,12 @@ export async function main(ns) {
         }
 
         updateObservedState(ns, state);
-        chooseFoundationAction(state);
+        const previousPrepStage = prep.stage;
+        if (prep.active) choosePrepAction(state, prep);
+        else if (prep.hold) choosePrepHoldAction(state, prep);
+        else chooseFoundationAction(state);
+        if (prep.stage !== previousPrepStage) pendingRequestId = "";
+        syncPrepState(state, prep);
         updateExecutionState(ns, state, planner, activeJobs);
 
         if (operationJustFinished) {
@@ -60,8 +74,11 @@ export async function main(ns) {
         }
 
         if (activeJobs.length > 0) {
-            state.tactical.status = "WAITING_WORKERS";
+            state.tactical.status = prep.active ? `PREP_${prep.stage}_RUNNING` : "WAITING_WORKERS";
             state.reason += ` | waiting for ${activeJobs.length} worker job(s)`;
+        } else if (prep.hold) {
+            pendingRequestId = "";
+            state.tactical.status = "PREPARED_HOLD";
         } else {
             const tacticalPlan = readTacticalPlanState(ns);
             if (isRequestedPlan(tacticalPlan, state.hostname, pendingRequestId)) {
@@ -80,7 +97,7 @@ export async function main(ns) {
 
                 if (dispatch.launched > 0) {
                     pendingRequestId = "";
-                    state.tactical.status = "EXECUTING";
+                    state.tactical.status = prep.active ? `PREP_${prep.stage}_RUNNING` : "EXECUTING";
                     state.execution.activeJobs = activeJobs.length;
                     state.execution.activeThreads = dispatch.launched;
                     state.reason += ` | dispatched ${dispatch.launched}/${dispatch.requested} thread(s)`;
@@ -96,11 +113,11 @@ export async function main(ns) {
                     state.reason += " | calculated plan ready, waiting for deployable RAM";
                 }
             } else if (!tacticalJob) {
-                const request = launchTacticalPlanner(ns, planner, state, ++requestSequence);
+                const request = launchTacticalPlanner(ns, planner, state, prep, ++requestSequence);
                 if (request.pid > 0) {
                     tacticalJob = request;
                     pendingRequestId = request.requestId;
-                    state.tactical.status = "CALCULATING";
+                    state.tactical.status = prep.active ? `PREP_${prep.stage}_CALCULATING` : "CALCULATING";
                     state.tactical.requestId = request.requestId;
                     state.tactical.plannerHost = request.hostname;
                     state.reason += ` | tactical calculation running on ${request.hostname}`;
@@ -110,13 +127,14 @@ export async function main(ns) {
                     state.reason += " | no execution host has enough free RAM for tactical analysis";
                 }
             } else {
-                state.tactical.status = "CALCULATING";
+                state.tactical.status = prep.active ? `PREP_${prep.stage}_CALCULATING` : "CALCULATING";
                 state.tactical.requestId = tacticalJob.requestId;
                 state.tactical.plannerHost = tacticalJob.hostname;
                 state.reason += ` | tactical calculation running on ${tacticalJob.hostname}`;
             }
         }
 
+        syncPrepState(state, prep);
         state.updatedAt = Date.now();
         publishControllerState(ns, state);
         if (!quiet) {
@@ -126,6 +144,117 @@ export async function main(ns) {
         }
         await ns.sleep(1000);
     }
+}
+
+function createPrepMode() {
+    return {
+        active: false,
+        hold: false,
+        stage: "",
+        target: "",
+        requestedAt: 0,
+        completedAt: 0,
+        lastMessage: "Automatic HGW",
+    };
+}
+
+function consumeControllerRequests(ns, state, prep) {
+    const port = ns.getPortHandle(RuntimePort.CONTROL_REQUESTS);
+    let changed = false;
+
+    while (!port.empty()) {
+        const raw = port.read();
+        if (raw === EMPTY_PORT) break;
+
+        let request;
+        try {
+            request = JSON.parse(String(raw));
+        } catch {
+            continue;
+        }
+
+        const action = String(request?.action ?? "").trim().toUpperCase();
+        if (action === "PREP_TARGET") {
+            const requestedTarget = String(request?.target ?? "").trim();
+            if (requestedTarget && requestedTarget !== state.hostname) {
+                prep.lastMessage = `Prep ignored: controller target changed from ${requestedTarget} to ${state.hostname}`;
+                changed = true;
+                continue;
+            }
+
+            prep.active = true;
+            prep.hold = false;
+            prep.stage = "GROW";
+            prep.target = state.hostname;
+            prep.requestedAt = Number(request?.requestedAt ?? Date.now());
+            prep.completedAt = 0;
+            prep.lastMessage = `Preparing ${state.hostname}: grow to 100%, then weaken to minimum`;
+            changed = true;
+        }
+
+        if (action === "RESUME_AUTO") {
+            prep.active = false;
+            prep.hold = false;
+            prep.stage = "";
+            prep.target = "";
+            prep.lastMessage = "Automatic HGW resumed";
+            changed = true;
+        }
+    }
+
+    return changed;
+}
+
+function syncPrepState(state, prep) {
+    state.prep = {
+        active: prep.active,
+        hold: prep.hold,
+        stage: prep.stage,
+        target: prep.target,
+        requestedAt: prep.requestedAt,
+        completedAt: prep.completedAt,
+        lastMessage: prep.lastMessage,
+        mode: prep.hold ? "HOLDING" : prep.active ? "PREP" : "AUTO",
+    };
+}
+
+function choosePrepAction(state, prep) {
+    state.money.desiredPercent = 1;
+
+    const moneyReady = state.money.max > 0 && state.money.current >= state.money.max * PREP_MONEY_RATIO;
+    if (prep.stage === "GROW" && !moneyReady) {
+        state.phase = TargetPhase.MONEY_PREP;
+        state.action = ActionType.GROW;
+        state.reason = "Prep mode: growing continuously to 100% money before weakening";
+        return;
+    }
+
+    if (prep.stage === "GROW") {
+        prep.stage = "WEAKEN";
+        prep.lastMessage = `${state.hostname} money is full; weakening to minimum security`;
+    }
+
+    const securityDelta = Math.max(0, state.security.current - state.security.minimum);
+    if (securityDelta > PREP_SECURITY_TOLERANCE) {
+        state.phase = TargetPhase.SECURITY_PREP;
+        state.action = ActionType.WEAKEN;
+        state.reason = `Prep mode: money full, weakening security +${formatNumber(securityDelta)} to minimum`;
+        return;
+    }
+
+    prep.active = false;
+    prep.hold = true;
+    prep.stage = "READY";
+    prep.completedAt = Date.now();
+    prep.lastMessage = `${state.hostname} prepared at 100% money and minimum security; holding for batch work`;
+    choosePrepHoldAction(state, prep);
+}
+
+function choosePrepHoldAction(state, prep) {
+    state.money.desiredPercent = 1;
+    state.phase = TargetPhase.PRODUCTION;
+    state.action = ActionType.NONE;
+    state.reason = `Prep complete: ${prep.target || state.hostname} is held at 100% money / minimum security until Resume Auto`;
 }
 
 function createManualState(hostname) {
@@ -210,14 +339,17 @@ function updateExecutionState(ns, state, planner, activeJobs) {
     state.execution.activeThreads = activeJobs.reduce((sum, job) => sum + job.threads, 0);
 }
 
-function launchTacticalPlanner(ns, planner, state, sequence) {
+function launchTacticalPlanner(ns, planner, state, prep, sequence) {
     const scriptRam = ns.getScriptRam(TACTICAL_PLANNER_SCRIPT, "home");
     const requestId = `tactical-${Date.now()}-${sequence}`;
     const target = state.hostname;
     if (scriptRam <= 0) return { pid: 0, hostname: "", requestId, target };
 
     const hackFraction = clamp(Number(state.strategy.hackPercent ?? 0.10), 0.001, 0.99);
-    const moneyTargetPercent = clamp(Number(state.money.desiredPercent ?? 1), 0.01, 1);
+    const moneyTargetPercent = prep.active ? 1 : clamp(Number(state.money.desiredPercent ?? 1), 0.01, 1);
+    const tacticalMode = prep.active
+        ? prep.stage === "GROW" ? "PREP_GROW" : "PREP_WEAKEN"
+        : "";
 
     for (const host of getExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB)) {
         if (host.usableRam < scriptRam) continue;
@@ -229,11 +361,12 @@ function launchTacticalPlanner(ns, planner, state, sequence) {
             requestId,
             hackFraction,
             moneyTargetPercent,
+            tacticalMode,
             ...quietArgs(ns),
         );
-        if (pid > 0) return { pid, hostname: host.hostname, requestId, target, scriptRam };
+        if (pid > 0) return { pid, hostname: host.hostname, requestId, target, scriptRam, tacticalMode };
     }
-    return { pid: 0, hostname: "", requestId, target, scriptRam };
+    return { pid: 0, hostname: "", requestId, target, scriptRam, tacticalMode };
 }
 
 function isRequestedPlan(plan, target, requestId) {
@@ -328,6 +461,7 @@ function printControllerState(ns, state) {
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
     ns.print(`Threads:   ${state.execution.activeThreads} active | ${state.execution.activeJobs} job(s)`);
     ns.print(`Tactical:  ${state.tactical.status}`);
+    ns.print(`Prep:      ${state.prep?.mode ?? "AUTO"}${state.prep?.stage ? ` / ${state.prep.stage}` : ""}`);
     ns.print(`Reason:    ${state.reason}`);
 }
 
