@@ -14,7 +14,8 @@ import { positionalArgs, tprint } from "/lib/output.js";
  *   [1] request id supplied by the controller
  *   [2] optional hack fraction
  *   [3] optional desired money percentage
- *   [4] optional forced tactical mode: PREP_GROW or PREP_WEAKEN
+ *   [4] optional forced tactical mode:
+ *       PREP_GROW, PREP_WEAKEN, BATCH_GROW, or BATCH_WEAKEN
  * Shared flags such as --quiet are ignored for positional parsing.
  *
  * @param {NS} ns
@@ -56,22 +57,26 @@ export async function main(ns) {
 }
 
 function applyForcedMode(plan, tacticalMode) {
-    if (tacticalMode === "PREP_GROW") {
+    if (tacticalMode === "PREP_GROW" || tacticalMode === "BATCH_GROW") {
         plan.next = {
             phase: "MONEY_PREP",
             action: "GROW",
             requestedThreads: Math.max(1, Math.floor(Number(plan.threads?.grow ?? 0))),
-            reason: "Prep mode: grow toward 100% before any weaken pass",
+            reason: tacticalMode === "PREP_GROW"
+                ? "Prep mode: grow toward 100% before any weaken pass"
+                : "Batch mode: grow toward the selected money baseline before launching HWGW",
         };
         return;
     }
 
-    if (tacticalMode === "PREP_WEAKEN") {
+    if (tacticalMode === "PREP_WEAKEN" || tacticalMode === "BATCH_WEAKEN") {
         plan.next = {
             phase: "SECURITY_PREP",
             action: "WEAKEN",
             requestedThreads: Math.max(1, Math.floor(Number(plan.threads?.securityPrepWeaken ?? 0))),
-            reason: "Prep mode: money is full; weaken back to minimum security",
+            reason: tacticalMode === "PREP_WEAKEN"
+                ? "Prep mode: money is full; weaken back to minimum security"
+                : "Batch mode: weaken to the stricter batch security threshold before launching HWGW",
         };
     }
 }
