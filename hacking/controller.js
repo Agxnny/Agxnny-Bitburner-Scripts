@@ -13,6 +13,7 @@ import {
 } from "/lib/execution.js";
 
 const TACTICAL_PLANNER_SCRIPT = "/hacking/tactical-planner.js";
+const MAX_RECENT_EVENTS = 8;
 
 /**
  * Lightweight persistent HGW controller.
@@ -47,14 +48,19 @@ export async function main(ns) {
     ns.disableLog("sleep");
 
     let activeJobs = [];
+    let activeOperation = null;
     let tacticalJob = null;
     let pendingRequestId = "";
     let requestSequence = 0;
     let jobSequence = 0;
+    const recentEvents = [];
 
     while (true) {
         planner = readPlannerState(ns);
+
+        const hadActiveJobs = activeJobs.length > 0;
         activeJobs = activeJobs.filter((job) => ns.isRunning(job.pid, job.hostname));
+        const operationJustFinished = hadActiveJobs && activeJobs.length === 0 && activeOperation;
 
         if (tacticalJob && !ns.isRunning(tacticalJob.pid, tacticalJob.hostname)) {
             tacticalJob = null;
@@ -72,6 +78,13 @@ export async function main(ns) {
         updateObservedState(ns, state);
         chooseFoundationAction(state);
         updateExecutionState(ns, state, planner, activeJobs);
+
+        if (operationJustFinished) {
+            const event = createCompletionEvent(activeOperation, state);
+            pushRecentEvent(recentEvents, event);
+            ns.tprint(event.terminalLine);
+            activeOperation = null;
+        }
 
         if (activeJobs.length > 0) {
             state.tactical.status = "WAITING_WORKERS";
@@ -110,6 +123,14 @@ export async function main(ns) {
                     state.execution.activeJobs = activeJobs.length;
                     state.execution.activeThreads = dispatch.launched;
                     state.reason += ` | dispatched ${dispatch.launched}/${dispatch.requested} thread(s)`;
+
+                    activeOperation = {
+                        action: state.action,
+                        target: state.hostname,
+                        threads: dispatch.launched,
+                        jobs: activeJobs.length,
+                        startedAt: Date.now(),
+                    };
                 } else {
                     state.tactical.status = "READY";
                     state.reason += " | calculated plan ready, waiting for deployable RAM";
@@ -147,6 +168,7 @@ export async function main(ns) {
 
         ns.clearLog();
         ns.print(JSON.stringify(state, null, 2));
+        printRecentEvents(ns, recentEvents);
 
         await ns.sleep(1000);
     }
@@ -401,6 +423,57 @@ function chooseFoundationAction(state) {
     state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.HACK;
     state.reason = "Target is prepared; awaiting tactical production calculation";
+}
+
+function createCompletionEvent(operation, state) {
+    const elapsedMs = Math.max(0, Date.now() - Number(operation.startedAt ?? Date.now()));
+    const nextAction = state.action;
+    const nextEstimateMs = getEstimatedActionTimeMs(state, nextAction);
+    const finished = `${operation.action} ${operation.target} finished | ${operation.threads} thread(s) | ${formatDuration(elapsedMs)}`;
+    const next = `NEXT ${nextAction} | estimated ${formatDuration(nextEstimateMs)} | ${state.phase}`;
+
+    return {
+        at: Date.now(),
+        finished,
+        next,
+        terminalLine: `[HGW] ${finished} | ${next}`,
+    };
+}
+
+function getEstimatedActionTimeMs(state, action) {
+    if (action === ActionType.HACK) return Number(state.analysis.hackTimeMs ?? 0);
+    if (action === ActionType.GROW) return Number(state.analysis.growTimeMs ?? 0);
+    if (action === ActionType.WEAKEN) return Number(state.analysis.weakenTimeMs ?? 0);
+    return 0;
+}
+
+function pushRecentEvent(events, event) {
+    events.push(event);
+    while (events.length > MAX_RECENT_EVENTS) events.shift();
+}
+
+function printRecentEvents(ns, events) {
+    if (events.length === 0) return;
+
+    ns.print("");
+    ns.print("=== RECENT HGW COMPLETIONS ===");
+    for (const event of events) {
+        ns.print(event.finished);
+        ns.print(`  ${event.next}`);
+    }
+}
+
+function formatDuration(milliseconds) {
+    const totalSeconds = Math.max(0, Number(milliseconds) || 0) / 1000;
+    if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds - minutes * 60;
+    if (minutes < 60) return `${minutes}m ${seconds.toFixed(1)}s`;
+
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes - hours * 60;
+    return `${hours}h ${remainingMinutes}m ${seconds.toFixed(0)}s`;
 }
 
 function formatNumber(value) {
