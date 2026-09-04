@@ -1,4 +1,5 @@
 import { readPlannerState } from "/lib/runtime-state.js";
+import { isQuiet, quietArgs } from "/lib/output.js";
 
 const FULL_REFRESH_MS = 30_000;
 const ECONOMY_REFRESH_MS = 30_000;
@@ -14,10 +15,6 @@ const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
  *  - full network + baseline target state,
  *  - cash/progression state,
  *  - economic target choice with prep-time cost.
- *
- * The economic target selector writes its winning host back into Port 2, so the
- * existing controller automatically adopts the fresh priority between worker
- * jobs without importing any of the expensive analysis APIs itself.
  *
  * @param {NS} ns
  */
@@ -49,7 +46,7 @@ export async function main(ns) {
 async function launchAndWait(ns, script) {
     const scriptRam = ns.getScriptRam(script, "home");
     if (!(scriptRam > 0)) {
-        ns.print(`Refresh skipped: could not determine RAM for ${script}`);
+        if (!isQuiet(ns)) ns.print(`Refresh skipped: could not determine RAM for ${script}`);
         return false;
     }
 
@@ -66,13 +63,13 @@ async function launchAndWait(ns, script) {
         .sort((a, b) => b.freeRam - a.freeRam || a.hostname.localeCompare(b.hostname));
 
     for (const host of candidates) {
-        const pid = ns.exec(script, host.hostname, 1);
+        const pid = ns.exec(script, host.hostname, 1, ...quietArgs(ns));
         if (pid <= 0) continue;
 
         while (ns.isRunning(pid, host.hostname)) await ns.sleep(50);
         return true;
     }
 
-    ns.print(`Refresh delayed: no remote host has ${scriptRam.toFixed(2)}GB free for ${script}`);
+    if (!isQuiet(ns)) ns.print(`Refresh delayed: no remote host has ${scriptRam.toFixed(2)}GB free for ${script}`);
     return false;
 }
