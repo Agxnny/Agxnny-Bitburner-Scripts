@@ -130,9 +130,10 @@ async function applyGoalAction(ns, action, now) {
 
 function controllerStatusText(action) {
     if (action.action === "PREP_TARGET") return `Prep request queued for ${action.target || "current target"}`;
-    if (action.action === "RESUME_AUTO") return "Resume automatic HGW request queued";
+    if (action.action === "RESUME_AUTO") return "Resume automatic execution request queued";
     if (action.action === "SET_MANUAL_TARGET") return `Manual target request queued: ${action.target}`;
     if (action.action === "CLEAR_MANUAL_TARGET") return "Automatic target selection request queued";
+    if (action.action === "SET_EXECUTION_MODE") return `${action.mode === "BATCH" ? "Synchronized HWGW batch" : "Normal HGW"} mode request queued`;
     return "Controller request queued";
 }
 
@@ -143,7 +144,7 @@ function renderApp(s) {
         el("div", { style: styles.content }, activeView(s)),
         el("div", { style: styles.footer },
             el("span", null, "CONTROL PLANE"),
-            el("span", null, "HGW workers: remote only"),
+            el("span", null, "Workers: remote only"),
             el("span", null, `Planner ${age(s.planner?.updatedAt)}`),
         ),
     );
@@ -154,6 +155,7 @@ function header(s) {
     const live = Boolean(s.controller) && !isControllerStateStale(s.controller);
     const locked = Boolean(s.manualGoal?.active);
     const prep = c.prep ?? {};
+    const executionMode = c.executionMode?.mode ?? "HGW";
     const manualTarget = c.targetControl?.mode === "MANUAL";
 
     return el("div", { style: styles.header },
@@ -166,10 +168,12 @@ function header(s) {
         ),
         el("div", { style: styles.badges },
             badge(live ? "CONTROLLER ONLINE" : "CONTROLLER WAITING", live ? "good" : "dim"),
+            badge(executionMode === "BATCH" ? "BATCH HWGW" : "NORMAL HGW", executionMode === "BATCH" ? "accent" : "dim"),
             badge(String(c.phase ?? "BOOTING"), live ? "accent" : "dim"),
             manualTarget ? badge("MANUAL TARGET", "accent") : null,
             prep.active ? badge(`PREP ${prep.stage || "ACTIVE"}`, "warn") : null,
             prep.hold ? badge("PREPARED HOLD", "good") : null,
+            c.executionMode?.awaitingReview ? badge("POST-BATCH REVIEW", "warn") : null,
             badge(locked ? "SPENDING LOCKED" : "AUTO SPEND", locked ? "warn" : "good"),
         ),
     );
@@ -197,8 +201,8 @@ function overviewView(s) {
     const sec = c.security ?? {};
     const exec = c.execution ?? {};
     const tele = s.telemetry ?? {};
-    const goal = s.economy?.goal ?? {};
     const batch = s.batch ?? {};
+    const executionMode = c.executionMode?.mode ?? "HGW";
     const moneyProgress = Number(m.max ?? 0) > 0 ? Number(m.current ?? 0) / Number(m.max ?? 1) : 0;
 
     return el("div", null,
@@ -206,11 +210,12 @@ function overviewView(s) {
             heroMetric("TARGET", c.hostname ?? "waiting", `${c.phase ?? "—"} / ${c.action ?? "—"}`),
             heroMetric("INCOME · 5M", `${moneyFmt(tele.incomePerSecond5m)}/s`, `${Number(tele.hackEvents ?? 0)} hack events`),
             heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} execution hosts`),
-            heroMetric("BATCH", batch.status ?? "idle", batch.hostname || "no batch active"),
+            heroMetric("EXECUTION", executionMode === "BATCH" ? "BATCH HWGW" : "NORMAL HGW", batch.status ? `${batch.status} · ${batch.target || "no target"}` : "no batch state"),
         ),
+        card("Execution mode", executionModeControls(s), true),
         card("Target prep controls", prepControls(s), true),
         grid(
-            card("Active HGW", el("div", null,
+            card("Active target", el("div", null,
                 kv("Target mode", c.targetControl?.mode ?? "AUTO"),
                 kv("Desired money", pct(m.desiredPercent)),
                 progressBar(moneyProgress, `${pct(moneyProgress)} of server max`),
@@ -219,16 +224,46 @@ function overviewView(s) {
                 kv("Tactical", c.tactical?.status ?? "waiting"),
                 note(c.reason ?? "Waiting for controller state"),
             )),
-            card("Execution", el("div", null,
-                kv("Policy", "REMOTE ONLY"),
-                kv("Active jobs", String(exec.activeJobs ?? 0)),
-                kv("Active threads", String(exec.activeThreads ?? 0)),
-                kv("Usable RAM", ramFmt(exec.usableRam)),
-                kv("Tactical planner", s.tactical?.plannerHost ?? "remote / waiting"),
-            )),
+            card("Execution", executionSummary(s)),
             card("Economy", economySummary(s)),
             card("System health", healthSummary(s)),
         ),
+    );
+}
+
+function executionModeControls(s) {
+    const mode = s.controller?.executionMode?.mode ?? "HGW";
+    const executionMode = s.controller?.executionMode ?? {};
+    const batch = s.batch ?? {};
+    const batchThreads = batch.threads ?? {};
+
+    return el("div", null,
+        el("div", { style: styles.controlGrid },
+            el("div", null,
+                kv("Current mode", mode === "BATCH" ? "SYNCHRONIZED HWGW" : "NORMAL SEQUENTIAL HGW"),
+                kv("Batch gap", `${Number(executionMode.batchGapMs ?? 200)} ms`),
+                kv("Review barrier", executionMode.awaitingReview ? "WAITING FOR STRATEGIC REVIEW" : "READY"),
+            ),
+            el("div", { style: styles.controlActions },
+                el("button", {
+                    disabled: mode === "HGW",
+                    onClick: () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "HGW" }; },
+                    style: { ...styles.clearButton, ...(mode === "HGW" ? styles.disabledButton : {}) },
+                }, "Use normal HGW"),
+                el("button", {
+                    disabled: mode === "BATCH",
+                    onClick: () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "BATCH" }; },
+                    style: { ...styles.primaryButton, ...(mode === "BATCH" ? styles.disabledButton : {}) },
+                }, "Use batched HWGW"),
+            ),
+        ),
+        el("div", { style: styles.goalHint }, "Batch mode prepares the selected strategy target, launches one synchronized HWGW batch, waits for the full batch to recover, then requires a fresh planner/economy review before another batch can start."),
+        el("div", { style: styles.goalStatus }, executionMode.lastMessage || controllerActionStatus),
+        batch.status ? el("div", { style: styles.miniGrid },
+            kv("Batch status", batch.status),
+            kv("Batch target", batch.target || "—"),
+            kv("Threads", `${Number(batchThreads.hack ?? 0)}H / ${Number(batchThreads.weakenHack ?? 0)}W / ${Number(batchThreads.grow ?? 0)}G / ${Number(batchThreads.weakenGrow ?? 0)}W`),
+        ) : null,
     );
 }
 
@@ -236,7 +271,8 @@ function prepControls(s) {
     const c = s.controller ?? {};
     const prep = c.prep ?? {};
     const target = String(c.hostname ?? "");
-    const mode = prep.hold ? "PREPARED / HOLDING" : prep.active ? `PREP ${prep.stage || "ACTIVE"}` : "AUTOMATIC HGW";
+    const executionMode = c.executionMode?.mode ?? "HGW";
+    const mode = prep.hold ? "PREPARED / HOLDING" : prep.active ? `PREP ${prep.stage || "ACTIVE"}` : executionMode === "BATCH" ? "AUTOMATIC BATCH MODE" : "AUTOMATIC HGW";
     const noTarget = !target;
 
     return el("div", null,
@@ -255,11 +291,30 @@ function prepControls(s) {
                 el("button", {
                     onClick: () => { requestedControllerAction = { action: "RESUME_AUTO" }; },
                     style: styles.clearButton,
-                }, "Resume auto HGW"),
+                }, executionMode === "BATCH" ? "Resume auto batching" : "Resume auto HGW"),
             ),
         ),
-        el("div", { style: styles.goalHint }, "Prep keeps growing even while security rises, then weakens to minimum and holds the target for batching."),
+        el("div", { style: styles.goalHint }, "Manual prep keeps growing even while security rises, then weakens to minimum and holds the target. Resume returns to the currently selected execution mode."),
         el("div", { style: styles.goalStatus }, prep.lastMessage || controllerActionStatus),
+    );
+}
+
+function executionSummary(s) {
+    const c = s.controller ?? {};
+    const exec = c.execution ?? {};
+    const mode = c.executionMode ?? {};
+    const batch = s.batch ?? {};
+    const final = batch.final ?? {};
+    return el("div", null,
+        kv("Policy", "REMOTE ONLY"),
+        kv("Mode", mode.mode ?? "HGW"),
+        kv("Active jobs", String(exec.activeJobs ?? 0)),
+        kv("Active threads", String(exec.activeThreads ?? 0)),
+        kv("Usable RAM", ramFmt(exec.usableRam)),
+        kv("Batch state", batch.status ?? "idle"),
+        mode.awaitingReview ? kv("Review", "WAITING") : null,
+        batch.status === "COMPLETE" ? kv("Recovery", `${pct(final.moneyPercent)} money / +${num(final.securityDelta)} sec`) : null,
+        note(mode.lastMessage ?? "Execution controller waiting"),
     );
 }
 
@@ -296,7 +351,7 @@ function targetsView(s) {
                     style: styles.clearButton,
                 }, "Clear / auto target"),
             ),
-            el("div", { style: styles.goalHint }, "Manual targeting overrides only the controller hostname. Clear it to return to the economic selector. Target changes wait for current workers/tactical analysis to finish."),
+            el("div", { style: styles.goalHint }, "Manual targeting overrides only the controller hostname. Clear it to return to the economic selector. Target changes wait for current workers/tactical analysis/batch work to finish."),
             el("div", { style: styles.goalStatus }, targetControl.lastMessage || controllerActionStatus),
             el("div", { style: styles.miniGrid },
                 kv("Controller mode", targetControl.mode ?? "AUTO"),
