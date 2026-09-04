@@ -36,6 +36,9 @@ export async function main(ns) {
                 threads: Math.max(0, Number(event.threads ?? 0)),
                 hostname: String(event.hostname ?? ""),
                 jobId: String(event.jobId ?? ""),
+                batchId: String(event.batchId ?? ""),
+                stage: String(event.stage ?? ""),
+                additionalMsec: Math.max(0, Number(event.additionalMsec ?? 0)),
                 durationMs: Math.max(0, Number(event.durationMs ?? 0)),
                 finishedAt,
             };
