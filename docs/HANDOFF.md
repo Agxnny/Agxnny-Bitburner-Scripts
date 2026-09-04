@@ -68,37 +68,26 @@ The strict review barrier is important: batch hack telemetry must **not** trigge
 
 ## Latest live validation
 
-On 2026-09-05, the first automatic batch-mode production cycle was observed on `sigma-cosmetics`.
-
-Observed batch state:
+On 2026-09-05, the original automatic batch-mode production cycle on `sigma-cosmetics` exposed the W2 security-compensation defect:
 
 ```text
-target: sigma-cosmetics
-mode: BATCH HWGW
-batch result: COMPLETE
 threads: 25H / 1W / 298G / 1W
 money recovery: 100%
 security recovery: +1.13 above minimum
 ```
 
-The controller correctly:
+After correcting the grow-security calculation, the first live corrected batch on the same target used:
 
-- accepted the batch as complete;
-- waited for the post-batch strategic review;
-- released the review barrier after fresh target/economy state arrived;
-- noticed the remaining `+1.13` security;
-- entered `SECURITY_PREP / WEAKEN`;
-- launched a 23-thread weaken correction before allowing another batch.
+```text
+threads: 25H / 1W / 298G / 24W
+money recovery: 100%
+security recovery: 3.00 / 3.00
+standalone correction weaken: not required
+```
 
-This proves the following pieces are working together:
+The controller also completed the post-batch strategic review and released the next-batch barrier normally.
 
-- GUI HGW/BATCH selector;
-- controller batch handoff;
-- remote batch runner launch;
-- synchronized completion ordering sufficient to restore money;
-- Port 12 batch state;
-- full-batch strategic review boundary;
-- fallback target-repair path after imperfect batch recovery.
+This validates the corrected W2 sizing for one production cycle. Repeated-cycle validation is still running.
 
 ## Highest-priority known issue
 
@@ -120,11 +109,9 @@ ns.growthAnalyzeSecurity(growThreads)
 
 This makes W2 compensate all grow threads that will execute after HACK rather than the target's pre-hack current state.
 
-The code fix is committed to `main`, but live repeated-batch validation is still required before treating the issue as closed.
-
 Validate that:
 
-- W2 is now sized proportionally to the grow stage rather than remaining at one thread;
+- W2 remains sized proportionally to the grow stage;
 - several consecutive batches recover security to roughly `+0.00–0.05`;
 - no standalone correction weaken is normally required;
 - money recovery remains correct;
@@ -137,12 +124,11 @@ Do **not** hide residual problems by relying on the post-batch repair weaken. Th
 Recommended order:
 
 ```text
-1. Pull/restart and validate corrected single-batch security compensation
-2. Validate repeated automatic batches return to near-minimum security
-3. Add predicted-vs-actual batch recovery telemetry
-4. Measure landing drift / timing error over repeated batches
-5. Tune or adapt the landing gap if needed
-6. Only then implement overlapping/pipelined batches
+1. Validate repeated automatic batches return to near-minimum security
+2. Add predicted-vs-actual batch recovery telemetry
+3. Measure landing drift / timing error over repeated batches
+4. Tune or adapt the landing gap if needed
+5. Only then implement overlapping/pipelined batches
 ```
 
 A useful acceptance criterion before pipelining is several consecutive automatic batches that recover money to the intended baseline and security to roughly `+0.00–0.05`, without needing standalone correction work.
@@ -171,7 +157,13 @@ A manual cash goal blocks automatic cloud-server purchases and upgrades independ
 
 ### GUI React callbacks must stay Netscript-free
 
-React event callbacks only assign plain JS request state. Netscript operations are performed in the asynchronous dashboard loop. This pattern was adopted to keep the GUI responsive and reliable.
+React event callbacks must not call Netscript APIs. They may only update React-local presentation state or assign plain JS request/input state. Netscript port/file operations remain in the asynchronous dashboard loop.
+
+### GUI React tree is persistent
+
+`ui/dashboard.js` now mounts its React tree once. The main loop refreshes a cached runtime snapshot and increments a plain-JS version counter; the mounted React root observes that version and re-renders without `clearLog()` / `printRaw()` remount churn.
+
+Tab selection is React-local and therefore immediate. Controller commands still cross the Netscript boundary through queued plain-JS requests processed by the main loop. This change was made specifically to address slow/hanging tab and mode interactions.
 
 ## Important user-facing controls
 
