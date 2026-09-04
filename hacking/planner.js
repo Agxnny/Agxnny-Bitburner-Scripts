@@ -1,4 +1,4 @@
-import { publishPlannerState } from "/lib/runtime-state.js";
+import { publishPlannerState, readPlannerState } from "/lib/runtime-state.js";
 import { analyzeNetwork, getAvailablePortOpeners } from "/lib/network.js";
 import { rankEligibleTargets } from "/lib/targets.js";
 import { quietArgs, tprint } from "/lib/output.js";
@@ -16,13 +16,25 @@ const WORKER_FILES = Object.freeze([
  * the controller and dashboard can read cached state without carrying the same
  * Netscript RAM costs themselves.
  *
+ * A baseline refresh must not temporarily overwrite an already-valid economic
+ * target. The baseline #1 is published separately, while the previous economic
+ * winner is preserved until the economic selector replaces it with a fresh one.
+ *
  * @param {NS} ns
  */
 export async function main(ns) {
+    const previous = readPlannerState(ns);
     const servers = analyzeNetwork(ns);
     const rankings = rankEligibleTargets(ns, servers);
-    const selectedTarget = rankings[0] ?? null;
+    const baselineSelectedTarget = rankings[0] ?? null;
     const tools = getAvailablePortOpeners(ns);
+
+    const previousEconomicHost = String(previous?.economicSelection?.hostname ?? "");
+    const previousWasEconomic = String(previous?.selectionModel ?? "").startsWith("GOAL_ETA_WITH_PREP_COST");
+    const preservedEconomicTarget = previousWasEconomic && previousEconomicHost
+        ? rankings.find((target) => target.hostname === previousEconomicHost) ?? null
+        : null;
+    const selectedTarget = preservedEconomicTarget ?? baselineSelectedTarget;
 
     const executionHosts = [
         {
@@ -48,30 +60,40 @@ export async function main(ns) {
     };
 
     const workerRam = Object.fromEntries(WORKER_FILES.map((path) => [path, ns.getScriptRam(path, "home")]));
+    const analysisUpdatedAt = Date.now();
 
     const snapshot = {
-        updatedAt: Date.now(),
+        updatedAt: analysisUpdatedAt,
+        analysisUpdatedAt,
         hackingLevel: ns.getHackingLevel(),
+        baselineSelectedTarget,
         selectedTarget,
         rankings,
         executionHosts,
         network,
         workerRam,
+        ...(preservedEconomicTarget ? {
+            selectionModel: previous.selectionModel,
+            economicSelection: previous.economicSelection,
+        } : {}),
     };
 
     publishPlannerState(ns, snapshot);
 
     tprint(ns, "=== TARGET / RAM PLANNER ===");
 
-    if (!selectedTarget) {
+    if (!baselineSelectedTarget) {
         tprint(ns, "No currently-eligible money target found.");
     } else {
-        tprint(ns, `Selected: #${selectedTarget.rank} ${selectedTarget.hostname}`);
-        tprint(ns, `Score:    ${ns.format.number(selectedTarget.score, 2)}`);
-        tprint(ns, `Chance:   ${(selectedTarget.hacking.chance * 100).toFixed(1)}%`);
-        tprint(ns, `Hack time:${(selectedTarget.timing.hackMs / 1000).toFixed(1)}s`);
-        tprint(ns, `Money:    ${(selectedTarget.money.percent * 100).toFixed(1)}% of max`);
-        tprint(ns, `Security: +${selectedTarget.security.delta.toFixed(2)} above minimum`);
+        tprint(ns, `Baseline: #${baselineSelectedTarget.rank} ${baselineSelectedTarget.hostname}`);
+        if (preservedEconomicTarget) {
+            tprint(ns, `Active:   ${preservedEconomicTarget.hostname} (preserved economic target pending refresh)`);
+        }
+        tprint(ns, `Score:    ${ns.format.number(baselineSelectedTarget.score, 2)}`);
+        tprint(ns, `Chance:   ${(baselineSelectedTarget.hacking.chance * 100).toFixed(1)}%`);
+        tprint(ns, `Hack time:${(baselineSelectedTarget.timing.hackMs / 1000).toFixed(1)}s`);
+        tprint(ns, `Money:    ${(baselineSelectedTarget.money.percent * 100).toFixed(1)}% of max`);
+        tprint(ns, `Security: +${baselineSelectedTarget.security.delta.toFixed(2)} above minimum`);
     }
 
     const totalRam = executionHosts.reduce((sum, host) => sum + host.maxRam, 0);
