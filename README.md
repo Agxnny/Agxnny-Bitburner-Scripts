@@ -1,6 +1,6 @@
 # Agxnny Bitburner Scripts
 
-A modular Bitburner automation project for v3.x, currently focused on an early-game distributed HGW system with low-RAM control, remote tactical planning, runtime telemetry, progression guidance, diagnostics, and a path toward adaptive multi-target HWGW batching.
+A modular Bitburner automation project for v3.x, currently focused on an early-game distributed HGW system with low-RAM control, remote tactical planning, runtime telemetry, progression guidance, economic target selection, diagnostics, and a path toward adaptive multi-target HWGW batching.
 
 ## Current architecture
 
@@ -8,7 +8,9 @@ The codebase is intentionally split by responsibility:
 
 - **Workers** stay minimal and only perform assigned `hack`, `grow`, or `weaken` actions.
 - **Planner** performs expensive network discovery and baseline target ranking, then publishes cached state for lightweight consumers.
-- **Controller** runs persistently, tracks the live target state, requests tactical plans, dispatches workers across the rooted RAM pool, and publishes controller state.
+- **Refresh coordinator** runs remotely and refreshes the full planner, economy state, and economic target choice every 30 seconds.
+- **Economic target selector** compares targets by estimated prep time, available RAM, expected production rate, and the current cash goal. A smaller prepared server can therefore outrank a richer server that would take too long to grow/weaken right now.
+- **Controller** runs persistently, tracks the live target state, adopts the latest planner-selected target between jobs, requests tactical plans, dispatches workers across the rooted RAM pool, and publishes controller state.
 - **Tactical planner** performs the expensive HGW thread calculations on a remote host, publishes one requested plan, then exits.
 - **Execution layer** distributes worker threads across home and rooted RAM hosts while preserving a home reserve.
 - **Telemetry** records actual `ns.hack()` returns and rolling income rates from distributed hack workers.
@@ -29,7 +31,7 @@ run kickstart.js
 `kickstart.js` performs a zero-delay handoff sequence:
 
 1. refresh `hacking/planner.js`,
-2. run `network/deploy.js`, which copies worker/support files to rooted RAM hosts and starts remote support services,
+2. run `network/deploy.js`, which copies worker/support files to rooted RAM hosts and starts remote telemetry, diagnostics, and refresh services,
 3. start `hacking/controller.js` on home.
 
 The clean updater intentionally stops active automation and replaces repo-managed files, so run `kickstart.js` again after a pull.
@@ -41,11 +43,13 @@ The current IPC layout is:
 | Port | Purpose |
 | --- | --- |
 | 1 | latest controller state snapshot |
-| 2 | latest planner state snapshot |
+| 2 | latest planner state snapshot / current target priority |
 | 3 | latest tactical thread-plan snapshot |
 | 4 | hack-completion event queue |
 | 5 | aggregate income telemetry snapshot |
 | 6 | user-triggered diagnostic-test request queue |
+| 7 | latest economy/progression snapshot |
+| 8 | latest economic target-ranking snapshot |
 
 State snapshot ports are replaced with the latest value. Port 4 and Port 6 are queues consumed by their respective remote services.
 
@@ -62,15 +66,42 @@ The current controller is sequential HGW rather than timed batching:
 
 Partial dispatches are therefore safe: if only part of a requested grow/weaken/hack fits, the controller waits for that work to finish and recalculates the remaining need instead of blindly launching a stale remainder.
 
-## Target ranking
+## Periodic planning and target priority
 
-`lib/targets.js` currently uses an explainable baseline score:
+`hacking/refresh.js` runs on a rooted remote host and refreshes the decision chain every 30 seconds:
+
+1. `hacking/planner.js` rescans the network and rebuilds baseline target/ranking/RAM state,
+2. `hacking/economy-planner.js` refreshes player cash, progression goal, remaining money required, and observed HGW income,
+3. `hacking/economy-targets.js` evaluates the freshly-ranked targets and writes the economically preferred target back into Port 2.
+
+The controller itself does not import these expensive analysis APIs. It simply sees the refreshed Port-2 target and can switch between jobs.
+
+## Economic target selection
+
+The baseline target score remains:
 
 ```text
 max money × hack percent per thread × hack chance / hack time
 ```
 
-This is deliberately not the final optimizer. Grow recovery, weaken recovery, RAM-time efficiency, and multi-target competition will be added by the adaptive strategy layer.
+That answers which server looks strongest in isolation. The economic selector answers a more useful early-game question: **which server is likely to get us to the current cash goal fastest from its present state?**
+
+For each eligible target it estimates:
+
+- current money percentage,
+- security prep required,
+- grow threads needed to refill the server,
+- weaken needed after growth,
+- how many RAM-limited waves those prep actions would require,
+- estimated prep time before useful production,
+- a small production-cycle hack fraction,
+- recovery grow/weaken cost,
+- estimated steady cash/sec,
+- estimated time to reach the current progression goal.
+
+When a progression goal still needs cash, targets are primarily ordered by estimated goal ETA. This allows a smaller, already-prepared target to beat a high-max-money server whose grow/weaken investment would delay cash for too long. When there is no outstanding cash goal, the selector falls back toward steady income rate while still accounting for prep cost.
+
+This is still a first-pass economic model. Future strategy tuning will compare multiple hack fractions, grow targets, RAM-seconds, observed-versus-predicted income, and multiple simultaneous targets.
 
 ## Progression advisor
 
@@ -128,7 +159,10 @@ manifest.json
 
 hacking/
   controller.js             persistent HGW controller
-  planner.js                network / target / RAM planner
+  planner.js                full network / baseline target / RAM planner
+  refresh.js                remote periodic refresh coordinator
+  economy-planner.js        short-lived cash/progression snapshot builder
+  economy-targets.js        prep-aware goal-ETA target selector
   tactical-planner.js       short-lived expensive HGW calculation
   dispatch.js               manual distributed-dispatch diagnostic
   targets.js                target-ranking diagnostic
@@ -143,7 +177,7 @@ lib/
   execution.js              RAM pool + distributed thread dispatch
   network.js                discovery / access analysis helpers
   progression.js            progression candidate ranking
-  runtime-state.js          Ports 1-3 state transport
+  runtime-state.js          Ports 1-3 and 7-8 snapshot transport
   state.js                  target/controller state model
   targets.js                target analysis/ranking
   telemetry.js              Ports 4-5 telemetry transport
@@ -175,20 +209,21 @@ Current examples from Bitburner v3.0.1 testing:
 
 - `diagnostics/dashboard.js` has been reduced to cached-state-only behavior and should remain close to base script RAM.
 - `hacking/telemetry.js` is a base-cost persistent remote service.
-- `hacking/tactical-planner.js` is intentionally expensive because its analysis APIs are expensive, so it runs remotely and exits immediately.
-- `hacking/controller.js` is the next important persistent-home optimization target; a future dispatcher split can move its `exec` cost off home.
+- `hacking/tactical-planner.js`, `hacking/planner.js`, and the economic analysis scripts are intentionally kept off the persistent home controller.
+- `hacking/controller.js` remains the next important persistent-home optimization target; a future dispatcher split can move its `exec` cost off home.
 
 ## Roadmap
 
 The next major layers are:
 
-1. continue reducing persistent home RAM usage,
-2. add more progression candidate types such as port openers,
-3. validate and use real hack-income telemetry in strategy decisions,
-4. build an adaptive strategy evaluator for hack %, grow target %, recovery cost, and money/sec/GB,
-5. optimize the whole RAM pool across multiple targets,
-6. add predicted-vs-actual performance metrics,
-7. transition from sequential HGW to timed HWGW batches,
-8. expand the persistent dashboard as new structured state becomes useful.
+1. validate periodic economic target switching against real gameplay,
+2. continue reducing persistent home RAM usage,
+3. add more progression candidate types such as port openers,
+4. use real hack-income telemetry to calibrate predicted target income,
+5. build an adaptive strategy evaluator for hack %, grow target %, recovery cost, and money/sec/GB,
+6. optimize the whole RAM pool across multiple targets,
+7. add predicted-vs-actual performance metrics,
+8. transition from sequential HGW to timed HWGW batches,
+9. expand the persistent dashboard as new structured state becomes useful.
 
 See [`docs/architecture.md`](docs/architecture.md) for the architectural direction.
