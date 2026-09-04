@@ -1,5 +1,6 @@
 import {
     isControllerStateStale,
+    publishManualMoneyGoalState,
     readCloudPurchaseState,
     readControllerState,
     readEconomyState,
@@ -12,6 +13,7 @@ import {
 import { readTelemetryState } from "/lib/telemetry.js";
 
 const TEST_REQUEST_PORT = 6;
+const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
 const TABS = Object.freeze(["Overview", "Targets", "Economy", "Network", "Diagnostics"]);
 const UI_TICK_MS = 100;
 const DATA_REFRESH_MS = 1000;
@@ -19,7 +21,11 @@ const DATA_REFRESH_MS = 1000;
 let activeTab = "Overview";
 let requestedTab = "Overview";
 let requestedTest = null;
+let requestedGoalAction = null;
 let actionStatus = "Ready";
+let goalStatus = "Ready";
+let goalInput = "";
+let goalLabelInput = "";
 let cachedState = null;
 let lastDataRefresh = 0;
 let dirty = true;
@@ -53,6 +59,15 @@ export async function main(ns) {
             dirty = true;
         }
 
+        if (requestedGoalAction) {
+            const action = requestedGoalAction;
+            requestedGoalAction = null;
+            await applyGoalAction(ns, action, now);
+            cachedState = snapshot(ns);
+            lastDataRefresh = now;
+            dirty = true;
+        }
+
         if (dirty) {
             redraw(ns);
             dirty = false;
@@ -74,6 +89,42 @@ function snapshot(ns) {
         purchase: readCloudPurchaseState(ns),
         manualGoal: readManualMoneyGoalState(ns),
     };
+}
+
+async function applyGoalAction(ns, action, now) {
+    if (action.type === "clear") {
+        const state = {
+            version: 1,
+            active: false,
+            targetCash: 0,
+            title: "",
+            updatedAt: now,
+            clearedAt: now,
+        };
+        await ns.write(MANUAL_GOAL_CONFIG, JSON.stringify(state), "w");
+        publishManualMoneyGoalState(ns, state);
+        goalStatus = "Money goal cleared · automatic spending enabled";
+        return;
+    }
+
+    const targetCash = parseMoney(action.value);
+    if (!(targetCash > 0) || !Number.isFinite(targetCash)) {
+        goalStatus = "Invalid goal · try 50m, 1.5b, or 25000000";
+        return;
+    }
+
+    const title = String(action.label ?? "").trim() || "Manual cash goal";
+    const state = {
+        version: 1,
+        active: true,
+        targetCash,
+        title,
+        updatedAt: now,
+        setAt: now,
+    };
+    await ns.write(MANUAL_GOAL_CONFIG, JSON.stringify(state), "w");
+    publishManualMoneyGoalState(ns, state);
+    goalStatus = `Goal set to ${moneyFmt(targetCash)} · automatic spending locked`;
 }
 
 function redraw(ns) {
@@ -197,32 +248,64 @@ function economyView(s) {
     const goal = e.goal ?? {};
     const manual = s.manualGoal ?? {};
     const purchase = s.purchase ?? {};
-    return grid(
-        card("Active money goal", el("div", null,
-            kv("Mode", e.mode ?? "waiting"),
-            kv("Goal", goal.title ?? "No goal"),
-            kv("Current cash", moneyFmt(e.cash)),
-            kv("Remaining", moneyFmt(goal.remaining)),
-            kv("Ready", goal.ready ? "YES" : "NO"),
-        )),
-        card("Savings lock", el("div", null,
-            kv("Status", manual.active ? "ACTIVE" : "OFF"),
-            kv("Target", manual.active ? moneyFmt(manual.targetCash) : "—"),
-            kv("Label", manual.title || "—"),
-            kv("Auto purchasing", manual.active ? "BLOCKED" : "ENABLED"),
-        )),
-        card("Cloud purchasing", el("div", null,
-            kv("Status", purchase.status ?? "No state"),
-            kv("Last host", purchase.hostname || "—"),
-            kv("RAM", purchase.ram ? ramFmt(purchase.ram) : "—"),
-            note(purchase.reason ?? "No purchase activity yet"),
-        )),
-        card("Useful commands", el("div", null,
-            command("Set savings goal", "run economy/manual-goal.js 50m"),
-            command("Check goal", "run economy/manual-goal.js status"),
-            command("Clear goal", "run economy/manual-goal.js clear"),
-            command("Economy report", "run diagnostics/economy-targets.js"),
-        )),
+    return el("div", null,
+        card("Money goal controls", el("div", null,
+            el("div", { style: styles.goalForm },
+                el("input", {
+                    value: goalInput,
+                    placeholder: "Target cash · e.g. 50m or 1.5b",
+                    onChange: (event) => { goalInput = String(event.target.value ?? ""); },
+                    onKeyDown: (event) => {
+                        if (event.key === "Enter") requestedGoalAction = { type: "set", value: goalInput, label: goalLabelInput };
+                    },
+                    style: styles.input,
+                }),
+                el("input", {
+                    value: goalLabelInput,
+                    placeholder: "Optional label",
+                    onChange: (event) => { goalLabelInput = String(event.target.value ?? ""); },
+                    onKeyDown: (event) => {
+                        if (event.key === "Enter") requestedGoalAction = { type: "set", value: goalInput, label: goalLabelInput };
+                    },
+                    style: styles.input,
+                }),
+                el("button", {
+                    onClick: () => { requestedGoalAction = { type: "set", value: goalInput, label: goalLabelInput }; },
+                    style: styles.primaryButton,
+                }, "Set money goal"),
+                el("button", {
+                    onClick: () => { requestedGoalAction = { type: "clear" }; },
+                    style: styles.clearButton,
+                }, "Clear goal / auto spend"),
+            ),
+            el("div", { style: styles.goalHint }, "Accepts plain amounts or k / m / b / t suffixes. Setting a goal immediately locks automated purchases."),
+            el("div", { style: styles.goalStatus }, goalStatus),
+        ), true),
+        grid(
+            card("Active money goal", el("div", null,
+                kv("Mode", e.mode ?? "waiting"),
+                kv("Goal", goal.title ?? "No goal"),
+                kv("Current cash", moneyFmt(e.cash)),
+                kv("Remaining", moneyFmt(goal.remaining)),
+                kv("Ready", goal.ready ? "YES" : "NO"),
+            )),
+            card("Savings lock", el("div", null,
+                kv("Status", manual.active ? "ACTIVE" : "OFF"),
+                kv("Target", manual.active ? moneyFmt(manual.targetCash) : "—"),
+                kv("Label", manual.title || "—"),
+                kv("Auto purchasing", manual.active ? "BLOCKED" : "ENABLED"),
+            )),
+            card("Cloud purchasing", el("div", null,
+                kv("Status", purchase.status ?? "No state"),
+                kv("Last host", purchase.hostname || "—"),
+                kv("RAM", purchase.ram ? ramFmt(purchase.ram) : "—"),
+                note(purchase.reason ?? "No purchase activity yet"),
+            )),
+            card("Useful commands", el("div", null,
+                command("Check goal", "run economy/manual-goal.js status"),
+                command("Economy report", "run diagnostics/economy-targets.js"),
+            )),
+        ),
     );
 }
 
@@ -379,6 +462,20 @@ function command(label, value) {
     );
 }
 
+function parseMoney(value) {
+    const text = String(value ?? "").trim().toLowerCase().replaceAll(",", "").replaceAll("$", "");
+    const match = text.match(/^([0-9]+(?:\.[0-9]+)?)([kmbt]?)$/);
+    if (!match) return NaN;
+    const number = Number(match[1]);
+    const suffix = match[2];
+    const multiplier = suffix === "k" ? 1e3
+        : suffix === "m" ? 1e6
+            : suffix === "b" ? 1e9
+                : suffix === "t" ? 1e12
+                    : 1;
+    return number * multiplier;
+}
+
 function pct(v) { return `${(Math.max(0, Number(v ?? 0)) * 100).toFixed(0)}%`; }
 function num(v) { return Number(v ?? 0).toFixed(2); }
 function moneyFmt(v) {
@@ -454,6 +551,12 @@ const styles = {
     healthWait: { color: "#d4ae69", fontSize: "10px", fontWeight: 700 },
     actionButton: { fontFamily: "monospace", marginRight: "8px", marginBottom: "8px", padding: "7px 10px", borderRadius: "5px", border: "1px solid #32536a", background: "#112334", color: "#b8dcf4", cursor: "pointer" },
     actionStatus: { color: "#7f8e9c", fontSize: "10px", marginTop: "4px" },
+    goalForm: { display: "grid", gridTemplateColumns: "1.25fr 1fr auto auto", gap: "8px", alignItems: "center" },
+    input: { minWidth: 0, fontFamily: "monospace", color: "#d8e1e9", background: "#0b1117", border: "1px solid #2b3945", borderRadius: "5px", padding: "8px 9px", outline: "none", fontSize: "11px" },
+    primaryButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #2e5c7d", background: "#12304a", color: "#bfe4ff", cursor: "pointer", whiteSpace: "nowrap" },
+    clearButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #5b4930", background: "#271e11", color: "#f0cf91", cursor: "pointer", whiteSpace: "nowrap" },
+    goalHint: { color: "#687888", fontSize: "9px", marginTop: "8px" },
+    goalStatus: { color: "#9dc7e4", fontSize: "10px", marginTop: "7px" },
     command: { marginBottom: "9px" },
     commandLabel: { color: "#708090", fontSize: "9px", marginBottom: "3px" },
     code: { color: "#b8d6e8", background: "#0b1117", border: "1px solid #1d2832", borderRadius: "4px", padding: "5px 7px", fontSize: "10px" },
