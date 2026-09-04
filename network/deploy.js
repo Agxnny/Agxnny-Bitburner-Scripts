@@ -3,9 +3,14 @@ import { WORKER_SCRIPTS } from "/lib/execution.js";
 
 const TELEMETRY_SCRIPT = "/hacking/telemetry.js";
 const TEST_LAUNCHER_SCRIPT = "/diagnostics/test-launcher.js";
+const REFRESH_SCRIPT = "/hacking/refresh.js";
 
 const SUPPORT_FILES = Object.freeze([
+    "/hacking/planner.js",
     "/hacking/tactical-planner.js",
+    "/hacking/economy-planner.js",
+    "/hacking/economy-targets.js",
+    REFRESH_SCRIPT,
     TELEMETRY_SCRIPT,
     TEST_LAUNCHER_SCRIPT,
     "/diagnostics/test.js",
@@ -13,6 +18,8 @@ const SUPPORT_FILES = Object.freeze([
     "/lib/runtime-state.js",
     "/lib/telemetry.js",
     "/lib/progression.js",
+    "/lib/network.js",
+    "/lib/targets.js",
     "/lib/state.js",
     "/lib/execution.js",
 ]);
@@ -57,10 +64,11 @@ export async function main(ns) {
     }
 
     ns.tprint(`Deployment complete: ${success}/${remoteHosts.length} host(s).`);
-    ns.tprint(`Files per host: ${files.length} (workers + tactical/telemetry/diagnostic support)`);
+    ns.tprint(`Files per host: ${files.length} (workers + planner/tactical/telemetry/diagnostic support)`);
 
-    startRemoteService(ns, remoteHosts, TELEMETRY_SCRIPT, "Telemetry collector");
-    startRemoteService(ns, remoteHosts, TEST_LAUNCHER_SCRIPT, "Diagnostic test launcher");
+    startRemoteService(ns, remoteHosts, TELEMETRY_SCRIPT, "Telemetry collector", false);
+    startRemoteService(ns, remoteHosts, TEST_LAUNCHER_SCRIPT, "Diagnostic test launcher", false);
+    startRemoteService(ns, remoteHosts, REFRESH_SCRIPT, "Planner refresh coordinator", true);
 
     if (String(ns.args[0] ?? "") === "--kickstart") {
         const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 2)));
@@ -69,15 +77,18 @@ export async function main(ns) {
 }
 
 /**
- * Keep one instance of a persistent support service off home. Prefer the
- * smallest remote server with enough current free RAM.
+ * Keep one instance of a persistent support service off home.
+ * For ordinary tiny services, prefer the smallest server that fits. The refresh
+ * coordinator needs room for its own RAM plus a 7GB planner on another remote
+ * host, so it prefers larger hosts to reduce launch starvation.
  *
  * @param {NS} ns
  * @param {string[]} remoteHosts
  * @param {string} script
  * @param {string} label
+ * @param {boolean} preferLarge
  */
-function startRemoteService(ns, remoteHosts, script, label) {
+function startRemoteService(ns, remoteHosts, script, label, preferLarge) {
     for (const hostname of remoteHosts) {
         if (ns.isRunning(script, hostname)) {
             ns.tprint(`${label} already running on ${hostname}.`);
@@ -97,7 +108,9 @@ function startRemoteService(ns, remoteHosts, script, label) {
             freeRam: Math.max(0, ns.getServerMaxRam(hostname) - ns.getServerUsedRam(hostname)),
         }))
         .filter((host) => host.freeRam >= scriptRam)
-        .sort((a, b) => a.freeRam - b.freeRam || a.hostname.localeCompare(b.hostname));
+        .sort((a, b) => preferLarge
+            ? b.freeRam - a.freeRam || a.hostname.localeCompare(b.hostname)
+            : a.freeRam - b.freeRam || a.hostname.localeCompare(b.hostname));
 
     for (const host of candidates) {
         const pid = ns.exec(script, host.hostname, 1);
