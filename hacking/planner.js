@@ -1,6 +1,7 @@
 import { publishPlannerState } from "/lib/runtime-state.js";
 import { analyzeNetwork, getAvailablePortOpeners } from "/lib/network.js";
 import { rankEligibleTargets } from "/lib/targets.js";
+import { quietArgs, tprint } from "/lib/output.js";
 
 const WORKER_FILES = Object.freeze([
     "/hacking/workers/hack.js",
@@ -60,26 +61,26 @@ export async function main(ns) {
 
     publishPlannerState(ns, snapshot);
 
-    ns.tprint("=== TARGET / RAM PLANNER ===");
+    tprint(ns, "=== TARGET / RAM PLANNER ===");
 
     if (!selectedTarget) {
-        ns.tprint("No currently-eligible money target found.");
+        tprint(ns, "No currently-eligible money target found.");
     } else {
-        ns.tprint(`Selected: #${selectedTarget.rank} ${selectedTarget.hostname}`);
-        ns.tprint(`Score:    ${ns.format.number(selectedTarget.score, 2)}`);
-        ns.tprint(`Chance:   ${(selectedTarget.hacking.chance * 100).toFixed(1)}%`);
-        ns.tprint(`Hack time:${(selectedTarget.timing.hackMs / 1000).toFixed(1)}s`);
-        ns.tprint(`Money:    ${(selectedTarget.money.percent * 100).toFixed(1)}% of max`);
-        ns.tprint(`Security: +${selectedTarget.security.delta.toFixed(2)} above minimum`);
+        tprint(ns, `Selected: #${selectedTarget.rank} ${selectedTarget.hostname}`);
+        tprint(ns, `Score:    ${ns.format.number(selectedTarget.score, 2)}`);
+        tprint(ns, `Chance:   ${(selectedTarget.hacking.chance * 100).toFixed(1)}%`);
+        tprint(ns, `Hack time:${(selectedTarget.timing.hackMs / 1000).toFixed(1)}s`);
+        tprint(ns, `Money:    ${(selectedTarget.money.percent * 100).toFixed(1)}% of max`);
+        tprint(ns, `Security: +${selectedTarget.security.delta.toFixed(2)} above minimum`);
     }
 
     const totalRam = executionHosts.reduce((sum, host) => sum + host.maxRam, 0);
-    ns.tprint(`RAM hosts: ${executionHosts.length} (${ns.format.ram(totalRam)} total max RAM)`);
-    ns.tprint(`Network:   ${network.discovered} discovered | ${network.rooted} rooted | ${network.hgwTargets} HGW target(s)`);
-    ns.tprint("Planner snapshot published.");
+    tprint(ns, `RAM hosts: ${executionHosts.length} (${ns.format.ram(totalRam)} total max RAM)`);
+    tprint(ns, `Network:   ${network.discovered} discovered | ${network.rooted} rooted | ${network.hgwTargets} HGW target(s)`);
+    tprint(ns, "Planner snapshot published.");
 
     if (String(ns.args[0] ?? "") === "--kickstart") {
         const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 1)));
-        ns.spawn("/kickstart.js", { threads: 1, spawnDelay: 0 }, nextStage);
+        ns.spawn("/kickstart.js", { threads: 1, spawnDelay: 0 }, nextStage, ...quietArgs(ns));
     }
 }
