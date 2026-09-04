@@ -1,5 +1,5 @@
 import { calculateThreadPlan } from "/lib/threads.js";
-import { publishTacticalPlanState } from "/lib/runtime-state.js";
+import { publishTacticalPlanState, readControllerState } from "/lib/runtime-state.js";
 import { positionalArgs, tprint } from "/lib/output.js";
 
 /**
@@ -26,7 +26,7 @@ export async function main(ns) {
     const requestId = String(args[1] ?? "");
     const hackFractionArg = args[2];
     const moneyTargetPercentArg = args[3];
-    const tacticalMode = String(args[4] ?? "").trim().toUpperCase();
+    const requestedMode = String(args[4] ?? "").trim().toUpperCase();
 
     if (!hostname) {
         tprint(ns, "ERROR: tactical-planner.js requires a target hostname.");
@@ -43,6 +43,7 @@ export async function main(ns) {
     if (moneyTargetPercentArg !== undefined) options.moneyTargetPercent = Number(moneyTargetPercentArg);
 
     const plan = calculateThreadPlan(ns, hostname, options);
+    const tacticalMode = requestedMode || inferBatchMode(ns, hostname);
     applyForcedMode(plan, tacticalMode);
 
     const snapshot = {
@@ -54,6 +55,18 @@ export async function main(ns) {
     };
 
     publishTacticalPlanState(ns, snapshot);
+}
+
+function inferBatchMode(ns, hostname) {
+    const controller = readControllerState(ns);
+    if (controller?.hostname !== hostname || controller?.executionMode?.mode !== "BATCH") return "";
+
+    const action = String(controller?.action ?? "").toUpperCase();
+    const reason = String(controller?.reason ?? "");
+    if (!reason.startsWith("Batch mode prep:")) return "";
+    if (action === "GROW") return "BATCH_GROW";
+    if (action === "WEAKEN") return "BATCH_WEAKEN";
+    return "";
 }
 
 function applyForcedMode(plan, tacticalMode) {
