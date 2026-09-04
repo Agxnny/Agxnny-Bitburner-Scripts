@@ -1,5 +1,7 @@
 import { publishHackEvent } from "/lib/telemetry.js";
 
+const BATCH_TIMING_PORT = 14;
+
 /** @param {NS} ns */
 export async function main(ns) {
     const target = String(ns.args[0] ?? "");
@@ -8,6 +10,7 @@ export async function main(ns) {
     const additionalMsec = Math.max(0, Math.floor(Number(ns.args[3] ?? 0)));
     const batchId = String(ns.args[4] ?? "");
     const stage = String(ns.args[5] ?? "HACK");
+    const plannedLandingAt = Math.max(0, Number(ns.args[6] ?? 0));
 
     if (!target) {
         ns.tprint("ERROR: hack.js requires a target hostname.");
@@ -32,4 +35,17 @@ export async function main(ns) {
         finishedAt,
         durationMs: Math.max(0, finishedAt - startedAt),
     });
+
+    if (batchId && plannedLandingAt > 0) {
+        ns.writePort(BATCH_TIMING_PORT, JSON.stringify({
+            type: "BATCH_STAGE_COMPLETE",
+            batchId,
+            stage,
+            jobId,
+            threads,
+            finishedAt,
+            plannedLandingAt,
+            landingErrorMs: finishedAt - plannedLandingAt,
+        }));
+    }
 }
