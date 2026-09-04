@@ -109,13 +109,14 @@ The Batch tab shows current batch status, last completed recovery, actual stage 
 Recommended order:
 
 ```text
-1. Pull/restart and allow at least one new batch to complete
-2. Inspect the Batch tab retained completed result
-3. Confirm H → W1 → G → W2 actual order remains correct
-4. Collect several samples of max landing error, minimum spacing, and allocation spread
-5. Decide whether the fixed 200 ms gap has sufficient safety margin
-6. Tune/adapt the gap only if measurements justify it
-7. Only then implement overlapping/pipelined batches
+1. Pull/restart and verify HGW → BATCH GUI switching completes at a safe boundary
+2. Allow at least one new batch to complete
+3. Inspect the Batch tab retained completed result
+4. Confirm H → W1 → G → W2 actual order remains correct
+5. Collect several samples of max landing error, minimum spacing, and allocation spread
+6. Decide whether the fixed 200 ms gap has sufficient safety margin
+7. Tune/adapt the gap only if measurements justify it
+8. Only then implement overlapping/pipelined batches
 ```
 
 Before pipelining, several consecutive automatic batches should recover money/security correctly, require no standalone correction work, report all worker timing events, and preserve the intended landing order with understood timing margin.
@@ -129,6 +130,19 @@ H/G/W worker jobs do not use home as fallback capacity. Home is preserved for co
 ### One batch at a time for now
 
 Do not jump directly to overlapping batches. The existing system deliberately serializes synchronized batches while correctness and timing are being validated.
+
+### Execution-mode changes are scheduling barriers
+
+`SET_EXECUTION_MODE` is not allowed to compete with fresh tactical work. When HGW/BATCH switching is pending:
+
+- no new tactical or batch work is scheduled;
+- an in-flight tactical-analysis process may be cancelled immediately because it has no target-side effect;
+- already-running H/G/W workers are allowed to finish naturally;
+- an already-running synchronized batch is allowed to finish naturally;
+- the controller publishes the pending transition through `executionMode.pending` / `transitioning` until the safe boundary is reached;
+- only then is the new execution mode applied.
+
+This prevents a mode button from appearing ignored because the controller keeps creating new work while waiting to become idle.
 
 ### Full-batch review boundary
 
