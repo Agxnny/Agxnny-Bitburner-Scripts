@@ -9,7 +9,7 @@ The codebase is intentionally split by responsibility:
 - **Workers** stay minimal and only perform assigned `hack`, `grow`, or `weaken` actions.
 - **Planner** performs expensive network discovery and baseline target ranking, then publishes cached state for lightweight consumers. Baseline refreshes no longer overwrite a valid economic target while the fresh economy pass is still running.
 - **Refresh coordinator** runs remotely and refreshes the full planner, economy state, and economic target choice every 30 seconds.
-- **Economic target selector** compares targets by live money/security state, estimated prep time, available RAM, expected production rate, and the current cash goal. A smaller prepared server can therefore outrank a richer server that would take too long to grow/weaken right now.
+- **Economic target selector** compares targets by live money/security state, real distributed thread capacity, estimated prep waves, exponentially weighted prep time, expected production rate, and the current cash goal. A smaller prepared server can therefore outrank a richer server that would take too long to grow/weaken right now.
 - **Controller** runs persistently, tracks the live target state, adopts the latest planner-selected target between jobs, requests tactical plans, dispatches workers across the rooted RAM pool, and publishes controller state.
 - **Tactical planner** performs the expensive HGW thread calculations on a remote host, publishes one requested plan, then exits.
 - **Execution layer** distributes worker threads across home and rooted RAM hosts while preserving a home reserve.
@@ -97,13 +97,15 @@ The baseline target score remains:
 max money × hack percent per thread × hack chance / hack time
 ```
 
-That answers which server looks strongest in isolation. The economic selector answers a more useful early-game question: **which server is likely to get us to the current cash goal fastest from its present state?**
+That answers which server looks strongest in isolation. The economic selector answers a more useful early-game question: **which server is likely to get us to the current cash goal fastest from its present state with the RAM we can actually dispatch?**
 
-For each eligible target it reads live money and security, then estimates security prep, grow/weaken work, RAM-limited prep waves, expected cash/sec, recovery cost, and estimated time to reach the active progression goal. If the controller snapshot is not yet fresh during startup, it derives usable RAM directly from the planner execution-host snapshot instead of assuming near-zero capacity.
+For each eligible target it reads live money and security, calculates required weaken/grow/recovery threads, and measures current distributed worker capacity by summing the thread slots that actually fit on each execution host after used RAM and the home reserve are removed. Prep and production time are then calculated in waves rather than from aggregate RAM alone. This better reflects the real number of HGW threads the current pool can launch at once, including host fragmentation.
 
-When a progression goal still needs cash, targets are primarily ordered by estimated goal ETA. This allows a smaller, already-prepared target to beat a high-max-money server whose grow/weaken investment would delay cash for too long. When there is no outstanding cash goal, the selector falls back toward steady income rate while still accounting for prep cost.
+Prep time is then weighted non-linearly. The current model uses a 30-minute exponential scale: short prep stays near its real elapsed time, while multi-hour prep receives a rapidly increasing penalty. The economic selector ranks by this weighted prep cost plus estimated production time toward the current cash goal. That deliberately favors targets that can begin paying sooner when home RAM or another progression purchase is still unaffordable.
 
-This is still a first-pass economic model. Future strategy tuning will compare multiple hack fractions, grow targets, RAM-seconds, observed-versus-predicted income, and multiple simultaneous targets.
+The Port-8 economic snapshot records usable RAM, per-action thread capacity, raw prep time, weighted prep time, prep penalty multiplier, prep/production wave counts, estimated steady income, and the resulting economic ETA. `diagnostics/economy-targets.js` displays the weighting so target decisions remain inspectable.
+
+This is still an evolving economic model. The next strategy step is to compare multiple desired money percentages instead of assuming every target must be grown to 100% before production. That will allow the system to decide whether a partially prepared rich server is worth using sooner instead of paying the full grow-to-max cost.
 
 ## Progression advisor
 
@@ -213,7 +215,7 @@ Current examples from Bitburner v3.0.1 testing:
 
 The next major layers are:
 
-1. validate economic target switching against real gameplay,
+1. validate capacity-aware, prep-weighted economic target switching against real gameplay,
 2. add target-switch hysteresis,
 3. evaluate partial grow targets instead of assuming every server should reach 100%,
 4. continue reducing persistent home RAM usage,
