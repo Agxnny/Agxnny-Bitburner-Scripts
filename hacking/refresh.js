@@ -84,7 +84,7 @@ export async function main(ns) {
                         if (hackNeedsReview) reasons.push("HACK completion");
                         if (rootExpansion) reasons.push("new root access");
                         if (manualGoalChanged) reasons.push("manual money-goal change");
-                        if (result.purchased) reasons.push(`cloud purchase ${result.hostname}`);
+                        if (result.capacityChanged) reasons.push(`${result.action.toLowerCase()} ${result.hostname}`);
                         ns.print(`Target/RAM review complete after ${reasons.join(" + ")}.`);
                     }
                 }
@@ -96,40 +96,43 @@ export async function main(ns) {
 }
 
 /**
- * Refresh progression state, optionally buy exactly one advisor-selected cloud
- * server, then publish the final economic target decision. The cloud buyer has a
- * direct manual-goal spending lock, so an active manual goal can never authorize
- * an automatic purchase even if Port 7 contains stale automatic advice.
+ * Refresh progression state, optionally execute exactly one advisor-selected
+ * cloud capacity action, then publish the final economic target decision.
+ * The cloud spender has a direct manual-goal lock, so stale economy state cannot
+ * authorize spending after the user enables a savings target.
  */
 async function runEconomyPurchaseTargetChain(ns) {
     const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
-    if (!economyOk) return { ok: false, purchased: false, hostname: "" };
+    if (!economyOk) return { ok: false, capacityChanged: false, hostname: "", action: "NONE" };
 
-    const previousPurchaseAt = Number(readCloudPurchaseState(ns)?.updatedAt ?? 0);
+    const previousCapacityAt = Number(readCloudPurchaseState(ns)?.updatedAt ?? 0);
     const buyerOk = await launchAndWait(ns, CLOUD_BUY_SCRIPT, true);
-    let purchased = false;
+    let capacityChanged = false;
     let hostname = "";
+    let action = "NONE";
 
     if (buyerOk) {
         const purchase = readCloudPurchaseState(ns);
-        purchased = Boolean(purchase?.purchased) && Number(purchase?.updatedAt ?? 0) > previousPurchaseAt;
-        hostname = purchased ? String(purchase?.hostname ?? "") : "";
+        capacityChanged = Boolean(purchase?.capacityChanged)
+            && Number(purchase?.updatedAt ?? 0) > previousCapacityAt;
+        hostname = capacityChanged ? String(purchase?.hostname ?? "") : "";
+        action = capacityChanged ? String(purchase?.action ?? "CLOUD_CAPACITY") : "NONE";
     }
 
-    if (purchased) {
+    if (capacityChanged) {
         const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT, true);
-        if (!plannerOk) return { ok: false, purchased, hostname };
+        if (!plannerOk) return { ok: false, capacityChanged, hostname, action };
         await launchAndWait(ns, SYNC_SCRIPT, true);
 
-        // Recalculate progression once after the purchase so Port 7 reflects the
-        // reduced cash/new server count. Do not invoke the buyer a second time in
-        // this same strategic pass.
+        // Recalculate progression once after capacity changes so Port 7 reflects
+        // reduced cash and the updated server fleet. Do not invoke the spender a
+        // second time in this same strategic pass.
         const refreshedEconomyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
-        if (!refreshedEconomyOk) return { ok: false, purchased, hostname };
+        if (!refreshedEconomyOk) return { ok: false, capacityChanged, hostname, action };
     }
 
     const targetOk = await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
-    return { ok: targetOk, purchased, hostname };
+    return { ok: targetOk, capacityChanged, hostname, action };
 }
 
 async function launchAndWait(ns, script, forceQuiet = false) {
