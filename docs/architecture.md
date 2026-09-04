@@ -27,7 +27,30 @@ planner → deploy/sync → economy/target → controller
 
 React callbacks never call Netscript APIs directly. Command callbacks assign plain-JS request state; the dashboard loop later writes Port 13 or files.
 
-The GUI now has a dedicated **Batch** tab. Overview remains focused on current control-plane status, while the Batch tab owns synchronized-HWGW observability: current batch state, latest completed recovery, landing-order measurements, per-stage errors/spread, and a planned-vs-actual landing timeline.
+The GUI has a dedicated **Batch** tab. Overview remains focused on current control-plane status, while the Batch tab owns synchronized-HWGW observability: current batch state, planned H/W1/G/W2 landing countdowns, W2 ETA, latest completed recovery, landing-order measurements, per-stage errors/spread, and a planned-vs-actual landing timeline.
+
+Overview also consumes controller-published standalone worker timing state. It shows current action ETA and an Active Workers table without scanning remote process lists from the GUI.
+
+## Standalone worker observability
+
+When the controller dispatches a normal/prep H/G/W operation, it records timing metadata on each allocation:
+
+```text
+pid
+hostname
+threads
+action
+target
+startedAt
+expectedDurationMs
+expectedFinishAt
+```
+
+These are republished through Port 1 under `execution.activeWorkers`, plus an aggregate `execution.currentAction` ETA summary.
+
+The GUI may label an allocation `LATE` after the expected duration plus an observation margin of `max(5s, 15%)`. This is intentionally **diagnostic only**. No current code kills a worker for exceeding that estimate.
+
+A future watchdog should be a separate reliability layer. It must use measured runtime variation, verify that the PID is still active, apply a grace period, and force target recovery/prep after any killed partial operation rather than treating termination as normal completion.
 
 ## Execution modes
 
@@ -53,6 +76,18 @@ WEAKEN_GROW       t0 + 3 × gap
 Default gap: 200 ms.
 
 The batch runner reserves the full remote worker footprint before launch. If the whole batch does not fit, no stage starts.
+
+## Safe execution-mode transitions
+
+A pending `SET_EXECUTION_MODE` command becomes a scheduling barrier:
+
+- new tactical/batch work is paused;
+- tactical analysis can be cancelled immediately because it has no target-side effect;
+- active H/G/W work is allowed to finish;
+- an active synchronized batch is allowed to finish;
+- the new mode is applied only after the safe boundary.
+
+The GUI disables both mode buttons while this transition is pending and displays `SWITCHING → HGW/BATCH`.
 
 ## Batch recovery model
 
@@ -103,7 +138,9 @@ landing.stages[]
 
 When a batch reaches `COMPLETE`, the same completed snapshot is also copied to **Port 15**. Port 12 is free to advance immediately to the next current batch, while Port 15 remains stable for GUI inspection.
 
-The Batch tab renders `landing.stages[]` as a planned-vs-actual timeline. Each H/W1/G/W2 row plots planned and actual completion on the same horizontal axis, making systematic early/late landing visually obvious while preserving exact numeric errors and allocation spread below.
+The Batch tab renders `landing.stages[]` as a planned-vs-actual timeline. While a batch is active, planned `stages[].landingAt` and `timing.lastLandingAt` drive live stage/W2 countdowns and planned total-duration display.
+
+Overview filters stale `COMPLETE` Port 12 state so an old completed target is not presented as the current batch.
 
 ### Current serialization assumption
 
@@ -158,6 +195,7 @@ Stage 4 synchronized batching currently includes:
 - predicted-vs-actual recovery telemetry;
 - actual landing drift/order telemetry;
 - retained latest-completed batch state and dedicated Batch GUI workspace;
+- standalone active-worker ETA/late observability;
 - **current: repeated timing-margin measurement**.
 
-Stage 5 pipelining begins only after repeated timing measurements show understood and adequate landing margin.
+Stage 5 pipelining begins only after repeated timing measurements show understood and adequate landing margin. Automatic worker watchdog termination remains deferred until after this timing work is stable.
