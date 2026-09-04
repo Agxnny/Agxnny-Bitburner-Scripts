@@ -1,6 +1,7 @@
 {
   "files": [
     "hacking/controller.js",
+    "hacking/planner.js",
     "hacking/targets.js",
     "hacking/workers/hack.js",
     "hacking/workers/grow.js",
