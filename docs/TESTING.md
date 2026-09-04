@@ -90,14 +90,14 @@ Expected safety behavior on an unprepared target:
 [BATCH] BLOCKED: Target security is ...; batch requires prepared security
 ```
 
-Expected successful behavior on a prepared target:
+Expected successful behavior on a prepared target now includes predicted-vs-actual output:
 
 ```text
 [BATCH] COMPLETE <target> | ...
-[BATCH] Final money 100.0% | security +0.000
+[BATCH] Predicted money ... | security ...
+[BATCH] Actual    money ... | security ...
+[BATCH] Error     money ... | security ...
 ```
-
-This proved the timing/landing mechanism can work on a simple prepared target.
 
 ## Automatic batch-mode validation
 
@@ -125,83 +125,68 @@ BATCH_READY or correction prep
 
 The controller should never launch the next batch while `awaitingReview` is true.
 
-## Latest automatic batch observation
+## Batch security compensation validation
 
-Live observation on 2026-09-05 before the security-calculation fix:
+The original live failure on `sigma-cosmetics` used:
 
 ```text
-target: sigma-cosmetics
-batch status: COMPLETE
-threads: 25H / 1W / 298G / 1W
+25H / 1W / 298G / 1W
 final money: 100%
-final security: +1.13 above minimum
+final security: +1.13
 ```
 
-After review, controller state showed:
-
-```text
-SECURITY_PREP / WEAKEN
-1 active worker job
-23 active weaken threads
-```
-
-Interpretation:
-
-- automatic batch launch works;
-- full batch completes;
-- money recovery works;
-- post-batch review barrier works;
-- controller safety repair works;
-- the original batch W2 security calculation was under-sized.
-
-## Batch security compensation fix
-
-Root cause was the batch runner calling:
-
-```text
-ns.growthAnalyzeSecurity(growThreads, target, 1)
-```
-
-Supplying `target` makes Bitburner cap the result to the grow threads currently needed to reach max money. The batch planner runs while the target is prepared at max money, so this incorrectly predicted effectively zero security from the future post-hack grow stage and produced a one-thread W2.
-
-The corrected batch calculation is:
+The cause was `growthAnalyzeSecurity(growThreads, target, 1)` being capped by the target's current prepared state. The corrected calculation uses:
 
 ```text
 ns.growthAnalyzeSecurity(growThreads)
 ```
 
-This estimates the uncapped security increase from every planned grow thread, which is the quantity W2 must compensate.
+The first corrected live cycle used:
 
-## Current highest-priority batch test
+```text
+25H / 1W / 298G / 24W
+final money: 100%
+final security: 3.00 / 3.00
+standalone correction weaken: not required
+```
 
-Pull the latest `main`, restart the stack, and validate the corrected W2 calculation in live automatic batching:
+A following automatic cycle continued to size W2 at 24 threads with 299 grow threads. The sizing defect is considered sufficiently validated to continue instrumentation, but continued observation should still flag any return to one-thread W2 or recurring repair prep.
+
+## Current highest-priority batch test: recovery-model telemetry
+
+After pulling the latest `main`, restart:
 
 ```text
 run gitpull.js
 run startup.js
 ```
 
-Then confirm:
+Let several automatic batches complete. Port 12 batch state version 2 now records `initial`, `predicted`, `final`, and `comparison` recovery data.
+
+For each completed batch, validate:
 
 ```text
-W2 thread count scales with G thread count
-final money returns to intended baseline
-final security is approximately +0.00–0.05
-no standalone correction weaken is required
+predicted.finalMoneyPercent
+final.moneyPercent
+comparison.moneyPercentError
+
+predicted.finalSecurityDelta
+final.securityDelta
+comparison.securityDeltaError
 ```
 
-Run several consecutive batches before declaring the fix stable. If security still drifts, capture the H/W1/G/W2 thread counts and final security delta before changing timing or adding pipelining.
-
-The next instrumentation step should record:
+Also inspect the component security effects:
 
 ```text
-predicted hack security increase
-predicted grow security increase
-weaken effect of W1
-weaken effect of W2
-predicted final security delta
-actual final security delta
+predicted.hackSecurityIncrease
+predicted.growSecurityIncrease
+predicted.weakenHackEffect
+predicted.weakenGrowEffect
 ```
+
+Expected behavior is small, stable predicted-vs-actual error. A large money error suggests growth/recovery modeling or landing-order problems. A large security error suggests stage ordering, missing/effective thread mismatch, or security-effect assumptions.
+
+Do not tune the 200 ms landing gap solely because one recovery error appears. First collect multiple cycles and separate math error from timing error.
 
 ## Batch correctness acceptance criteria
 
@@ -213,19 +198,20 @@ Before starting pipelined/overlapping batches, aim for several consecutive autom
 - money returns to intended baseline after W2;
 - security returns to approximately `+0.00–0.05`;
 - no standalone correction weaken/grow is required between normal batches;
+- predicted-vs-actual recovery error is understood and consistently small;
 - post-batch strategic review completes once per full batch;
 - batch-associated HACK does not independently trigger strategic review;
 - no partial batch is left alive after launch failure.
 
 ## Timing validation before pipelining
 
-Once security math is correct, measure timing drift.
+Once recovery telemetry is stable, add actual stage completion timing.
 
 Record for each stage:
 
 ```text
 planned landing timestamp
-actual completion timestamp (if practical to capture)
+actual completion timestamp
 landing error
 stage ordering
 ```
