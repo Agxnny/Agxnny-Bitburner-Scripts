@@ -25,10 +25,11 @@ run ui/dashboard.js
 
 Current tabs are **Overview, Targets, Economy, Network, and Diagnostics**.
 
-Key controls now include:
+Key controls include:
 
-- **Overview → Prep target to 100%** — grow continuously to full money, then weaken to minimum security and hold the target prepared for batching.
-- **Overview → Resume auto HGW** — releases prep hold.
+- **Overview → Execution mode** — choose **Normal HGW** or **Batched HWGW** at runtime.
+- **Overview → Prep target to 100%** — grow continuously to full money, then weaken to minimum security and hold the target.
+- **Overview → Resume auto HGW / batching** — releases prep hold and resumes the currently selected execution mode.
 - **Targets → Manual target override** — set a specific eligible money server as the controller target, or clear the override to return to automatic economic target selection.
 - **Economy → Manual money goal** — set/clear a savings target and spending lock.
 
@@ -40,14 +41,52 @@ React event callbacks only queue plain-JS requests. Netscript port/file work sta
 - **Workers** are minimal `hack`, `grow`, and `weaken` scripts running on remote execution hosts.
 - **Planner** discovers the network, eligible targets, and execution hosts.
 - **Economic selector** chooses the preferred automatic hostname, desired-money percentage, and hack fraction.
-- **Controller** currently uses sequential tactical HGW for normal automation and prep, while synchronized HWGW is validated separately.
-- **Prep-and-hold mode** grows to 100%, then weakens to minimum, then stops for batch testing.
-- **Manual target mode** overrides the controller hostname at runtime through Port 13. Target switches wait until current workers/tactical analysis finish.
+- **Controller** can switch at runtime between sequential tactical HGW and synchronized single-batch HWGW production.
+- **Automatic batch mode** prepares the selected strategy target, launches one synchronized HWGW batch, waits for complete recovery, then requires a fresh planner/economy review before another batch may launch.
+- **Prep-and-hold mode** grows to 100%, then weakens to minimum, then stops until automatic execution is resumed.
+- **Manual target mode** overrides the controller hostname at runtime through Port 13. Target switches wait until current workers/tactical/batch work is idle.
 - **Progression advisor** compares home RAM, new cloud servers, and cloud-server upgrades.
 - **Cloud capacity automation** executes advisor-selected purchases/upgrades and independently retries affordable cloud actions every few seconds, so long prep phases no longer require a HACK completion to trigger spending.
 - **Manual money goal** remains a hard interlock that disables automated cloud spending.
 - **Telemetry** records real hack returns and rolling income.
 - **Main GUI** consumes structured state instead of performing expensive analysis itself.
+
+## Execution modes
+
+The controller accepts runtime mode changes through Port 13. The GUI exposes these as two buttons on the Overview tab.
+
+### Normal HGW
+
+Sequential tactical production:
+
+```text
+WEAKEN / GROW prep as needed
+        ↓
+HACK
+        ↓
+repeat
+```
+
+### Batched HWGW
+
+The current automatic batching milestone is deliberately conservative: **one synchronized batch at a time**.
+
+```text
+prepare selected strategy baseline
+        ↓
+HACK
+WEAKEN_HACK
+GROW
+WEAKEN_GROW
+        ↓
+full batch COMPLETE
+        ↓
+planner + economy + target review
+        ↓
+next batch
+```
+
+The controller will not launch the next batch while the post-batch review barrier is active. This prevents strategy analysis from being performed on the temporary post-HACK/pre-recovery target state.
 
 ## Manual target override
 
@@ -73,7 +112,7 @@ WEAKEN until minimum security
 PREPARED_HOLD
 ```
 
-This creates the clean starting state required for synchronized batch testing.
+This creates a clean deterministic starting state for batch testing or manual holds.
 
 ## Manual money goal / spending lock
 
@@ -106,7 +145,7 @@ hgw-003
 ...
 ```
 
-When the advisor selects a new cloud server or upgrade, `hacking/refresh.js` now performs a lightweight affordability check every 5 seconds using the cached goal cost and live home cash. Once affordable, it retries the cloud spender even if no HACK has completed. This is especially important during long GROW/WEAKEN prep windows and later during batching.
+When the advisor selects a new cloud server or upgrade, `hacking/refresh.js` performs a lightweight affordability check every 5 seconds using the cached goal cost and live home cash. Once affordable, it retries the cloud spender even if no HACK has completed.
 
 The expensive planner/economy/target chain is **not** rerun on every retry. It only runs after a successful capacity change, at which point planner + sync + economy + target selection refresh so the new RAM joins the remote execution pool.
 
@@ -128,11 +167,11 @@ If the advisor currently prefers a non-cloud progression goal such as home RAM, 
 | 10 | automated cloud-capacity action state |
 | 11 | manual money-goal / spending lock |
 | 12 | latest synchronized HWGW batch state |
-| 13 | controller command queue (prep/resume/manual target) |
+| 13 | controller command queue (prep/resume/manual target/execution mode) |
 
-## First HWGW batching milestone
+## HWGW batch runner
 
-`hacking/batch-runner.js` provides a synchronized single HWGW batch against a prepared target.
+`hacking/batch-runner.js` executes a synchronized single HWGW batch against a prepared target.
 
 Landing order:
 
@@ -253,15 +292,13 @@ Home RAM is control-plane capacity, not worker capacity. Persistent home process
 
 ## Roadmap
 
-1. validate prep/manual-target GUI controls and independent cloud purchase/upgrade retries;
-2. expose richer batch timing/health state in the main GUI;
-3. integrate one synchronized batch into automatic production;
-4. move strategic review from raw HACK completion to full batch completion;
-5. measure timing drift and tune the landing gap dynamically;
-6. add overlapping/pipelined batches with RAM reservation and collision prevention;
-7. add target/strategy hysteresis and predicted-versus-actual calibration;
-8. split more dispatch/scheduling work out of the home controller;
-9. optimize the whole remote RAM pool across multiple targets;
-10. flesh out the independent stock subsystem.
+1. validate automatic single-batch mode and GUI mode switching on live targets;
+2. measure batch landing drift and recovery accuracy over repeated runs;
+3. add adaptive landing-gap tuning and better batch failure/recovery state;
+4. add overlapping/pipelined batches with RAM reservation and collision prevention;
+5. add target/strategy hysteresis and predicted-versus-actual calibration;
+6. split more dispatch/scheduling work out of the home controller;
+7. optimize the whole remote RAM pool across multiple targets;
+8. flesh out the independent stock subsystem.
 
 See `docs/architecture.md` for the architectural direction.
