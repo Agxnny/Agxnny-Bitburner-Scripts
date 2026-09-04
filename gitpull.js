@@ -1,6 +1,13 @@
 /**
  * Pull the Bitburner script set from the GitHub repository.
  *
+ * Clean-pull behavior is intentionally destructive for repo-managed automation:
+ *   1. stop every other running script on every discovered host,
+ *   2. remove deployed HGW worker copies from remote hosts,
+ *   3. remove stale repo-managed files on home,
+ *   4. freshly download every manifest file,
+ *   5. hand off to a helper so gitpull.js itself can be replaced.
+ *
  * Usage:
  *   run gitpull.js
  *   run gitpull.js --branch dev
@@ -30,9 +37,25 @@ export async function main(ns) {
     const manifestPath = "repo-manifest.json";
     const selfPath = "gitpull.js";
     const helperPath = "gitpull-self-update.js";
+    const deployedWorkers = [
+        "/hacking/workers/hack.js",
+        "/hacking/workers/grow.js",
+        "/hacking/workers/weaken.js",
+    ];
 
     ns.tprint(`Pulling ${owner}/${repo}@${branch}...`);
-    ns.tprint("Clean pull: existing managed files will be removed and replaced.");
+    ns.tprint("FULL CLEAN PULL: stopping active automation before replacement.");
+    ns.tprint("");
+
+    const hosts = discoverNetwork(ns);
+    const shutdown = stopAllOtherScripts(ns, hosts);
+    ns.tprint(`STOPPED    ${shutdown.stopped} script(s) across ${hosts.length} discovered host(s)`);
+    if (shutdown.failed > 0) {
+        ns.tprint(`WARNING:   ${shutdown.failed} script(s) could not be stopped.`);
+    }
+
+    const remoteCleanup = cleanRemoteWorkers(ns, hosts, deployedWorkers);
+    ns.tprint(`CLEANED    ${remoteCleanup} deployed worker file(s) from remote hosts`);
     ns.tprint("");
 
     if (ns.fileExists(manifestPath, "home")) {
@@ -70,6 +93,12 @@ export async function main(ns) {
 
     const files = manifest.files.map(String);
     const normalFiles = files.filter((file) => file !== selfPath);
+
+    const staleRemoved = removeStaleManagedFiles(ns, files, selfPath, manifestPath);
+    if (staleRemoved > 0) {
+        ns.tprint(`STALE      removed ${staleRemoved} repo-managed file(s) no longer in manifest`);
+        ns.tprint("");
+    }
 
     let succeeded = 0;
     let replaced = 0;
@@ -114,7 +143,10 @@ export async function main(ns) {
     ns.rm(manifestPath, "home");
 
     ns.tprint("");
-    ns.tprint("========== CLEAN PULL STATUS ==========");
+    ns.tprint("========== FULL CLEAN PULL STATUS ==========");
+    ns.tprint(`Stopped    : ${shutdown.stopped} script(s)`);
+    ns.tprint(`Remote rm  : ${remoteCleanup} worker file(s)`);
+    ns.tprint(`Stale rm   : ${staleRemoved} local file(s)`);
     ns.tprint(`Successful : ${succeeded}/${normalFiles.length} pre-handoff file(s)`);
     ns.tprint(`Replaced   : ${replaced}`);
     ns.tprint(`Added      : ${added}`);
@@ -138,19 +170,95 @@ export async function main(ns) {
         return;
     }
 
-    ns.tprint("CONFIRMED: All non-running managed files were freshly installed.");
+    ns.tprint("CONFIRMED: active automation stopped and managed files freshly installed.");
     ns.tprint(`HANDOFF: Replacing ${selfPath} after this process exits...`);
 
-    // spawn() terminates this script before starting the helper. That allows the
-    // helper to delete and freshly download gitpull.js, which cannot be removed
-    // while it is the currently running script.
     ns.spawn(helperPath, 1, owner, repo, branch);
 }
 
 /** @param {NS} ns */
+function discoverNetwork(ns) {
+    const visited = new Set(["home"]);
+    const queue = ["home"];
+
+    while (queue.length > 0) {
+        const host = queue.shift();
+        for (const neighbor of ns.scan(host)) {
+            if (visited.has(neighbor)) continue;
+            visited.add(neighbor);
+            queue.push(neighbor);
+        }
+    }
+
+    return [...visited];
+}
+
+/** @param {NS} ns @param {string[]} hosts */
+function stopAllOtherScripts(ns, hosts) {
+    let stopped = 0;
+    let failed = 0;
+
+    for (const host of hosts) {
+        for (const process of ns.ps(host)) {
+            if (host === "home" && process.pid === ns.pid) continue;
+
+            if (ns.kill(process.pid)) stopped += 1;
+            else failed += 1;
+        }
+    }
+
+    return { stopped, failed };
+}
+
+/** @param {NS} ns @param {string[]} hosts @param {string[]} workers */
+function cleanRemoteWorkers(ns, hosts, workers) {
+    let removed = 0;
+
+    for (const host of hosts) {
+        if (host === "home") continue;
+
+        for (const worker of workers) {
+            if (!ns.fileExists(worker, host)) continue;
+            if (ns.rm(worker, host)) removed += 1;
+        }
+    }
+
+    return removed;
+}
+
+/**
+ * Remove files inside repo-owned script roots when they are no longer listed in
+ * the downloaded manifest. This prevents renamed/deleted scripts from lingering.
+ *
+ * @param {NS} ns
+ * @param {string[]} manifestFiles
+ * @param {string} selfPath
+ * @param {string} manifestPath
+ */
+function removeStaleManagedFiles(ns, manifestFiles, selfPath, manifestPath) {
+    const managedRoots = ["hacking/", "lib/", "network/", "diagnostics/"];
+    const keep = new Set([...manifestFiles, selfPath, manifestPath]);
+    let removed = 0;
+
+    for (const file of ns.ls("home")) {
+        const managed = managedRoots.some((root) => file.startsWith(root));
+        if (!managed || keep.has(file)) continue;
+
+        if (ns.rm(file, "home")) {
+            removed += 1;
+            ns.tprint(`STALE RM  ${file}`);
+        }
+    }
+
+    return removed;
+}
+
+/** @param {NS} ns */
 function printHelp(ns) {
-    ns.tprint("gitpull.js - clean-update Bitburner scripts from GitHub");
+    ns.tprint("gitpull.js - full clean-update Bitburner automation from GitHub");
     ns.tprint("Usage: run gitpull.js [--branch main]");
-    ns.tprint("Existing managed files are deleted before fresh copies are downloaded.");
+    ns.tprint("WARNING: stops every other active script on discovered hosts.");
+    ns.tprint("Remote HGW workers are removed and must be redeployed after the pull.");
+    ns.tprint("Stale files under hacking/, lib/, network/, and diagnostics/ are removed.");
     ns.tprint("gitpull.js itself is replaced by a handoff helper after the updater exits.");
 }
