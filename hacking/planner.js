@@ -1,13 +1,19 @@
 import { publishPlannerState } from "/lib/runtime-state.js";
-import { analyzeNetwork } from "/lib/network.js";
+import { analyzeNetwork, getAvailablePortOpeners } from "/lib/network.js";
 import { rankEligibleTargets } from "/lib/targets.js";
+
+const WORKER_FILES = Object.freeze([
+    "/hacking/workers/hack.js",
+    "/hacking/workers/grow.js",
+    "/hacking/workers/weaken.js",
+]);
 
 /**
  * Short-lived target and execution-pool planner.
  *
- * Expensive network/target analysis lives here so the persistent controller does
- * not carry its RAM cost. Run this whenever progression changes or you want to
- * refresh AUTO target choice and the rooted RAM host inventory.
+ * Expensive network/target analysis lives here so persistent consumers such as
+ * the controller and dashboard can read cached state without carrying the same
+ * Netscript RAM costs themselves.
  *
  * @param {NS} ns
  */
@@ -15,6 +21,7 @@ export async function main(ns) {
     const servers = analyzeNetwork(ns);
     const rankings = rankEligibleTargets(ns, servers);
     const selectedTarget = rankings[0] ?? null;
+    const tools = getAvailablePortOpeners(ns);
 
     const executionHosts = [
         {
@@ -29,12 +36,26 @@ export async function main(ns) {
             })),
     ];
 
+    const network = {
+        discovered: servers.length,
+        rooted: servers.filter((server) => server.hasRoot).length,
+        rootableNow: servers.filter((server) => !server.hasRoot && server.canRootNow).length,
+        hgwTargets: servers.filter((server) => server.canHackNow && server.target.hasMoney).length,
+        blockedMoney: servers.filter((server) => !server.canBecomeHackableNow && server.target.hasMoney).length,
+        availableTools: tools.map((tool) => tool.file),
+        portToolCount: tools.length,
+    };
+
+    const workerRam = Object.fromEntries(WORKER_FILES.map((path) => [path, ns.getScriptRam(path, "home")]));
+
     const snapshot = {
         updatedAt: Date.now(),
         hackingLevel: ns.getHackingLevel(),
         selectedTarget,
         rankings,
         executionHosts,
+        network,
+        workerRam,
     };
 
     publishPlannerState(ns, snapshot);
@@ -54,6 +75,7 @@ export async function main(ns) {
 
     const totalRam = executionHosts.reduce((sum, host) => sum + host.maxRam, 0);
     ns.tprint(`RAM hosts: ${executionHosts.length} (${ns.format.ram(totalRam)} total max RAM)`);
+    ns.tprint(`Network:   ${network.discovered} discovered | ${network.rooted} rooted | ${network.hgwTargets} HGW target(s)`);
     ns.tprint("Planner snapshot published.");
 
     if (String(ns.args[0] ?? "") === "--kickstart") {
