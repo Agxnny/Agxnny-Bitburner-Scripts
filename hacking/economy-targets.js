@@ -9,19 +9,18 @@ import {
 const DEFAULT_HACK_FRACTION = 0.10;
 const SECURITY_TOLERANCE = 0.5;
 const HOME_RESERVE_GB = 1;
-const CONTROLLER_FRESH_MS = 5_000;
 const PREP_PENALTY_SCALE_SECONDS = 30 * 60;
 const PREP_PENALTY_MAX_EXPONENT = 8;
 
 /**
  * Short-lived target selector that answers a different question from the baseline
  * planner: "which target gets us to the current cash goal fastest from its live
- * state?"
+ * state with the RAM we can actually dispatch right now?"
  *
- * Target prep is intentionally penalized non-linearly. Short prep remains close
- * to its real elapsed time, while long grow/weaken commitments become rapidly
- * less attractive. This prevents a theoretically rich target from monopolizing
- * the RAM pool for hours when a smaller prepared target can produce cash now.
+ * Prep time is calculated from required thread counts and the real distributed
+ * thread capacity of the current execution pool. Long prep is then penalized
+ * exponentially so multi-hour grow/weaken commitments become increasingly less
+ * attractive than targets that can begin producing cash quickly.
  *
  * @param {NS} ns
  */
@@ -33,29 +32,27 @@ export async function main(ns) {
 
     if (rankings.length === 0) return;
 
-    const controllerFresh = controller?.updatedAt && Date.now() - Number(controller.updatedAt) <= CONTROLLER_FRESH_MS;
-    const usableRam = controllerFresh
-        ? Math.max(0, Number(controller?.execution?.usableRam ?? 0))
-        : estimatePlannerUsableRam(ns, planner);
-
     const workerRam = planner?.workerRam ?? {};
     const growRam = Math.max(0.001, Number(workerRam["/hacking/workers/grow.js"] ?? 0));
     const weakenRam = Math.max(0.001, Number(workerRam["/hacking/workers/weaken.js"] ?? 0));
     const hackRam = Math.max(0.001, Number(workerRam["/hacking/workers/hack.js"] ?? 0));
-    const growCapacity = Math.max(1, Math.floor(usableRam / growRam));
-    const weakenCapacity = Math.max(1, Math.floor(usableRam / weakenRam));
-    const hackCapacity = Math.max(1, Math.floor(usableRam / hackRam));
-    const weakenPerThread = Math.max(0.000001, Number(ns.weakenAnalyze(1)) || 0.05);
 
+    const execution = getLiveExecutionCapacity(ns, planner, {
+        growRam,
+        weakenRam,
+        hackRam,
+    });
+
+    const weakenPerThread = Math.max(0.000001, Number(ns.weakenAnalyze(1)) || 0.05);
     const goalRemaining = Math.max(0, Number(economy?.goal?.remaining ?? 0));
     const hasCashGoal = goalRemaining > 0;
 
     const candidates = rankings.map((target) => evaluateTarget(ns, target, {
         goalRemaining,
         hasCashGoal,
-        growCapacity,
-        weakenCapacity,
-        hackCapacity,
+        growCapacity: execution.growThreads,
+        weakenCapacity: execution.weakenThreads,
+        hackCapacity: execution.hackThreads,
         weakenPerThread,
     })).filter(Boolean);
 
@@ -68,13 +65,15 @@ export async function main(ns) {
     const selected = candidates[0] ?? null;
     const updatedAt = Date.now();
     publishEconomyTargetState(ns, {
-        version: 3,
+        version: 4,
         updatedAt,
         plannerUpdatedAt: Number(planner?.analysisUpdatedAt ?? planner?.updatedAt ?? 0),
         economyUpdatedAt: Number(economy?.updatedAt ?? 0),
         goal: economy?.goal ?? null,
         cash: Math.max(0, Number(economy?.cash ?? 0)),
-        usableRam,
+        usableRam: execution.usableRam,
+        executionCapacity: execution,
+        controllerUpdatedAt: Number(controller?.updatedAt ?? 0),
         prepPenalty: {
             model: "EXPONENTIAL_30M_V1",
             scaleSeconds: PREP_PENALTY_SCALE_SECONDS,
@@ -91,7 +90,7 @@ export async function main(ns) {
                 ...planner,
                 updatedAt,
                 selectedTarget: selectedAnalysis,
-                selectionModel: "GOAL_ETA_EXP_PREP_PENALTY_V3",
+                selectionModel: "GOAL_ETA_EXP_PREP_CAPACITY_V4",
                 economicSelection: {
                     hostname: selected.hostname,
                     baselineRank: selected.baselineRank,
@@ -105,6 +104,7 @@ export async function main(ns) {
                     goalRemaining,
                     cash: Math.max(0, Number(economy?.cash ?? 0)),
                     goal: economy?.goal ?? null,
+                    executionCapacity: execution,
                 },
             });
         }
@@ -144,9 +144,13 @@ function evaluateTarget(ns, target, context) {
         : 0;
     const growWeakenThreads = Math.ceil(growSecurity / context.weakenPerThread);
 
-    const prepSeconds = waves(securityPrepThreads, context.weakenCapacity) * weakenTime
-        + waves(growThreads, context.growCapacity) * growTime
-        + waves(growWeakenThreads, context.weakenCapacity) * weakenTime;
+    const securityPrepWaves = waves(securityPrepThreads, context.weakenCapacity);
+    const growWaves = waves(growThreads, context.growCapacity);
+    const growWeakenWaves = waves(growWeakenThreads, context.weakenCapacity);
+
+    const prepSeconds = securityPrepWaves * weakenTime
+        + growWaves * growTime
+        + growWeakenWaves * weakenTime;
     const weightedPrepSeconds = exponentialPrepPenalty(prepSeconds);
     const prepPenaltyMultiplier = prepSeconds > 0 ? weightedPrepSeconds / prepSeconds : 1;
 
@@ -169,16 +173,17 @@ function evaluateTarget(ns, target, context) {
         : 0;
     const recoveryWeakenThreads = Math.ceil((recoveryGrowSecurity + hackSecurity) / context.weakenPerThread);
 
-    const cycleSeconds = hackTime
-        + waves(recoveryGrowThreads, context.growCapacity) * growTime
-        + waves(recoveryWeakenThreads, context.weakenCapacity) * weakenTime;
+    const hackWaves = waves(effectiveHackThreads, context.hackCapacity);
+    const recoveryGrowWaves = waves(recoveryGrowThreads, context.growCapacity);
+    const recoveryWeakenWaves = waves(recoveryWeakenThreads, context.weakenCapacity);
+    const cycleSeconds = hackWaves * hackTime
+        + recoveryGrowWaves * growTime
+        + recoveryWeakenWaves * weakenTime;
     const steadyIncomePerSecond = cycleSeconds > 0 ? expectedCash / cycleSeconds : 0;
     const productionGoalSeconds = context.hasCashGoal && steadyIncomePerSecond > 0
         ? context.goalRemaining / steadyIncomePerSecond
         : steadyIncomePerSecond > 0 ? 1 / steadyIncomePerSecond : Number.MAX_SAFE_INTEGER;
-    const goalEtaSeconds = context.hasCashGoal
-        ? prepSeconds + productionGoalSeconds
-        : prepSeconds + productionGoalSeconds;
+    const goalEtaSeconds = prepSeconds + productionGoalSeconds;
     const economicEtaSeconds = weightedPrepSeconds + productionGoalSeconds;
 
     return {
@@ -194,6 +199,16 @@ function evaluateTarget(ns, target, context) {
         growWeakenThreads,
         effectiveHackThreads,
         effectiveHackFraction,
+        prepWaves: {
+            weaken: securityPrepWaves,
+            grow: growWaves,
+            growWeaken: growWeakenWaves,
+        },
+        productionWaves: {
+            hack: hackWaves,
+            grow: recoveryGrowWaves,
+            weaken: recoveryWeakenWaves,
+        },
         expectedCashPerCycle: expectedCash,
         cycleSeconds,
         steadyIncomePerSecond,
@@ -204,10 +219,45 @@ function evaluateTarget(ns, target, context) {
             weightedPrepSeconds,
             prepPenaltyMultiplier,
             steadyIncomePerSecond,
-            goalEtaSeconds,
             economicEtaSeconds,
+            growThreads,
+            growCapacity: context.growCapacity,
+            growWaves,
             hasCashGoal: context.hasCashGoal,
         }),
+    };
+}
+
+function getLiveExecutionCapacity(ns, planner, workerRam) {
+    const hosts = Array.isArray(planner?.executionHosts) ? planner.executionHosts : [];
+    let usableRam = 0;
+    let growThreads = 0;
+    let weakenThreads = 0;
+    let hackThreads = 0;
+    let hostCount = 0;
+
+    for (const entry of hosts) {
+        const hostname = String(entry?.hostname ?? "");
+        if (!hostname) continue;
+        const maxRam = Math.max(0, Number(entry?.maxRam ?? 0));
+        const usedRam = Math.max(0, Number(ns.getServerUsedRam(hostname)) || 0);
+        const reserve = hostname === "home" ? HOME_RESERVE_GB : 0;
+        const freeRam = Math.max(0, maxRam - usedRam - reserve);
+        if (freeRam <= 0) continue;
+
+        hostCount += 1;
+        usableRam += freeRam;
+        growThreads += Math.floor(freeRam / workerRam.growRam);
+        weakenThreads += Math.floor(freeRam / workerRam.weakenRam);
+        hackThreads += Math.floor(freeRam / workerRam.hackRam);
+    }
+
+    return {
+        hostCount,
+        usableRam,
+        growThreads: Math.max(1, growThreads),
+        weakenThreads: Math.max(1, weakenThreads),
+        hackThreads: Math.max(1, hackThreads),
     };
 }
 
@@ -218,28 +268,19 @@ function exponentialPrepPenalty(prepSeconds) {
     return PREP_PENALTY_SCALE_SECONDS * Math.expm1(exponent);
 }
 
-function estimatePlannerUsableRam(ns, planner) {
-    const hosts = Array.isArray(planner?.executionHosts) ? planner.executionHosts : [];
-    return hosts.reduce((total, entry) => {
-        const hostname = String(entry?.hostname ?? "");
-        if (!hostname) return total;
-        const maxRam = Math.max(0, Number(entry?.maxRam ?? 0));
-        const usedRam = Math.max(0, Number(ns.getServerUsedRam(hostname)) || 0);
-        const reserve = hostname === "home" ? HOME_RESERVE_GB : 0;
-        return total + Math.max(0, maxRam - usedRam - reserve);
-    }, 0);
-}
-
 function describeReason(values) {
     const prep = values.prepSeconds < 1 ? "ready now" : `${formatDuration(values.prepSeconds)} prep`;
     const weighted = values.prepSeconds < 1
         ? ""
         : ` (weighted ${formatDuration(values.weightedPrepSeconds)}, x${values.prepPenaltyMultiplier.toFixed(1)})`;
+    const growLoad = values.growThreads > 0
+        ? `, grow ${values.growThreads}t @ ${values.growCapacity}t/wave (${values.growWaves} wave${values.growWaves === 1 ? "" : "s"})`
+        : "";
     const rate = `$${formatCompactNumber(values.steadyIncomePerSecond)}/s`;
     if (values.hasCashGoal) {
-        return `${prep}${weighted}, ${rate}, raw goal ${formatDuration(values.goalEtaSeconds)}, economic ${formatDuration(values.economicEtaSeconds)}`;
+        return `${prep}${weighted}${growLoad}, ${rate}, economic ${formatDuration(values.economicEtaSeconds)}`;
     }
-    return `${prep}${weighted}, estimated steady ${rate}`;
+    return `${prep}${weighted}${growLoad}, estimated steady ${rate}`;
 }
 
 function waves(threads, capacity) {
