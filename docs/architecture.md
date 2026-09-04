@@ -99,7 +99,7 @@ PURCHASED_SERVER
 CLOUD_SERVER_UPGRADE
 ```
 
-The selected automatic progression goal remains the spending authority. `network/cloud-buy.js` is now a cloud-capacity executor rather than a purchase-only script:
+The selected automatic progression goal remains the spending authority. `network/cloud-buy.js` is a cloud-capacity executor:
 
 ```text
 PURCHASED_SERVER
@@ -111,7 +111,24 @@ CLOUD_SERVER_UPGRADE
 
 The spender checks live cash/cost immediately before acting. It also independently reads Port 11; an active manual money goal blocks both purchases and upgrades even if economy state is stale.
 
-After a successful purchase or upgrade, `hacking/refresh.js` runs planner + sync + economy refresh before final target selection so changed RAM capacity is incorporated into the remote execution pool.
+### Independent cloud-capacity retry loop
+
+Cloud spending is intentionally decoupled from HACK completion. `hacking/refresh.js` checks the current cached economy goal every 5 seconds. If the selected goal is `PURCHASED_SERVER` or `CLOUD_SERVER_UPGRADE`, no manual money lock is active, and live home cash has reached the cached goal cost, the coordinator retries `network/cloud-buy.js`.
+
+```text
+cached cloud goal
+    + live cash >= goal cost
+        ↓
+cloud-buy.js retry
+        ↓
+capacity changed?
+    no  -> return to lightweight loop
+    yes -> planner -> sync -> economy -> economic target
+```
+
+This means long GROW/WEAKEN prep phases and future batch pipelines do not need a raw HACK completion just to execute an already-approved RAM purchase or upgrade.
+
+The expensive planner/economy/target analysis is not run on each 5-second check. It is triggered after the capacity action actually succeeds, or by the existing strategic events such as HACK completion, root expansion, and manual-goal changes.
 
 The spender does not override non-cloud progression priorities. If home RAM or another future goal is selected, cloud spending remains idle and publishes a clear status reason on Port 10.
 
@@ -134,7 +151,7 @@ Batch state is published on Port 12 with thread counts, landing timestamps, allo
 
 ## Strategic-review boundary
 
-The current refresh coordinator still reacts to raw hack completion. Before automatic batching replaces sequential production, this must move to a **full batch completion acknowledgment**:
+The current refresh coordinator still reacts to raw hack completion for strategic target review. Before automatic batching replaces sequential production, this must move to a **full batch completion acknowledgment**:
 
 ```text
 batch COMPLETE
@@ -146,7 +163,7 @@ strategic planner/economy review
 next batch
 ```
 
-That prevents planners from inspecting a target after the hack lands but before grow/weaken recovery finishes.
+Cloud-capacity retries are already independent of this boundary, so server purchases/upgrades will continue to work during prep and batching without forcing a target review.
 
 ## Runtime ports
 
@@ -179,6 +196,7 @@ That prevents planners from inspecting a target after the hack lands but before 
 - host synchronization
 - progression advisor
 - cloud purchases and upgrades
+- independent affordable cloud-capacity retries
 - manual money-goal spending lock
 
 ### Stage 3 — target/control ergonomics
