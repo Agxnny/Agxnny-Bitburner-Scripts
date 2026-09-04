@@ -25,6 +25,7 @@
     "lib/targets.js",
     "lib/telemetry.js",
     "lib/threads.js",
+    "network/cloud-buy.js",
     "network/deploy.js",
     "network/inspect.js",
     "network/root.js",
