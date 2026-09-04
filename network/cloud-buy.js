@@ -1,4 +1,8 @@
-import { publishCloudPurchaseState, readEconomyState } from "/lib/runtime-state.js";
+import {
+    publishCloudPurchaseState,
+    readEconomyState,
+    readManualMoneyGoalState,
+} from "/lib/runtime-state.js";
 import { isQuiet } from "/lib/output.js";
 
 const NAME_PREFIX = "hgw-";
@@ -9,18 +13,23 @@ const PURCHASED_SERVER_GOAL = "PURCHASED_SERVER";
  * Short-lived cloud-server purchaser.
  *
  * This script only buys when the progression advisor has selected an affordable
- * PURCHASED_SERVER goal. Automated servers use deterministic names such as
- * hgw-001, hgw-002, ... Existing manually named servers are left unchanged.
+ * PURCHASED_SERVER goal. A user-controlled manual money goal is a hard spending
+ * lock and is checked directly here so stale economy state cannot accidentally
+ * authorize a purchase.
+ *
+ * Automated servers use deterministic names such as hgw-001, hgw-002, ...
+ * Existing manually named servers are left unchanged.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     const economy = readEconomyState(ns);
     const goal = economy?.goal ?? null;
+    const manual = readManualMoneyGoalState(ns);
     const existing = ns.cloud.getServerNames();
     const serverLimit = Math.max(0, Number(ns.cloud.getServerLimit()) || 0);
     const baseState = {
-        version: 1,
+        version: 2,
         updatedAt: Date.now(),
         naming: {
             prefix: NAME_PREFIX,
@@ -34,6 +43,20 @@ export async function main(ns) {
         ram: 0,
         cost: 0,
     };
+
+    if (manual?.active && Number(manual?.targetCash ?? 0) > 0) {
+        publishCloudPurchaseState(ns, {
+            ...baseState,
+            status: "BLOCKED_MANUAL_GOAL",
+            reason: `Manual money goal is active at $${formatCompact(manual.targetCash)}; automated purchasing is locked.`,
+            manualMoneyGoal: {
+                active: true,
+                targetCash: Number(manual.targetCash),
+                title: String(manual.title ?? "Manual cash goal"),
+            },
+        });
+        return;
+    }
 
     if (!goal || String(goal.type ?? "") !== PURCHASED_SERVER_GOAL) {
         publishCloudPurchaseState(ns, { ...baseState, status: "NO_PURCHASE_GOAL", reason: "Progression advisor did not select a new cloud server." });
