@@ -1,44 +1,125 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
 import { publishControllerState } from "/lib/runtime-state.js";
+import { analyzeTarget, rankEligibleTargets } from "/lib/targets.js";
 
 /**
- * Foundation controller.
+ * Foundation controller with automatic target selection.
  *
- * This is intentionally not yet the final adaptive HGW engine. Its job is to
- * establish the controller -> structured state pattern that later analyzers,
- * schedulers, telemetry, and the dashboard will build on.
+ * With no argument, the controller periodically selects the highest-ranked
+ * currently-eligible money target. Supplying a hostname keeps manual-target
+ * behavior for diagnostics and testing.
+ *
+ * This still does not launch workers. Scheduling and thread calculations remain
+ * separate layers that will consume the structured state built here.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
-    const target = String(ns.args[0] ?? "n00dles");
-    const state = createTargetState(target);
+    const manualTarget = ns.args.length > 0 ? String(ns.args[0]) : null;
+    let state = createInitialState(ns, manualTarget);
+
+    if (!state) {
+        ns.tprint("ERROR: No currently-eligible money target was found.");
+        return;
+    }
 
     ns.disableLog("sleep");
 
+    let nextAutoSelectionAt = 0;
+
     while (true) {
-        updateObservedState(ns, state);
+        if (!manualTarget && Date.now() >= nextAutoSelectionAt) {
+            state = refreshAutomaticSelection(ns, state);
+            nextAutoSelectionAt = Date.now() + 5000;
+        }
+
+        const analysis = analyzeTarget(ns, state.hostname);
+        updateObservedState(state, analysis);
         chooseFoundationAction(state);
         publishControllerState(ns, state);
 
         ns.clearLog();
         ns.print(JSON.stringify(state, null, 2));
 
-        // No workers are launched yet. Scheduling and thread calculations will
-        // be added as their own layer rather than embedded into this loop.
         await ns.sleep(1000);
     }
 }
 
-/** @param {NS} ns @param {ReturnType<createTargetState>} state */
-function updateObservedState(ns, state) {
-    state.money.current = ns.getServerMoneyAvailable(state.hostname);
-    state.money.max = ns.getServerMaxMoney(state.hostname);
+/** @param {NS} ns @param {string|null} manualTarget */
+function createInitialState(ns, manualTarget) {
+    if (manualTarget) {
+        const analysis = analyzeTarget(ns, manualTarget);
+        const state = createTargetState(manualTarget);
+        applyAnalysis(state, analysis, "MANUAL", 0);
+        return state;
+    }
 
-    state.security.current = ns.getServerSecurityLevel(state.hostname);
-    state.security.minimum = ns.getServerMinSecurityLevel(state.hostname);
-    state.security.desired = state.security.minimum;
+    const best = rankEligibleTargets(ns)[0];
+    if (!best) return null;
 
+    const state = createTargetState(best.hostname);
+    applyAnalysis(state, best, "AUTO", best.rank);
+    return state;
+}
+
+/** @param {NS} ns @param {ReturnType<createTargetState>} currentState */
+function refreshAutomaticSelection(ns, currentState) {
+    const ranked = rankEligibleTargets(ns);
+    const best = ranked[0];
+    if (!best) return currentState;
+
+    if (best.hostname !== currentState.hostname) {
+        const nextState = createTargetState(best.hostname);
+        applyAnalysis(nextState, best, "AUTO", best.rank);
+        return nextState;
+    }
+
+    applyAnalysis(currentState, best, "AUTO", best.rank);
+    return currentState;
+}
+
+/**
+ * Copy analyzer output into the controller-owned state contract.
+ *
+ * @param {ReturnType<createTargetState>} state
+ * @param {ReturnType<analyzeTarget>} analysis
+ * @param {string} mode
+ * @param {number} rank
+ */
+function applyAnalysis(state, analysis, mode, rank) {
+    state.selection.mode = mode;
+    state.selection.rank = rank;
+    state.selection.score = analysis.score;
+    state.selection.scoreModel = analysis.scoreModel;
+
+    state.analysis.hackChance = analysis.hacking.chance;
+    state.analysis.hackPercentPerThread = analysis.hacking.percentPerThread;
+    state.analysis.hackTimeMs = analysis.timing.hackMs;
+    state.analysis.growTimeMs = analysis.timing.growMs;
+    state.analysis.weakenTimeMs = analysis.timing.weakenMs;
+    state.analysis.growth = analysis.growth;
+
+    state.strategy.score = analysis.score;
+    state.strategy.expectedIncomePerSecond = analysis.score;
+}
+
+/**
+ * Refresh volatile target observations from the analyzer snapshot.
+ *
+ * @param {ReturnType<createTargetState>} state
+ * @param {ReturnType<analyzeTarget>} analysis
+ */
+function updateObservedState(state, analysis) {
+    state.money.current = analysis.money.current;
+    state.money.max = analysis.money.max;
+
+    state.security.current = analysis.security.current;
+    state.security.minimum = analysis.security.minimum;
+    state.security.desired = analysis.security.minimum;
+
+    // Ranking inputs such as chance and timings can change with player/server
+    // state, so keep the live controller snapshot current between ranking passes.
+    applyAnalysis(state, analysis, state.selection.mode, state.selection.rank);
     state.updatedAt = Date.now();
 }
 
