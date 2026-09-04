@@ -1,30 +1,10 @@
+import { DEPLOY_FILES } from "/lib/deployment.js";
 import { readPlannerState } from "/lib/runtime-state.js";
-import { WORKER_SCRIPTS } from "/lib/execution.js";
 import { quietArgs, tprint } from "/lib/output.js";
 
 const TELEMETRY_SCRIPT = "/hacking/telemetry.js";
 const TEST_LAUNCHER_SCRIPT = "/diagnostics/test-launcher.js";
 const REFRESH_SCRIPT = "/hacking/refresh.js";
-
-const SUPPORT_FILES = Object.freeze([
-    "/hacking/planner.js",
-    "/hacking/tactical-planner.js",
-    "/hacking/economy-planner.js",
-    "/hacking/economy-targets.js",
-    REFRESH_SCRIPT,
-    TELEMETRY_SCRIPT,
-    TEST_LAUNCHER_SCRIPT,
-    "/diagnostics/test.js",
-    "/lib/threads.js",
-    "/lib/runtime-state.js",
-    "/lib/telemetry.js",
-    "/lib/progression.js",
-    "/lib/network.js",
-    "/lib/targets.js",
-    "/lib/state.js",
-    "/lib/execution.js",
-    "/lib/output.js",
-]);
 
 /**
  * Copy execution/support files from home to every rooted RAM host in the latest
@@ -50,13 +30,11 @@ export async function main(ns) {
         return;
     }
 
-    const files = [...new Set([...Object.values(WORKER_SCRIPTS), ...SUPPORT_FILES])];
     let success = 0;
-
     tprint(ns, "=== EXECUTION DEPLOYMENT ===");
 
     for (const hostname of remoteHosts) {
-        const ok = await ns.scp(files, hostname, "home");
+        const ok = await ns.scp(DEPLOY_FILES, hostname, "home");
         if (ok) {
             success += 1;
             tprint(ns, `DEPLOYED  ${hostname}`);
@@ -66,7 +44,7 @@ export async function main(ns) {
     }
 
     tprint(ns, `Deployment complete: ${success}/${remoteHosts.length} host(s).`);
-    tprint(ns, `Files per host: ${files.length} (workers + planner/tactical/telemetry/diagnostic support)`);
+    tprint(ns, `Files per host: ${DEPLOY_FILES.length} (workers + planner/tactical/telemetry/rooting support)`);
 
     const inheritedQuiet = quietArgs(ns);
     startRemoteService(ns, remoteHosts, TELEMETRY_SCRIPT, "Telemetry collector", false, inheritedQuiet);
