@@ -41,7 +41,7 @@ export async function main(ns) {
     }
 
     if (["status", "show"].includes(normalized)) {
-        printStatus(ns, readManualMoneyGoalState(ns));
+        printStatus(ns, loadCurrentState(ns));
         return;
     }
 
@@ -76,6 +76,21 @@ export async function main(ns) {
 async function persistAndPublish(ns, state) {
     await ns.write(CONFIG_FILE, JSON.stringify(state), "w");
     publishManualMoneyGoalState(ns, state);
+}
+
+function loadCurrentState(ns) {
+    const runtime = readManualMoneyGoalState(ns);
+    if (runtime) return runtime;
+    if (!ns.fileExists(CONFIG_FILE, "home")) return null;
+
+    try {
+        const persisted = JSON.parse(String(ns.read(CONFIG_FILE) || "null"));
+        if (!persisted || typeof persisted !== "object") return null;
+        publishManualMoneyGoalState(ns, persisted);
+        return persisted;
+    } catch {
+        return null;
+    }
 }
 
 function printStatus(ns, state) {
