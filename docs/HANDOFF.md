@@ -37,7 +37,7 @@ Core design goals:
 
 ## Current major milestone
 
-The system now supports two runtime-selectable controller modes:
+The system supports two runtime-selectable controller modes:
 
 1. **Normal HGW** — sequential tactical weaken/grow/hack automation.
 2. **Batched HWGW** — automatic, synchronized **one-batch-at-a-time** HWGW.
@@ -85,53 +85,56 @@ security recovery: 3.00 / 3.00
 standalone correction weaken: not required
 ```
 
-The controller also completed the post-batch strategic review and released the next-batch barrier normally.
-
-This validates the corrected W2 sizing for one production cycle. Repeated-cycle validation is still running.
+A following automatic cycle continued to size W2 correctly (`25H / 1W / 299G / 24W`). The corrected sizing has remained stable enough in live operation to advance to instrumentation, while continued passive observation remains useful.
 
 ## Highest-priority known issue
 
-**Validate the corrected single-batch security compensation over repeated automatic batches.**
+**Measure predicted-vs-actual batch recovery, then measure landing drift.**
 
-Root cause of the original `25H / 1W / 298G / 1W` failure was identified on 2026-09-05. `hacking/batch-runner.js` used:
+The original W2 defect was caused by calling:
 
 ```text
 ns.growthAnalyzeSecurity(growThreads, target, 1)
 ```
 
-When a host is supplied, Bitburner caps the reported grow-security increase to the number of grow threads currently needed to reach max money. Batch planning happens while the target is already prepared at max money, so that call reported effectively zero future grow security and W2 was forced to the one-thread minimum.
-
-The batch runner now uses the uncapped future-operation form:
+Supplying a host caps the security estimate to grow threads needed from the target's current money state. Because batch planning occurs on a prepared target, that produced effectively zero predicted future grow security. The runner now correctly uses:
 
 ```text
 ns.growthAnalyzeSecurity(growThreads)
 ```
 
-This makes W2 compensate all grow threads that will execute after HACK rather than the target's pre-hack current state.
+The next instrumentation layer is now implemented in `hacking/batch-runner.js`. Port 12 batch state version 2 records:
 
-Validate that:
+```text
+initial money/security state
+predicted money after HACK
+predicted final money / money percent
+predicted HACK security increase
+predicted GROW security increase
+predicted W1 weaken effect
+predicted W2 weaken effect
+predicted security delta after each stage
+actual final money/security
+predicted-vs-actual money error
+predicted-vs-actual security error
+```
 
-- W2 remains sized proportionally to the grow stage;
-- several consecutive batches recover security to roughly `+0.00–0.05`;
-- no standalone correction weaken is normally required;
-- money recovery remains correct;
-- one-core assumptions remain valid for the remote worker pool.
-
-Do **not** hide residual problems by relying on the post-batch repair weaken. The repair path is a safety net, not the intended steady-state batching model.
+This keeps recovery math in the batch runner rather than duplicating it in the GUI.
 
 ## Immediate next development sequence
 
 Recommended order:
 
 ```text
-1. Validate repeated automatic batches return to near-minimum security
-2. Add predicted-vs-actual batch recovery telemetry
-3. Measure landing drift / timing error over repeated batches
-4. Tune or adapt the landing gap if needed
-5. Only then implement overlapping/pipelined batches
+1. Pull/restart and collect predicted-vs-actual recovery over several batches
+2. Confirm recovery-model error is consistently small
+3. Add actual stage completion timestamps / landing-error telemetry
+4. Measure landing drift and stage ordering over repeated batches
+5. Tune or adapt the landing gap if needed
+6. Only then implement overlapping/pipelined batches
 ```
 
-A useful acceptance criterion before pipelining is several consecutive automatic batches that recover money to the intended baseline and security to roughly `+0.00–0.05`, without needing standalone correction work.
+A useful acceptance criterion before pipelining is several consecutive automatic batches that recover money to the intended baseline and security to roughly `+0.00–0.05`, without standalone correction work, with measured landing order/drift understood.
 
 ## Important architectural constraints
 
@@ -141,7 +144,7 @@ H/G/W worker jobs do not use home as fallback capacity. Home is preserved for co
 
 ### One batch at a time for now
 
-Do not jump directly to overlapping batches. The existing system deliberately serializes synchronized batches while correctness is being validated.
+Do not jump directly to overlapping batches. The existing system deliberately serializes synchronized batches while correctness and timing are being validated.
 
 ### Full-batch review boundary
 
@@ -161,9 +164,9 @@ React event callbacks must not call Netscript APIs. They may only update React-l
 
 ### GUI React tree is persistent
 
-`ui/dashboard.js` now mounts its React tree once. The main loop refreshes a cached runtime snapshot and increments a plain-JS version counter; the mounted React root observes that version and re-renders without `clearLog()` / `printRaw()` remount churn.
+`ui/dashboard.js` mounts its React tree once. The main loop refreshes a cached runtime snapshot and increments a plain-JS version counter; the mounted React root observes that version and re-renders without `clearLog()` / `printRaw()` remount churn.
 
-Tab selection is React-local and therefore immediate. Controller commands still cross the Netscript boundary through queued plain-JS requests processed by the main loop. This change was made specifically to address slow/hanging tab and mode interactions.
+Tab selection is React-local and therefore immediate. Controller commands still cross the Netscript boundary through queued plain-JS requests processed by the main loop.
 
 ## Important user-facing controls
 
