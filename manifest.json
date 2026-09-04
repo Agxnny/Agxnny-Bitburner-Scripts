@@ -13,6 +13,7 @@
     "hacking/workers/weaken.js",
     "lib/execution.js",
     "lib/network.js",
+    "lib/progression.js",
     "lib/runtime-state.js",
     "lib/state.js",
     "lib/targets.js",
@@ -23,6 +24,7 @@
     "network/root.js",
     "diagnostics/dashboard.js",
     "diagnostics/income.js",
+    "diagnostics/progression.js",
     "diagnostics/test.js",
     "gitpull-self-update.js",
     "gitpull.js"
