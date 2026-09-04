@@ -1,5 +1,5 @@
 import { WORKER_SCRIPTS, getExecutionPool } from "/lib/execution.js";
-import { RuntimePort, publishBatchState, readPlannerState } from "/lib/runtime-state.js";
+import { RuntimePort, publishBatchState, publishLastCompletedBatchState, readPlannerState } from "/lib/runtime-state.js";
 import { isQuiet, positionalArgs } from "/lib/output.js";
 
 const DEFAULT_HACK_FRACTION = 0.10;
@@ -144,6 +144,7 @@ export async function main(ns) {
         updatedAt: finishedAt,
     };
     publishBatchState(ns, complete);
+    publishLastCompletedBatchState(ns, complete);
 
     if (!quiet) {
         ns.tprint(`[BATCH] COMPLETE ${target} | ${(complete.actualHackFraction * 100).toFixed(1)}% hack | gap ${gapMs}ms | ${launched.length} job(s)`);
