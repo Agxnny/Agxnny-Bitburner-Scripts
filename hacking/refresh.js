@@ -1,23 +1,26 @@
-import { readPlannerState } from "/lib/runtime-state.js";
+import { readPlannerState, readRootState } from "/lib/runtime-state.js";
 import { readTelemetryState } from "/lib/telemetry.js";
 import { isQuiet, quietArgs } from "/lib/output.js";
 
+const ROOT_CHECK_MS = 30_000;
+const ROOT_SCRIPT = "/network/root.js";
 const PLANNER_SCRIPT = "/hacking/planner.js";
+const SYNC_SCRIPT = "/network/sync.js";
 const ECONOMY_SCRIPT = "/hacking/economy-planner.js";
 const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
 
 /**
  * Persistent remote refresh coordinator.
  *
- * The expensive target/RAM planner is event-driven rather than timer-driven.
- * Kickstart creates the initial planner snapshot; this coordinator then:
- *   1. performs the initial economy + economic-target pass,
- *   2. watches Port 5 telemetry for a newly completed HACK,
- *   3. after each completed HACK, refreshes planner -> economy -> economic target,
- *   4. leaves the chosen target alone during weaken/grow prep between hacks.
+ * Heavy target/RAM analysis is event-driven rather than timer-driven. This
+ * coordinator performs lightweight rooting checks every 30 seconds, and runs the
+ * full planner only after either:
+ *   - a HACK has completed, or
+ *   - the rooting pass gained one or more new servers.
  *
- * Internal planner launches are always quiet. Running hacking/planner.js manually
- * still prints its full report.
+ * Newly rooted RAM hosts are synced immediately after the planner discovers them,
+ * so they can join the worker pool without rerunning the heavy startup deploy on
+ * the 8GB home node.
  *
  * @param {NS} ns
  */
@@ -26,6 +29,7 @@ export async function main(ns) {
 
     const initialTelemetry = readTelemetryState(ns);
     let lastReviewedHackAt = Number(initialTelemetry?.lastHack?.finishedAt ?? 0);
+    let lastRootCheckAt = 0;
     let startupEconomyDone = false;
 
     while (true) {
@@ -37,19 +41,39 @@ export async function main(ns) {
             }
         }
 
+        const now = Date.now();
+        let rootExpansion = false;
+
+        if (now - lastRootCheckAt >= ROOT_CHECK_MS) {
+            const rootOk = await launchAndWait(ns, ROOT_SCRIPT, true);
+            lastRootCheckAt = Date.now();
+            if (rootOk) {
+                const root = readRootState(ns);
+                rootExpansion = Number(root?.newlyRooted ?? 0) > 0;
+                if (rootExpansion && !isQuiet(ns)) {
+                    ns.print(`Root expansion: ${root.newlyRootedHosts?.join(", ") || `${root.newlyRooted} server(s)`}.`);
+                }
+            }
+        }
+
         const telemetry = readTelemetryState(ns);
         const hackCompletedAt = Number(telemetry?.lastHack?.finishedAt ?? 0);
+        const hackNeedsReview = hackCompletedAt > lastReviewedHackAt;
 
-        if (hackCompletedAt > lastReviewedHackAt) {
+        if (hackNeedsReview || rootExpansion) {
             const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT, true);
             if (plannerOk) {
+                await launchAndWait(ns, SYNC_SCRIPT, true);
                 const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
                 if (economyOk) {
                     const targetOk = await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
                     if (targetOk) {
-                        lastReviewedHackAt = hackCompletedAt;
+                        if (hackNeedsReview) lastReviewedHackAt = hackCompletedAt;
                         if (!isQuiet(ns)) {
-                            ns.print(`Cycle target review complete after HACK at ${new Date(hackCompletedAt).toLocaleTimeString()}.`);
+                            const reason = hackNeedsReview && rootExpansion
+                                ? "HACK completion + new root access"
+                                : hackNeedsReview ? "HACK completion" : "new root access";
+                            ns.print(`Target/RAM review complete after ${reason}.`);
                         }
                     }
                 }
