@@ -13,10 +13,16 @@ import { readTelemetryState } from "/lib/telemetry.js";
 
 const TEST_REQUEST_PORT = 6;
 const TABS = Object.freeze(["Overview", "Targets", "Economy", "Network", "Diagnostics"]);
+const UI_TICK_MS = 100;
 const DATA_REFRESH_MS = 1000;
+
 let activeTab = "Overview";
+let requestedTab = "Overview";
+let requestedTest = null;
 let actionStatus = "Ready";
 let cachedState = null;
+let lastDataRefresh = 0;
+let dirty = true;
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -25,10 +31,34 @@ export async function main(ns) {
     ns.ui.setTailTitle("Agxnny Control Plane");
     ns.ui.resizeTail(1120, 780);
 
-    redraw(ns, true);
     while (true) {
-        await ns.sleep(DATA_REFRESH_MS);
-        redraw(ns, true);
+        const now = Date.now();
+
+        if (!cachedState || now - lastDataRefresh >= DATA_REFRESH_MS) {
+            cachedState = snapshot(ns);
+            lastDataRefresh = now;
+            dirty = true;
+        }
+
+        if (requestedTab !== activeTab) {
+            activeTab = requestedTab;
+            dirty = true;
+        }
+
+        if (requestedTest) {
+            const test = requestedTest;
+            requestedTest = null;
+            ns.writePort(TEST_REQUEST_PORT, JSON.stringify({ test: test.id, requestedAt: now }));
+            actionStatus = `${test.label} queued`;
+            dirty = true;
+        }
+
+        if (dirty) {
+            redraw(ns);
+            dirty = false;
+        }
+
+        await ns.sleep(UI_TICK_MS);
     }
 }
 
@@ -46,23 +76,16 @@ function snapshot(ns) {
     };
 }
 
-function redraw(ns, refreshData = false) {
-    if (refreshData || !cachedState) cachedState = snapshot(ns);
+function redraw(ns) {
     ns.clearLog();
-    ns.printRaw(renderApp(ns, cachedState));
+    ns.printRaw(renderApp(cachedState));
 }
 
-function switchTab(ns, tab) {
-    if (activeTab === tab) return;
-    activeTab = tab;
-    redraw(ns, false);
-}
-
-function renderApp(ns, s) {
+function renderApp(s) {
     return el("div", { style: styles.app },
         header(s),
-        nav(ns),
-        el("div", { style: styles.content }, activeView(ns, s)),
+        nav(),
+        el("div", { style: styles.content }, activeView(s)),
         el("div", { style: styles.footer },
             el("span", null, "CONTROL PLANE"),
             el("span", null, "HGW workers: remote only"),
@@ -92,22 +115,19 @@ function header(s) {
     );
 }
 
-function nav(ns) {
+function nav() {
     return el("div", { style: styles.nav }, ...TABS.map((tab) => el("button", {
         key: tab,
-        onMouseDown: (event) => {
-            event.preventDefault();
-            switchTab(ns, tab);
-        },
+        onClick: () => { requestedTab = tab; },
         style: { ...styles.navButton, ...(activeTab === tab ? styles.navActive : {}) },
     }, tab)));
 }
 
-function activeView(ns, s) {
+function activeView(s) {
     if (activeTab === "Targets") return targetsView(s);
     if (activeTab === "Economy") return economyView(s);
     if (activeTab === "Network") return networkView(s);
-    if (activeTab === "Diagnostics") return diagnosticsView(ns, s);
+    if (activeTab === "Diagnostics") return diagnosticsView(s);
     return overviewView(s);
 }
 
@@ -121,7 +141,7 @@ function overviewView(s) {
     const moneyProgress = Number(m.max ?? 0) > 0 ? Number(m.current ?? 0) / Number(m.max ?? 1) : 0;
 
     return el("div", null,
-        heroGrid(
+        el("div", { style: styles.heroGrid },
             heroMetric("TARGET", c.hostname ?? "waiting", `${c.phase ?? "—"} / ${c.action ?? "—"}`),
             heroMetric("INCOME · 5M", `${moneyFmt(tele.incomePerSecond5m)}/s`, `${Number(tele.hackEvents ?? 0)} hack events`),
             heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} execution hosts`),
@@ -153,8 +173,9 @@ function targetsView(s) {
     const selected = s.economic?.selectedTarget;
     const rankings = Array.isArray(s.economic?.rankings) ? s.economic.rankings : [];
     const rejected = Array.isArray(s.economic?.rejectedTargets) ? s.economic.rejectedTargets : [];
+
     return el("div", null,
-        card("Selected strategy", selected ? el("div", null,
+        selected ? card("Selected strategy", el("div", null,
             el("div", { style: styles.strategyTitle }, `${selected.hostname} · ${pct(selected.moneyTargetPercent)} money`),
             el("div", { style: styles.strategyStats },
                 stat("Prep", duration(selected.prepSeconds)),
@@ -163,7 +184,7 @@ function targetsView(s) {
                 stat("Economic ETA", duration(selected.economicEtaSeconds)),
             ),
             note(selected.reason ?? "No cached reason"),
-        ) : note("Waiting for economic target state."), true),
+        ), true) : card("Selected strategy", note("Waiting for economic target state."), true),
         card("Economic ranking", el("div", null, ...rankings.slice(0, 10).map((r, i) => targetRow(r, i))), true),
         card("Filtered targets", rejected.length
             ? el("div", null, ...rejected.slice(0, 8).map((r) => kv(String(r.hostname), String(r.reason ?? "filtered"))))
@@ -177,19 +198,19 @@ function economyView(s) {
     const manual = s.manualGoal ?? {};
     const purchase = s.purchase ?? {};
     return grid(
-        card("Active money goal", rows([
-            ["Mode", e.mode ?? "waiting"],
-            ["Goal", goal.title ?? "No goal"],
-            ["Current cash", moneyFmt(e.cash)],
-            ["Remaining", moneyFmt(goal.remaining)],
-            ["Ready", goal.ready ? "YES" : "NO"],
-        ])),
-        card("Savings lock", rows([
-            ["Status", manual.active ? "ACTIVE" : "OFF"],
-            ["Target", manual.active ? moneyFmt(manual.targetCash) : "—"],
-            ["Label", manual.title || "—"],
-            ["Auto purchasing", manual.active ? "BLOCKED" : "ENABLED"],
-        ])),
+        card("Active money goal", el("div", null,
+            kv("Mode", e.mode ?? "waiting"),
+            kv("Goal", goal.title ?? "No goal"),
+            kv("Current cash", moneyFmt(e.cash)),
+            kv("Remaining", moneyFmt(goal.remaining)),
+            kv("Ready", goal.ready ? "YES" : "NO"),
+        )),
+        card("Savings lock", el("div", null,
+            kv("Status", manual.active ? "ACTIVE" : "OFF"),
+            kv("Target", manual.active ? moneyFmt(manual.targetCash) : "—"),
+            kv("Label", manual.title || "—"),
+            kv("Auto purchasing", manual.active ? "BLOCKED" : "ENABLED"),
+        )),
         card("Cloud purchasing", el("div", null,
             kv("Status", purchase.status ?? "No state"),
             kv("Last host", purchase.hostname || "—"),
@@ -212,23 +233,23 @@ function networkView(s) {
         ? s.planner.executionHosts.filter((h) => h.hostname !== "home")
         : [];
     return el("div", null,
-        heroGrid(
+        el("div", { style: styles.heroGrid },
             heroMetric("DISCOVERED", String(n.discovered ?? 0), "network hosts"),
             heroMetric("ROOTED", String(n.rooted ?? 0), "available access"),
             heroMetric("HGW TARGETS", String(n.hgwTargets ?? 0), "money servers"),
             heroMetric("PORT TOOLS", `${root.portToolCount ?? n.portToolCount ?? 0}/5`, age(root.updatedAt)),
         ),
         card("Remote execution hosts", el("div", null, ...hosts.slice(0, 18).map(hostRow)), true),
-        card("Rooting status", rows([
-            ["Rootable now", String(n.rootableNow ?? 0)],
-            ["Newly rooted", String(root.newlyRooted ?? 0)],
-            ["Last check", age(root.updatedAt)],
-            ["Tools", Array.isArray(root.availableTools) && root.availableTools.length ? root.availableTools.join(", ") : "none"],
-        ]), true),
+        card("Rooting status", el("div", null,
+            kv("Rootable now", String(n.rootableNow ?? 0)),
+            kv("Newly rooted", String(root.newlyRooted ?? 0)),
+            kv("Last check", age(root.updatedAt)),
+            kv("Tools", Array.isArray(root.availableTools) && root.availableTools.length ? root.availableTools.join(", ") : "none"),
+        ), true),
     );
 }
 
-function diagnosticsView(ns, s) {
+function diagnosticsView(s) {
     const tacticalAge = s.tactical?.updatedAt ? Date.now() - Number(s.tactical.updatedAt) : Infinity;
     const telemetryAge = s.telemetry?.updatedAt ? Date.now() - Number(s.telemetry.updatedAt) : Infinity;
     return grid(
@@ -240,17 +261,17 @@ function diagnosticsView(ns, s) {
             healthRow("Telemetry", telemetryAge < 5000),
         )),
         card("Manual tests", el("div", null,
-            actionButton(ns, "Run smoke tests", "all"),
-            actionButton(ns, "Test progression", "progression-advisor"),
+            actionButton("Run smoke tests", "all"),
+            actionButton("Test progression", "progression-advisor"),
             el("div", { style: styles.actionStatus }, actionStatus),
         )),
-        card("State ages", rows([
-            ["Planner", age(s.planner?.updatedAt)],
-            ["Economy", age(s.economy?.updatedAt)],
-            ["Target strategy", age(s.economic?.updatedAt)],
-            ["Root", age(s.root?.updatedAt)],
-            ["Cloud purchase", age(s.purchase?.updatedAt)],
-        ])),
+        card("State ages", el("div", null,
+            kv("Planner", age(s.planner?.updatedAt)),
+            kv("Economy", age(s.economy?.updatedAt)),
+            kv("Target strategy", age(s.economic?.updatedAt)),
+            kv("Root", age(s.root?.updatedAt)),
+            kv("Cloud purchase", age(s.purchase?.updatedAt)),
+        )),
         card("Commands", el("div", null,
             command("RAM audit", "run diagnostics/mem-audit.js"),
             command("Income report", "run diagnostics/income.js"),
@@ -263,13 +284,13 @@ function diagnosticsView(ns, s) {
 function economySummary(s) {
     const e = s.economy ?? {};
     const goal = e.goal ?? {};
-    return rows([
-        ["Mode", e.mode ?? "waiting"],
-        ["Goal", goal.title ?? "No goal"],
-        ["Cash", moneyFmt(e.cash)],
-        ["Remaining", moneyFmt(goal.remaining)],
-        ["Manual lock", s.manualGoal?.active ? "ACTIVE" : "off"],
-    ]);
+    return el("div", null,
+        kv("Mode", e.mode ?? "waiting"),
+        kv("Goal", goal.title ?? "No goal"),
+        kv("Cash", moneyFmt(e.cash)),
+        kv("Remaining", moneyFmt(goal.remaining)),
+        kv("Manual lock", s.manualGoal?.active ? "ACTIVE" : "off"),
+    );
 }
 
 function healthSummary(s) {
@@ -300,12 +321,29 @@ function hostRow(h) {
     );
 }
 
-function heroGrid(...children) { return el("div", { style: styles.heroGrid }, ...children); }
-function heroMetric(label, value, sub) { return el("div", { style: styles.heroCard }, el("div", { style: styles.heroLabel }, label), el("div", { style: styles.heroValue }, value), el("div", { style: styles.heroSub }, sub)); }
-function stat(label, value) { return el("div", { style: styles.stat }, el("div", { style: styles.statLabel }, label), el("div", { style: styles.statValue }, String(value))); }
-function card(title, content, wide = false) { return el("div", { style: { ...styles.card, ...(wide ? styles.wide : {}) } }, el("div", { style: styles.cardTitle }, title), content); }
+function heroMetric(label, value, sub) {
+    return el("div", { style: styles.heroCard },
+        el("div", { style: styles.heroLabel }, label),
+        el("div", { style: styles.heroValue }, value),
+        el("div", { style: styles.heroSub }, sub),
+    );
+}
+
+function stat(label, value) {
+    return el("div", { style: styles.stat },
+        el("div", { style: styles.statLabel }, label),
+        el("div", { style: styles.statValue }, String(value)),
+    );
+}
+
+function card(title, content, wide = false) {
+    return el("div", { style: { ...styles.card, ...(wide ? styles.wide : {}) } },
+        el("div", { style: styles.cardTitle }, title),
+        content,
+    );
+}
+
 function grid(...children) { return el("div", { style: styles.grid }, ...children); }
-function rows(values) { return el("div", null, ...values.map(([k, v]) => kv(k, v))); }
 function kv(k, v) { return el("div", { style: styles.kv }, el("span", { style: styles.key }, k), el("span", { style: styles.value }, String(v))); }
 function note(v) { return el("div", { style: styles.note }, String(v)); }
 function badge(label, tone) { return el("span", { style: { ...styles.badge, ...styles[`badge_${tone}`] } }, label); }
@@ -326,16 +364,11 @@ function progressBar(value, label) {
     );
 }
 
-function actionButton(ns, label, test) {
+function actionButton(label, id) {
     return el("button", {
-        key: test,
+        key: id,
         style: styles.actionButton,
-        onMouseDown: (event) => {
-            event.preventDefault();
-            ns.writePort(TEST_REQUEST_PORT, JSON.stringify({ test, requestedAt: Date.now() }));
-            actionStatus = `${label} queued`;
-            redraw(ns, false);
-        },
+        onClick: () => { requestedTest = { id, label }; },
     }, label);
 }
 
@@ -386,7 +419,7 @@ const styles = {
     badge_accent: { color: "#8ed0ff", borderColor: "#285276", background: "#102235" },
     badge_dim: { color: "#8593a1", background: "#151a20" },
     nav: { display: "flex", gap: "4px", padding: "12px 0" },
-    navButton: { fontFamily: "monospace", border: "0", borderBottom: "2px solid transparent", background: "transparent", color: "#728191", padding: "8px 12px", cursor: "pointer", fontSize: "12px", userSelect: "none" },
+    navButton: { fontFamily: "monospace", border: "0", borderBottom: "2px solid transparent", background: "transparent", color: "#728191", padding: "8px 12px", cursor: "pointer", fontSize: "12px" },
     navActive: { color: "#e9f2fa", borderBottom: "2px solid #4fa3dc", background: "#101821" },
     content: { paddingTop: "2px" },
     heroGrid: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "10px", marginBottom: "10px" },
@@ -419,7 +452,7 @@ const styles = {
     progressLabel: { color: "#687888", fontSize: "9px", marginTop: "4px" },
     healthGood: { color: "#83d8a9", fontSize: "10px", fontWeight: 700 },
     healthWait: { color: "#d4ae69", fontSize: "10px", fontWeight: 700 },
-    actionButton: { fontFamily: "monospace", marginRight: "8px", marginBottom: "8px", padding: "7px 10px", borderRadius: "5px", border: "1px solid #32536a", background: "#112334", color: "#b8dcf4", cursor: "pointer", userSelect: "none" },
+    actionButton: { fontFamily: "monospace", marginRight: "8px", marginBottom: "8px", padding: "7px 10px", borderRadius: "5px", border: "1px solid #32536a", background: "#112334", color: "#b8dcf4", cursor: "pointer" },
     actionStatus: { color: "#7f8e9c", fontSize: "10px", marginTop: "4px" },
     command: { marginBottom: "9px" },
     commandLabel: { color: "#708090", fontSize: "9px", marginBottom: "3px" },
