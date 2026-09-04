@@ -23,7 +23,9 @@ Quiet mode is unconditional from `startup.js`.
 
 ## Main GUI architecture
 
-`ui/dashboard.js` is the primary control-plane interface. Current views are **Overview, Targets, Economy, Network, and Diagnostics**. Expensive work remains outside the GUI, and interactive operations should use lightweight state/command channels rather than importing costly APIs into the home-resident UI.
+`ui/dashboard.js` is the primary control-plane interface. Current views are **Overview, Targets, Economy, Network, and Diagnostics**. Expensive work remains outside the GUI, and interactive operations use lightweight command/state channels rather than importing costly analysis APIs into the home-resident UI.
+
+The Overview tab can request controller prep/resume actions through Port 13. The React handlers only mutate local request variables; the dashboard's async main loop performs the Netscript port write, preserving the same callback-safety rule used for tab switching and diagnostic actions.
 
 `diagnostics/dashboard.js` remains a separate troubleshooting surface.
 
@@ -43,7 +45,7 @@ ui/stocks.js         -> future portfolio / signals / risk / controls
 Consequences:
 
 - `hack.js`, `grow.js`, and `weaken.js` never launch on home;
-- tactical planning and the new batch runner are intended for remote hosts;
+- tactical planning and the batch runner are intended for remote hosts;
 - if remote capacity is unavailable, production waits rather than consuming control/UI RAM;
 - economic capacity models exclude home worker RAM.
 
@@ -73,7 +75,33 @@ WEAKEN or GROW or HACK
 wait for completion
 ```
 
-This remains the safe fallback and prep mechanism.
+This remains the safe fallback production mechanism.
+
+## Manual prep-and-hold path
+
+The controller now has an explicit prep mode requested through the GUI/controller command queue.
+
+```text
+GUI "Prep target to 100%"
+        ↓ Port 13
+controller enters PREP_GROW
+        ↓
+forced GROW tactical plans until money ≈ 100%
+        ↓
+controller enters PREP_WEAKEN
+        ↓
+forced WEAKEN tactical plans until security ≈ minimum
+        ↓
+PREPARED_HOLD
+```
+
+The key behavior is that **security does not interrupt the grow phase**. The normal tactical calculator remains security-first, so `tactical-planner.js` accepts an optional forced mode (`PREP_GROW` or `PREP_WEAKEN`) and replaces only the `next` action in the calculated plan. Thread analysis still runs remotely through the existing calculator.
+
+This allows a target to fill to 100% in one continuous grow phase, even though growth increases security, and then clean up security afterward without grow/weaken oscillation.
+
+When prep is complete, the controller intentionally holds the target instead of immediately resuming hacking. This is useful for manual HWGW validation because the target remains at approximately 100% money and minimum security until the GUI sends `RESUME_AUTO`.
+
+If prep is requested while a worker action is already in flight, that action is allowed to finish. Any stale tactical request id is invalidated, and the next tactical calculation uses the prep mode.
 
 ## Synchronized HWGW batch path
 
@@ -102,7 +130,7 @@ The runner calculates:
 - absolute landing timestamps for all four stages;
 - full remote-host RAM reservation before launch.
 
-The batch is rejected unless the target is already close to minimum security and at the selected desired-money level.
+The batch is rejected unless the target is already close to minimum security and at the selected desired-money level. Prep-and-hold mode provides the conservative 100% / minimum-security starting state for current manual batch tests.
 
 ### Full-batch RAM reservation
 
@@ -114,7 +142,7 @@ If an unexpected `ns.exec` failure happens after launch begins, all already-star
 
 ### Timed worker interface
 
-Workers remain backward compatible with sequential execution. Their argument shape now reserves:
+Workers remain backward compatible with sequential execution. Their argument shape reserves:
 
 ```text
 arg[0] target
@@ -185,7 +213,14 @@ Economic estimates use remote-only capacity. The batch runner receives the chose
 
 ## Runtime state
 
-Current state channels include controller, planner, tactical plan, telemetry, economy, target strategy, rooting, cloud purchasing, manual spending lock, diagnostics, and synchronized batch state on Port 12.
+Current channels include controller, planner, tactical plan, telemetry, economy, target strategy, rooting, cloud purchasing, manual spending lock, diagnostics, synchronized batch state on Port 12, and controller commands on Port 13.
+
+Port 13 is a queue rather than a latest-value snapshot. Current commands are:
+
+```text
+PREP_TARGET
+RESUME_AUTO
+```
 
 The shared state model remains the contract between automation and presentation.
 
@@ -216,6 +251,7 @@ The shared state model remains the contract between automation and presentation.
 - unified GUI
 - one-command quiet startup
 - safe GUI command channels
+- prep-and-hold controls
 - progression/network/economy visibility
 
 ### Stage 5 — synchronized batching
