@@ -37,7 +37,7 @@ After significant changes to persistent or frequently launched scripts:
 run diagnostics/mem-audit.js
 ```
 
-Pay particular attention to worker RAM after timing instrumentation because GROW/WEAKEN now write one tiny batch-only Port 14 completion event.
+Pay particular attention to controller/dashboard RAM after observability changes and worker RAM after timing instrumentation.
 
 ## Core smoke checks
 
@@ -48,6 +48,38 @@ run diagnostics/progression.js
 run network/inspect.js
 run network/root.js
 ```
+
+## Active worker ETA validation
+
+During a normal HGW or batch-prep GROW/WEAKEN action, Overview should show:
+
+- non-zero Active jobs/threads;
+- `Current ETA` for the active action;
+- one Active Workers row per controller allocation, up to the display limit;
+- action/target, host, threads, elapsed time, and remaining estimate.
+
+`execution.activeWorkers` is observational only. The GUI currently marks a worker `LATE` only after:
+
+```text
+expectedFinishAt + max(5 seconds, expectedDuration × 15%)
+```
+
+A `LATE` label must **not** kill the worker or trigger recovery. Automatic watchdog behavior remains deferred until batching timing is stable.
+
+When the standalone operation completes, the Active Workers list and `execution.currentAction` should clear naturally on the next controller state update.
+
+## Execution-mode transition validation
+
+Switch HGW → BATCH and BATCH → HGW while workers are active.
+
+Expected behavior:
+
+- both mode buttons disable while the transition is pending;
+- GUI shows `SWITCHING → <mode>`;
+- no new tactical/batch work is scheduled;
+- active target-side H/G/W work finishes naturally;
+- tactical analysis may be cancelled;
+- the requested mode applies at the safe boundary.
 
 ## Batch security compensation validation
 
@@ -81,6 +113,13 @@ The tab combines:
 Port 12 → current batch
 Port 15 → latest completed batch
 ```
+
+While a batch is active, verify:
+
+- planned H/W1/G/W2 countdowns are visible;
+- W2 ETA counts down toward `timing.lastLandingAt`;
+- planned total duration is plausible;
+- stale `COMPLETE` state from an older target is not shown as the active batch on Overview.
 
 The retained completed result should show:
 
@@ -156,9 +195,13 @@ Important: Port 14 is currently cleared before each serialized batch. That behav
 At minimum verify:
 
 - `run startup.js` starts GUI + stack;
-- all six tabs switch responsively, including the new Batch tab;
+- all six tabs switch responsively, including the Batch tab;
 - normal HGW mode still works;
 - GUI can switch to BATCH and back to HGW;
+- transition buttons disable and show the pending target mode;
+- Active Workers rows appear and disappear with standalone/prep worker allocations;
+- current action ETA is plausible and counts down between controller refreshes;
+- no automatic worker kill occurs from a `LATE` label;
 - manual target override still works;
 - manual prep/hold still works;
 - manual money goal still blocks automated spending;
