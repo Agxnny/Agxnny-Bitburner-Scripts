@@ -2,7 +2,7 @@
 
 ## Core principle
 
-Game logic and presentation stay separate. The dashboard consumes structured state; it does not decide what HGW should do. Expensive analysis and topology work should run remotely and only when useful, keeping the persistent home control path small.
+Game logic and presentation stay separate. The dashboard consumes structured state; it does not decide what HGW should do. Expensive analysis, topology work, progression decisions, and cloud purchasing should run remotely and only when useful, keeping the persistent home control path small.
 
 ## Target lifecycle
 
@@ -16,7 +16,7 @@ DISCOVERED
   -> PRODUCTION
 ```
 
-`MONEY_PREP` no longer implies “grow to 100%.” The desired money level is a selected strategy input. A target may therefore become production-ready at 25%, 40%, 55%, 70%, 85%, or 100% of max money depending on current economics.
+`MONEY_PREP` does not imply “grow to 100%.” The desired money level is a selected strategy input. Larger targets may become production-ready at 25%, 40%, 55%, 70%, 85%, or 100% of max money depending on current economics, while small targets below the configured floor are forced to full preparation.
 
 A completed `HACK` is a strategic checkpoint. After production completes, the system can reconsider network, RAM, progression, target, and desired-money strategy before settling into another cycle.
 
@@ -24,24 +24,50 @@ Later, `PRODUCTION` can become timed HWGW batching without replacing this lifecy
 
 ## Event-driven network and planner refresh
 
-The heavy target/RAM planner is deliberately not a periodic timer task. Normal operation uses two event classes:
+The heavy target/RAM planner is deliberately not a periodic timer task. Normal operation uses meaningful event classes:
 
 - **HACK completion:** run the full planner, progression/economy refresh, and economic strategy selector.
 - **Root-pool expansion:** when a lightweight rooting pass gains new servers, run the full planner immediately, sync runtime files to the new hosts, then recalculate strategy.
+- **Cloud-server purchase:** when the progression advisor selects an affordable new cloud server, purchase at most one server in that strategic pass, then immediately refresh planner + sync + economy so the new RAM is visible before target selection finishes.
 
 A lightweight rooting pass runs remotely every 30 seconds. It discovers the network, checks port-opening programs on home, opens available ports, and NUKEs servers whose port requirement is satisfied. Rooting does not depend on hacking level.
 
-The rooting result is published on Port 9. If no new server was rooted, no heavy planner run is triggered.
+Rooting state is published on Port 9. Automated cloud-purchase state is published on Port 10.
+
+## Automated cloud capacity
+
+Cloud purchasing is intentionally separated from the persistent controller. `network/cloud-buy.js` consumes the cached progression goal from Port 7 and only acts when:
+
+- the selected goal type is `PURCHASED_SERVER`;
+- the goal is currently affordable;
+- the cloud-server limit has not been reached.
+
+The RAM size comes from progression-candidate metadata rather than being inferred from a title string. Automated server names are deterministic:
+
+```text
+hgw-001
+hgw-002
+hgw-003
+...
+```
+
+The purchaser scans existing cloud-server names and selects the first unused managed name. Existing manually named servers are not renamed. Only one purchase is allowed per strategic refresh so a large cash balance cannot trigger a same-pass purchase loop.
+
+A successful purchase is treated as execution-pool growth. The planner refreshes `executionHosts`, then `network/sync.js` copies the common execution/support files onto the new server.
+
+Automatic cloud-server upgrades are not enabled yet; upgrade candidates remain advisory.
 
 ## Adaptive economic strategy
 
-The economic layer now selects both **server** and **desired money percentage**.
+The economic layer selects both **server** and **desired money percentage**.
 
-For every eligible server, the selector evaluates:
+For targets large enough to justify partial prep, the selector evaluates:
 
 ```text
 25%, 40%, 55%, 70%, 85%, 100%
 ```
+
+Small targets at or below the current max-money floor are forced to 100% preparation. Targets can also be filtered when player cash is sufficiently large relative to the target's **maximum** money, provided another viable target remains.
 
 Each server/percentage strategy uses live state and includes:
 
@@ -65,7 +91,7 @@ Thread capacity is measured host-by-host after subtracting used RAM and the home
 
 Long prep uses a 30-minute exponential penalty. Short preparation stays close to real time, while multi-hour grow commitments become rapidly less attractive.
 
-Each target keeps its best candidate percentage, then those best per-target strategies compete globally. The winning strategy is published through planner/economic state as `moneyTargetPercent` and `hackFraction`.
+Each target keeps its best allowed candidate percentage, then those best per-target strategies compete globally. The winning strategy is published through planner/economic state as `moneyTargetPercent` and `hackFraction`.
 
 The persistent controller imports no expensive economic APIs. It reads the chosen strategy, sets its desired money level, and passes both values to the remote tactical planner. `lib/threads.js` performs the actual live thread calculation for that strategy.
 
@@ -91,9 +117,28 @@ lib/threads.js
 
 This keeps policy selection separate from tactical execution.
 
+## Progression-to-purchase handoff
+
+```text
+lib/progression.js
+    ranks progression candidates
+        ↓
+hacking/economy-planner.js
+    publishes selected goal + metadata on Port 7
+        ↓
+network/cloud-buy.js
+    buys one affordable PURCHASED_SERVER goal
+    publishes result on Port 10
+        ↓
+hacking/refresh.js
+    planner -> sync -> economy refresh
+        ↓
+new server joins distributed RAM pool
+```
+
 ## Runtime state and telemetry
 
-Important decisions should remain representable as structured data. Current state channels include controller, planner, tactical plan, economy, economic target/strategy, telemetry, diagnostics, and root/tool discovery.
+Important decisions should remain representable as structured data. Current state channels include controller, planner, tactical plan, economy, economic target/strategy, telemetry, diagnostics, root/tool discovery, and automated cloud-purchase state.
 
 The shared state should continue to expose or grow toward:
 
@@ -105,6 +150,7 @@ The shared state should continue to expose or grow toward:
 - queued/running operations and progress;
 - usable/committed/free RAM;
 - available port-opening tools and newly rooted hosts;
+- progression goal and automated purchase outcomes;
 - money earned by HGW and income rate;
 - predicted versus actual cycle performance;
 - reasons for controller decisions;
@@ -116,7 +162,9 @@ The dashboard should eventually include HGW totals, RAM-pool usage, active targe
 
 ## Guidance engine
 
-Guidance remains separate from HGW decision-making. It evaluates blockers and upgrade opportunities such as port programs, hacking level, home RAM, purchased servers, and saving. Recommendations should compare expected automation benefit against cost where practical.
+Guidance remains separate from HGW decision-making. It evaluates blockers and upgrade opportunities such as port programs, hacking level, home RAM, cloud servers, and saving. Recommendations should compare expected automation benefit against cost where practical.
+
+The guidance layer owns **what should be purchased**. Short-lived action scripts own **how to execute an approved automated purchase**. This separation allows future automation for cloud upgrades or port programs without putting purchase APIs into the home controller.
 
 ## Development stages
 
@@ -134,6 +182,7 @@ Guidance remains separate from HGW decision-making. It evaluates blockers and up
 - event-driven planner refresh
 - RAM pool discovery
 - startup deployment plus lightweight new-host sync
+- advisor-driven cloud-server purchasing
 
 ### Stage 3 — adaptive strategy
 
@@ -151,6 +200,7 @@ Guidance remains separate from HGW decision-making. It evaluates blockers and up
 - telemetry and progress
 - progression recommendations
 - actual versus predicted metrics
+- broader controlled progression automation
 
 ### Stage 5 — batching
 
