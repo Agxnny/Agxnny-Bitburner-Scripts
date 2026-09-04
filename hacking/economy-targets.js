@@ -8,6 +8,8 @@ import {
 
 const DEFAULT_HACK_FRACTION = 0.10;
 const SECURITY_TOLERANCE = 0.5;
+const HOME_RESERVE_GB = 1;
+const CONTROLLER_FRESH_MS = 5_000;
 
 /**
  * Short-lived target selector that answers a different question from the baseline
@@ -34,7 +36,11 @@ export async function main(ns) {
 
     if (rankings.length === 0) return;
 
-    const usableRam = Math.max(0, Number(controller?.execution?.usableRam ?? 0));
+    const controllerFresh = controller?.updatedAt && Date.now() - Number(controller.updatedAt) <= CONTROLLER_FRESH_MS;
+    const usableRam = controllerFresh
+        ? Math.max(0, Number(controller?.execution?.usableRam ?? 0))
+        : estimatePlannerUsableRam(ns, planner);
+
     const workerRam = planner?.workerRam ?? {};
     const growRam = Math.max(0.001, Number(workerRam["/hacking/workers/grow.js"] ?? 0));
     const weakenRam = Math.max(0.001, Number(workerRam["/hacking/workers/weaken.js"] ?? 0));
@@ -64,9 +70,9 @@ export async function main(ns) {
     const selected = candidates[0] ?? null;
     const updatedAt = Date.now();
     publishEconomyTargetState(ns, {
-        version: 1,
+        version: 2,
         updatedAt,
-        plannerUpdatedAt: Number(planner?.updatedAt ?? 0),
+        plannerUpdatedAt: Number(planner?.analysisUpdatedAt ?? planner?.updatedAt ?? 0),
         economyUpdatedAt: Number(economy?.updatedAt ?? 0),
         goal: economy?.goal ?? null,
         cash: Math.max(0, Number(economy?.cash ?? 0)),
@@ -82,7 +88,7 @@ export async function main(ns) {
                 ...planner,
                 updatedAt,
                 selectedTarget: selectedAnalysis,
-                selectionModel: "GOAL_ETA_WITH_PREP_COST_V1",
+                selectionModel: "GOAL_ETA_WITH_PREP_COST_V2",
                 economicSelection: {
                     hostname: selected.hostname,
                     baselineRank: selected.baselineRank,
@@ -103,12 +109,14 @@ function evaluateTarget(ns, target, context) {
     const hostname = String(target?.hostname ?? "");
     if (!hostname) return null;
 
-    const moneyCurrent = Math.max(0, Number(target.money?.current ?? 0));
+    const moneyCurrent = Math.max(0, Number(ns.getServerMoneyAvailable(hostname)) || 0);
     const moneyMax = Math.max(0, Number(target.money?.max ?? 0));
     if (moneyMax <= 0) return null;
 
-    const moneyPercent = moneyMax > 0 ? moneyCurrent / moneyMax : 0;
-    const securityDelta = Math.max(0, Number(target.security?.delta ?? 0));
+    const moneyPercent = moneyCurrent / moneyMax;
+    const securityCurrent = Math.max(0, Number(ns.getServerSecurityLevel(hostname)) || 0);
+    const securityMinimum = Math.max(0, Number(target.security?.minimum ?? ns.getServerMinSecurityLevel(hostname)) || 0);
+    const securityDelta = Math.max(0, securityCurrent - securityMinimum);
     const hackChance = clamp01(Number(target.hacking?.chance ?? 0));
     const hackPercentPerThread = Math.max(0, Number(target.hacking?.percentPerThread ?? 0));
     const hackTime = Math.max(0.001, Number(target.timing?.hackMs ?? 1) / 1000);
@@ -178,6 +186,18 @@ function evaluateTarget(ns, target, context) {
         goalEtaSeconds,
         reason: describeReason({ prepSeconds, steadyIncomePerSecond, goalEtaSeconds, hasCashGoal: context.hasCashGoal }),
     };
+}
+
+function estimatePlannerUsableRam(ns, planner) {
+    const hosts = Array.isArray(planner?.executionHosts) ? planner.executionHosts : [];
+    return hosts.reduce((total, entry) => {
+        const hostname = String(entry?.hostname ?? "");
+        if (!hostname) return total;
+        const maxRam = Math.max(0, Number(entry?.maxRam ?? 0));
+        const usedRam = Math.max(0, Number(ns.getServerUsedRam(hostname)) || 0);
+        const reserve = hostname === "home" ? HOME_RESERVE_GB : 0;
+        return total + Math.max(0, maxRam - usedRam - reserve);
+    }, 0);
 }
 
 function describeReason(values) {
