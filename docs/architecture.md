@@ -2,7 +2,23 @@
 
 ## Core principle
 
-Game logic and presentation stay separate. The dashboard consumes structured state; it does not decide what HGW should do. Expensive analysis, topology work, progression decisions, and cloud purchasing should run remotely and only when useful, keeping the persistent home control path small.
+Game logic and presentation stay separate. Home is the **control plane**: orchestration, state coordination, GUI/dashboard, updater, and other lightweight persistent services belong there. Rooted and cloud servers are the **execution plane**: HGW workers and expensive short-lived analysis should run remotely whenever possible.
+
+The dashboard consumes structured state; it does not decide what HGW should do. Expensive analysis, topology work, progression decisions, and cloud purchasing should run remotely and only when useful, keeping the persistent home control path small.
+
+## Home/control-plane policy
+
+`lib/execution.js` now enforces `REMOTE_ONLY` worker execution. The worker pool excludes `home` completely rather than merely reserving a few GB.
+
+Consequences:
+
+- `hack.js`, `grow.js`, and `weaken.js` never launch on home;
+- tactical planning uses the same remote execution pool and therefore also avoids home;
+- if no remote host has enough RAM, the controller waits instead of falling back to home;
+- controller RAM totals represent remote execution capacity rather than mixed control + worker capacity;
+- economic strategy calculations exclude home from hack/grow/weaken thread capacity so predicted waves match real dispatch behavior.
+
+This makes home RAM available for the controller, GUI/dashboard, future scheduling services, and other orchestration features. A later controller/dispatcher split should reduce home RAM further without weakening this boundary.
 
 ## Target lifecycle
 
@@ -77,7 +93,7 @@ hgw-003
 
 The purchaser scans existing cloud-server names and selects the first unused managed name. Existing manually named servers are not renamed. Only one purchase is allowed per strategic refresh so a large cash balance cannot trigger a same-pass purchase loop.
 
-A successful purchase is treated as execution-pool growth. The planner refreshes `executionHosts`, then `network/sync.js` copies execution/support files onto the new server.
+A successful purchase is treated as execution-pool growth. The planner refreshes `executionHosts`, then `network/sync.js` copies execution/support files onto the new server. The new server can then enter the remote-only worker pool.
 
 Automatic cloud-server upgrades are not enabled yet; upgrade candidates remain advisory.
 
@@ -97,7 +113,7 @@ Each server/percentage strategy uses live state and includes required prep/recov
 
 When a manual money goal is active, that remaining amount becomes the progression-goal distance used by the selector. This means manual savings mode changes target economics without changing the tactical execution interfaces.
 
-Thread capacity is measured host-by-host after subtracting used RAM and the home reserve. Long prep uses a 30-minute exponential penalty.
+Thread capacity is measured host-by-host across **remote execution hosts only** after subtracting their current used RAM. Home contributes zero worker capacity. Long prep uses a 30-minute exponential penalty.
 
 ## Strategy handoff
 
@@ -107,14 +123,16 @@ economy-targets.js
         ↓
 Port 2 planner economicSelection
         ↓
-controller.js
+controller.js on home
     adopts desired money percentage
         ↓
-tactical-planner.js
+tactical-planner.js on remote host
     receives target, request id, hack fraction, money target
         ↓
 lib/threads.js
     calculates WEAKEN / GROW / HACK requirements
+        ↓
+remote-only worker pool
 ```
 
 ## Progression-to-purchase handoff
@@ -141,11 +159,13 @@ hacking/refresh.js
 
 Current state channels include controller, planner, tactical plan, economy, economic target/strategy, telemetry, diagnostics, root/tool discovery, automated cloud-purchase state, and manual money-goal state.
 
-The shared state should continue to expose or grow toward active targets, selected strategy, RAM capacity, progression objectives, purchase outcomes, spending locks, predicted/actual performance, reasons, and warnings.
+The shared state should continue to expose or grow toward active targets, selected strategy, **remote worker capacity**, progression objectives, purchase outcomes, spending locks, predicted/actual performance, reasons, and warnings.
 
 ## Guidance engine
 
 Guidance remains separate from HGW decision-making. It evaluates blockers and upgrade opportunities such as port programs, hacking level, home RAM, cloud servers, and saving. The guidance layer owns **what should be purchased**; short-lived action scripts own **how to execute an approved automated purchase**; the manual money-goal layer can temporarily revoke automatic spending authority entirely.
+
+Home RAM and remote RAM now have distinct economic roles: home upgrades create control/UI headroom, while rooted/cloud RAM directly expands HGW execution throughput.
 
 ## Development stages
 
@@ -161,7 +181,7 @@ Guidance remains separate from HGW decision-making. It evaluates blockers and up
 - recursive discovery
 - automatic rooting/capability checks
 - event-driven planner refresh
-- RAM pool discovery
+- remote-only worker RAM pool
 - startup deployment plus lightweight new-host sync
 - advisor-driven cloud-server purchasing
 - manual money-goal spending lock
@@ -174,7 +194,7 @@ Guidance remains separate from HGW decision-making. It evaluates blockers and up
 - target/strategy hysteresis
 - hack-fraction optimization
 - predicted-versus-actual calibration
-- multiple-target resource allocation
+- multiple-target remote resource allocation
 
 ### Stage 4 — dashboard and guidance
 
