@@ -69,13 +69,20 @@ Corrected live cycles used `25H / 1W / 298G / 24W` and later `25H / 1W / 299G / 
 
 ## Recovery-model telemetry
 
-Port 12 retains `initial`, `predicted`, `final`, and `comparison` data. Validate that predicted-vs-actual money/security errors remain small and stable over repeated batches.
+Port 12 retains `initial`, `predicted`, `final`, and `comparison` data while a completed batch remains current. On every `COMPLETE`, the same payload is copied to **Port 15**, which remains available after the next batch begins.
 
 ## Current highest-priority batch test: landing drift
 
-After pulling/restarting, let several automatic batches complete. Port 12 schema version 3 now includes a `landing` object aggregated from worker completion events on Port 14.
+After pulling/restarting, let at least one new automatic batch complete, then open the **Batch** tab.
 
-For each completed batch inspect:
+The tab combines:
+
+```text
+Port 12 → current batch
+Port 15 → latest completed batch
+```
+
+The retained completed result should show:
 
 ```text
 landing.orderCorrect
@@ -85,31 +92,28 @@ landing.minimumSpacingMs
 landing.maxAbsLandingErrorMs
 ```
 
-Then inspect each `landing.stages[]` entry:
+Each stage should also show:
 
 ```text
-name
 plannedLandingAt
-firstCompletionAt
 actualLandingAt
 allocationSpreadMs
 landingErrorMs
-expectedJobs
-reportedJobs
-missingJobs
-complete
+reportedJobs / expectedJobs
 ```
+
+The planned-vs-actual timeline plots one row each for H, W1, G, and W2. Planned and actual markers should remain close. Actual to the right of planned means the stage landed late; actual to the left means early.
 
 Interpretation:
 
 - `orderCorrect` should be true.
 - `missingJobs` should be zero.
 - `actualOrder` should remain `HACK → WEAKEN_HACK → GROW → WEAKEN_GROW`.
-- `minimumSpacingMs` should remain comfortably positive; compare it with the configured 200 ms gap.
-- `maxAbsLandingErrorMs` shows the worst stage drift from its planned landing.
-- `allocationSpreadMs` shows how widely a stage split across several hosts completed; large spread can matter even when the final stage order is correct.
+- `minimumSpacingMs` should remain comfortably positive relative to the configured 200 ms gap.
+- `maxAbsLandingErrorMs` shows the worst stage drift.
+- `allocationSpreadMs` shows how widely a stage split across hosts completed.
 
-Do not tune the 200 ms gap from a single sample. Collect several cycles and look for the worst observed drift/spread and whether timing errors are biased or sporadic.
+Do not tune the 200 ms gap from a single sample. Collect several cycles and compare the worst observed drift, spread, and minimum spacing.
 
 ## Batch correctness acceptance criteria
 
@@ -130,7 +134,7 @@ Before starting pipelined/overlapping batches, aim for several consecutive autom
 
 ## Timing validation before pipelining
 
-The current fixed gap is 200 ms. After collecting repeated Port 12 landing samples, compare:
+The current fixed gap is 200 ms. Compare over repeated retained completed batches:
 
 ```text
 configured gap
@@ -139,9 +143,7 @@ maximum absolute landing error
 maximum within-stage allocation spread
 ```
 
-If order remains correct and the worst measured timing variation leaves substantial positive spacing, keep the gap unchanged for the next stage. If spacing becomes narrow or negative, investigate whether launch overhead, host split, or scheduler drift is responsible before adapting the gap.
-
-Do not reduce the gap aggressively until measured drift is available.
+If order remains correct and the worst measured timing variation leaves substantial positive spacing, keep the gap unchanged. If spacing becomes narrow or negative, investigate launch overhead, host split, and scheduler drift before adapting the gap.
 
 ## Pipelining readiness test
 
@@ -154,13 +156,14 @@ Important: Port 14 is currently cleared before each serialized batch. That behav
 At minimum verify:
 
 - `run startup.js` starts GUI + stack;
+- all six tabs switch responsively, including the new Batch tab;
 - normal HGW mode still works;
 - GUI can switch to BATCH and back to HGW;
 - manual target override still works;
 - manual prep/hold still works;
 - manual money goal still blocks automated spending;
 - cloud purchase and cloud upgrade automation still execute;
-- new port tools are detected and newly rootable servers join the pool;
 - batch-associated HACK does not trigger premature planner review;
 - Port 14 timing events do not affect Port 4 strategic HACK telemetry;
+- Port 15 retains the latest complete result while Port 12 moves to the next batch;
 - README/docs reflect the current architecture.
