@@ -5,11 +5,6 @@
  *   run gitpull.js
  *   run gitpull.js --branch dev
  *
- * Important: GitHub raw URLs for private repositories require authentication,
- * and Netscript's wget does not provide a safe way to attach GitHub auth
- * headers. This script therefore works directly when the repository/files are
- * publicly reachable, or when BASE_URL is changed to another reachable mirror.
- *
  * @param {NS} ns
  */
 export async function main(ns) {
@@ -23,19 +18,27 @@ export async function main(ns) {
         return;
     }
 
+    if (ns.getHostname() !== "home") {
+        ns.tprint("ERROR: Run gitpull.js from home.");
+        return;
+    }
+
     const owner = "Agxnny";
     const repo = "Agxnny-Bitburner-Scripts";
     const branch = String(flags.branch);
     const baseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
-    const manifestPath = "/data/repo-manifest.json";
+    const manifestPath = "repo-manifest.json";
+    const cacheBust = Date.now();
 
     ns.tprint(`Pulling ${owner}/${repo}@${branch}...`);
 
-    const manifestOk = await ns.wget(`${baseUrl}/manifest.json`, manifestPath, "home");
+    const manifestUrl = `${baseUrl}/manifest.json?ts=${cacheBust}`;
+    const manifestOk = await ns.wget(manifestUrl, manifestPath, "home");
+
     if (!manifestOk) {
         ns.tprint("ERROR: Could not download manifest.json.");
-        ns.tprint("If the GitHub repository is private, raw.githubusercontent.com will reject the request.");
-        ns.tprint("Do not embed a GitHub token in this script. Use a public/mirrored source instead.");
+        ns.tprint(`Tried: ${manifestUrl}`);
+        ns.tprint("Test the raw URL directly with Bitburner's terminal wget command.");
         return;
     }
 
@@ -44,6 +47,7 @@ export async function main(ns) {
         manifest = JSON.parse(ns.read(manifestPath));
     } catch (error) {
         ns.tprint(`ERROR: Downloaded manifest is invalid JSON: ${String(error)}`);
+        ns.tprint(`Contents: ${ns.read(manifestPath)}`);
         return;
     }
 
@@ -54,16 +58,16 @@ export async function main(ns) {
 
     const files = manifest.files.map(String);
     const selfPath = "gitpull.js";
-    const normalFiles = files.filter((file) => file !== selfPath);
-    const selfFiles = files.filter((file) => file === selfPath);
+    const orderedFiles = [
+        ...files.filter((file) => file !== selfPath),
+        ...files.filter((file) => file === selfPath),
+    ];
 
     let succeeded = 0;
     const failed = [];
 
-    // Pull the updater itself last so the currently running source is not
-    // replaced until every other repository script has been attempted.
-    for (const file of [...normalFiles, ...selfFiles]) {
-        const url = `${baseUrl}/${file}`;
+    for (const file of orderedFiles) {
+        const url = `${baseUrl}/${file}?ts=${Date.now()}`;
         const ok = await ns.wget(url, file, "home");
 
         if (ok) {
@@ -72,6 +76,7 @@ export async function main(ns) {
         } else {
             failed.push(file);
             ns.tprint(`FAIL ${file}`);
+            ns.tprint(`     ${url}`);
         }
     }
 
