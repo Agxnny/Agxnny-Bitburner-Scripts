@@ -20,29 +20,53 @@ DISCOVERED
 
 A completed `HACK` is a strategic checkpoint. After production completes, the system can reconsider network, RAM, progression, target, and desired-money strategy before settling into another cycle.
 
-Later, `PRODUCTION` can become timed HWGW batching without replacing this lifecycle contract.
-
-## Event-driven network and planner refresh
+## Event-driven network and economy refresh
 
 The heavy target/RAM planner is deliberately not a periodic timer task. Normal operation uses meaningful event classes:
 
 - **HACK completion:** run the full planner, progression/economy refresh, and economic strategy selector.
-- **Root-pool expansion:** when a lightweight rooting pass gains new servers, run the full planner immediately, sync runtime files to the new hosts, then recalculate strategy.
-- **Cloud-server purchase:** when the progression advisor selects an affordable new cloud server, purchase at most one server in that strategic pass, then immediately refresh planner + sync + economy so the new RAM is visible before target selection finishes.
+- **Root-pool expansion:** run the full planner, sync newly available RAM hosts, then recalculate strategy.
+- **Cloud-server purchase:** purchase at most one approved server per strategic pass, then refresh planner + sync + economy before target selection finishes.
+- **Manual money-goal change:** refresh only economy, purchase-lock state, and target economics; do not rerun the heavy network planner unless another event already requires it.
 
-A lightweight rooting pass runs remotely every 30 seconds. It discovers the network, checks port-opening programs on home, opens available ports, and NUKEs servers whose port requirement is satisfied. Rooting does not depend on hacking level.
+A lightweight rooting pass runs remotely every 30 seconds. Rooting state is published on Port 9, cloud-purchase state on Port 10, and manual money-goal state on Port 11.
 
-Rooting state is published on Port 9. Automated cloud-purchase state is published on Port 10.
+## Manual money-goal safety interlock
+
+The user can set an explicit total-cash target with `economy/manual-goal.js`. This is both an economic objective and a spending lock.
+
+While active:
+
+```text
+manual-goal.js
+    publishes target cash on Port 11
+        ↓
+hacking/economy-planner.js
+    replaces automatic progression goal with MANUAL_MONEY
+        ↓
+hacking/economy-targets.js
+    optimizes cash generation toward remaining manual target
+        ↓
+network/cloud-buy.js
+    independently reads Port 11 and refuses all automated purchases
+```
+
+The purchaser checks Port 11 directly rather than trusting only Port 7. This is a deliberate safety interlock: a stale automatic `PURCHASED_SERVER` recommendation cannot spend money after the user has activated a manual savings goal.
+
+Reaching the manual target does not clear the lock. The user must explicitly clear it before automated spending resumes. This prevents the system from reaching a savings milestone and immediately consuming those funds on an unrelated automatic purchase.
+
+Automatic progression candidates continue to be calculated and published while the manual goal is active so the advisor remains observable without being authoritative for spending.
 
 ## Automated cloud capacity
 
-Cloud purchasing is intentionally separated from the persistent controller. `network/cloud-buy.js` consumes the cached progression goal from Port 7 and only acts when:
+Cloud purchasing is intentionally separated from the persistent controller. `network/cloud-buy.js` only acts when:
 
-- the selected goal type is `PURCHASED_SERVER`;
+- no manual money goal is active;
+- the selected automatic goal type is `PURCHASED_SERVER`;
 - the goal is currently affordable;
 - the cloud-server limit has not been reached.
 
-The RAM size comes from progression-candidate metadata rather than being inferred from a title string. Automated server names are deterministic:
+Automated server names are deterministic:
 
 ```text
 hgw-001
@@ -53,7 +77,7 @@ hgw-003
 
 The purchaser scans existing cloud-server names and selects the first unused managed name. Existing manually named servers are not renamed. Only one purchase is allowed per strategic refresh so a large cash balance cannot trigger a same-pass purchase loop.
 
-A successful purchase is treated as execution-pool growth. The planner refreshes `executionHosts`, then `network/sync.js` copies the common execution/support files onto the new server.
+A successful purchase is treated as execution-pool growth. The planner refreshes `executionHosts`, then `network/sync.js` copies execution/support files onto the new server.
 
 Automatic cloud-server upgrades are not enabled yet; upgrade candidates remain advisory.
 
@@ -69,35 +93,13 @@ For targets large enough to justify partial prep, the selector evaluates:
 
 Small targets at or below the current max-money floor are forced to 100% preparation. Targets can also be filtered when player cash is sufficiently large relative to the target's **maximum** money, provided another viable target remains.
 
-Each server/percentage strategy uses live state and includes:
+Each server/percentage strategy uses live state and includes required prep/recovery threads, distributed thread capacity, worker waves, raw and exponentially weighted prep time, production cycle time, expected cash rate, and progression-goal ETA.
 
-- desired money before hacking;
-- fixed current hack fraction (currently 10%);
-- live current/max money;
-- live current/minimum security;
-- required security-prep weaken threads;
-- grow threads needed only to reach the candidate money target;
-- grow security and recovery weaken work;
-- current distributed hack/grow/weaken thread capacity;
-- number of required worker waves;
-- raw prep time;
-- exponentially weighted prep time;
-- production recovery cycle time;
-- expected cash per cycle;
-- expected steady cash/sec;
-- progression-goal ETA and weighted economic ETA.
+When a manual money goal is active, that remaining amount becomes the progression-goal distance used by the selector. This means manual savings mode changes target economics without changing the tactical execution interfaces.
 
-Thread capacity is measured host-by-host after subtracting used RAM and the home reserve. This preserves fragmentation effects instead of pretending the whole RAM pool is one server.
-
-Long prep uses a 30-minute exponential penalty. Short preparation stays close to real time, while multi-hour grow commitments become rapidly less attractive.
-
-Each target keeps its best allowed candidate percentage, then those best per-target strategies compete globally. The winning strategy is published through planner/economic state as `moneyTargetPercent` and `hackFraction`.
-
-The persistent controller imports no expensive economic APIs. It reads the chosen strategy, sets its desired money level, and passes both values to the remote tactical planner. `lib/threads.js` performs the actual live thread calculation for that strategy.
+Thread capacity is measured host-by-host after subtracting used RAM and the home reserve. Long prep uses a 30-minute exponential penalty.
 
 ## Strategy handoff
-
-The current handoff is:
 
 ```text
 economy-targets.js
@@ -115,56 +117,35 @@ lib/threads.js
     calculates WEAKEN / GROW / HACK requirements
 ```
 
-This keeps policy selection separate from tactical execution.
-
 ## Progression-to-purchase handoff
 
 ```text
 lib/progression.js
-    ranks progression candidates
+    ranks automatic progression candidates
         ↓
 hacking/economy-planner.js
-    publishes selected goal + metadata on Port 7
+    automatic goal OR manual override on Port 7
         ↓
 network/cloud-buy.js
-    buys one affordable PURCHASED_SERVER goal
-    publishes result on Port 10
+    hard-checks Port 11
+        ↓
+    if unlocked, may buy one affordable PURCHASED_SERVER goal
+        ↓
+Port 10 purchase result
         ↓
 hacking/refresh.js
     planner -> sync -> economy refresh
-        ↓
-new server joins distributed RAM pool
 ```
 
 ## Runtime state and telemetry
 
-Important decisions should remain representable as structured data. Current state channels include controller, planner, tactical plan, economy, economic target/strategy, telemetry, diagnostics, root/tool discovery, and automated cloud-purchase state.
+Current state channels include controller, planner, tactical plan, economy, economic target/strategy, telemetry, diagnostics, root/tool discovery, automated cloud-purchase state, and manual money-goal state.
 
-The shared state should continue to expose or grow toward:
-
-- active targets and lifecycle phase;
-- current/max/desired money;
-- current/minimum/desired security;
-- selected strategy and alternatives;
-- hack/grow/weaken thread requirements;
-- queued/running operations and progress;
-- usable/committed/free RAM;
-- available port-opening tools and newly rooted hosts;
-- progression goal and automated purchase outcomes;
-- money earned by HGW and income rate;
-- predicted versus actual cycle performance;
-- reasons for controller decisions;
-- warnings/errors and recent events.
-
-## Persistent dashboard
-
-The dashboard should eventually include HGW totals, RAM-pool usage, active target state, selected desired-money strategy, predicted versus actual performance, important events, and progression guidance. Detailed one-off reports remain diagnostics rather than being folded into the dashboard.
+The shared state should continue to expose or grow toward active targets, selected strategy, RAM capacity, progression objectives, purchase outcomes, spending locks, predicted/actual performance, reasons, and warnings.
 
 ## Guidance engine
 
-Guidance remains separate from HGW decision-making. It evaluates blockers and upgrade opportunities such as port programs, hacking level, home RAM, cloud servers, and saving. Recommendations should compare expected automation benefit against cost where practical.
-
-The guidance layer owns **what should be purchased**. Short-lived action scripts own **how to execute an approved automated purchase**. This separation allows future automation for cloud upgrades or port programs without putting purchase APIs into the home controller.
+Guidance remains separate from HGW decision-making. It evaluates blockers and upgrade opportunities such as port programs, hacking level, home RAM, cloud servers, and saving. The guidance layer owns **what should be purchased**; short-lived action scripts own **how to execute an approved automated purchase**; the manual money-goal layer can temporarily revoke automatic spending authority entirely.
 
 ## Development stages
 
@@ -183,6 +164,7 @@ The guidance layer owns **what should be purchased**. Short-lived action scripts
 - RAM pool discovery
 - startup deployment plus lightweight new-host sync
 - advisor-driven cloud-server purchasing
+- manual money-goal spending lock
 
 ### Stage 3 — adaptive strategy
 
