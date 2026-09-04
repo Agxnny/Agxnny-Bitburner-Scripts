@@ -15,9 +15,9 @@ const MANUAL_TESTS = Object.freeze([
 let manualTestStatus = "Ready";
 
 /**
- * Lightweight read-only live dashboard plus explicit user-triggered manual test
- * requests. Expensive network/progression analysis is performed by short-lived
- * planners/tests and consumed here as cached state.
+ * Minimal persistent dashboard. It consumes cached state only; expensive/live
+ * Netscript analysis belongs in planners, controllers, telemetry collectors, or
+ * explicit manual diagnostics.
  *
  * @param {NS} ns
  */
@@ -43,16 +43,17 @@ function render(ns) {
     const telemetry = readTelemetryState(ns);
     const network = planner?.network ?? null;
     const workerRam = planner?.workerRam ?? {};
-
-    const homeMaxRam = ns.getServerMaxRam("home");
-    const homeUsedRam = ns.getServerUsedRam("home");
-    const homeFreeRam = Math.max(0, homeMaxRam - homeUsedRam);
+    const homePlan = Array.isArray(planner?.executionHosts)
+        ? planner.executionHosts.find((host) => host.hostname === "home")
+        : null;
+    const homeMaxRam = Number(homePlan?.maxRam ?? 0);
+    const execution = controller?.execution ?? {};
 
     ns.clearLog();
     ns.print("┌──────────────────────── BITBURNER DIAGNOSTICS ────────────────────────┐");
     ns.print(`│ Planner      ${planner ? `cached ${formatAge(Math.max(0, Date.now() - Number(planner.updatedAt ?? 0)))} ago` : "WAITING"}`);
-    ns.print(`│ Hack level   ${String(planner?.hackingLevel ?? "?").padEnd(8)} Home RAM ${formatRam(homeUsedRam)} / ${formatRam(homeMaxRam)}`);
-    ns.print(`│ Free RAM     ${formatRam(homeFreeRam).padEnd(10)} Port tools ${Number(network?.portToolCount ?? 0)}/5`);
+    ns.print(`│ Hack level   ${String(planner?.hackingLevel ?? "?").padEnd(8)} Home tier ${formatRam(homeMaxRam)}`);
+    ns.print(`│ Pool usable  ${formatRam(execution.usableRam ?? 0).padEnd(10)} Port tools ${Number(network?.portToolCount ?? 0)}/5`);
 
     ns.print("├──────────────────────────── CONTROLLER ───────────────────────────────┤");
     renderController(ns, controller, controllerStale);
@@ -81,7 +82,7 @@ function render(ns) {
     ns.print("├─────────────────────────── QUICK CHECKS ──────────────────────────────┤");
     ns.print(`│ Planner    ${planner?.selectedTarget ? "PASS" : "WAIT"}`);
     ns.print(`│ Network    ${Number(network?.discovered ?? 0) > 0 ? "PASS" : "WAIT"}`);
-    ns.print(`│ Workers    ${["/hacking/workers/hack.js", "/hacking/workers/grow.js", "/hacking/workers/weaken.js"].every((path) => Number(workerRam[path] ?? 0) > 0) ? "PASS" : "WAIT"}`);
+    ns.print(`│ Workers    ${["/hacking/workers/hack.js", "/hacking/workers/grow.js", "/hacking/workers/workers/weaken.js"].every((path) => Number(workerRam[path] ?? 0) > 0) ? "PASS" : "WAIT"}`);
     ns.print(`│ Controller ${controller && !controllerStale ? "PASS" : "WAIT"}`);
     ns.print("└───────────────────────────────────────────────────────────────────────┘");
 }
