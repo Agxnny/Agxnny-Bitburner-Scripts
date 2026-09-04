@@ -3,10 +3,12 @@ import {
     readControllerState,
 } from "/lib/runtime-state.js";
 import { readTelemetryState } from "/lib/telemetry.js";
+import { buildProgressionAdvice } from "/lib/progression.js";
 
 const TESTS = Object.freeze({
     "controller-state": testControllerState,
     "telemetry-state": testTelemetryState,
+    "progression-advisor": testProgressionAdvisor,
 });
 
 /**
@@ -17,6 +19,7 @@ const TESTS = Object.freeze({
  *   run diagnostics/test.js --list
  *   run diagnostics/test.js controller-state
  *   run diagnostics/test.js telemetry-state
+ *   run diagnostics/test.js progression-advisor
  *   run diagnostics/test.js all
  *
  * Tests inspect shared runtime state and do not interrupt the live HGW loop.
@@ -154,6 +157,47 @@ function testTelemetryState(ns) {
     return { ok: true, lines };
 }
 
+/** @param {NS} ns */
+function testProgressionAdvisor(ns) {
+    const telemetry = readTelemetryState(ns);
+    const advice = buildProgressionAdvice(ns, telemetry);
+    const goal = advice?.selected;
+    const lines = [];
+
+    if (!goal) return fail("Progression advisor did not produce a selected goal.");
+
+    const checks = [
+        [Number(advice.version) >= 1, "advisor version"],
+        [Array.isArray(advice.candidates), "candidate list"],
+        [Boolean(goal.id), "goal id"],
+        [Boolean(goal.type), "goal type"],
+        [Boolean(goal.title), "goal title"],
+        [Number.isFinite(Number(goal.currentCash)), "current cash"],
+        [Number.isFinite(Number(goal.cost)) && Number(goal.cost) >= 0, "goal cost"],
+        [Number.isFinite(Number(goal.remaining)) && Number(goal.remaining) >= 0, "remaining cost"],
+        [Boolean(goal.recommendation), "recommendation"],
+        [Boolean(goal.model?.costModel), "cost-model metadata"],
+    ];
+
+    lines.push(`Mode:       ${advice.mode}`);
+    lines.push(`Goal:       ${goal.title}`);
+    lines.push(`Cash:       $${ns.format.number(goal.currentCash, 2)}`);
+    lines.push(`Cost:       $${ns.format.number(goal.cost, 2)}`);
+    lines.push(`Remaining:  $${ns.format.number(goal.remaining, 2)}`);
+    lines.push(`Income:     $${ns.format.number(goal.incomePerSecond, 2)}/s (${goal.incomeSource})`);
+    lines.push(`Candidates: ${advice.candidates.length}`);
+    lines.push(`Model:      ${goal.model.costModel}`);
+
+    const failures = checks.filter(([ok]) => !ok).map(([, label]) => label);
+    if (failures.length > 0) {
+        lines.push(`Missing/invalid: ${failures.join(", ")}`);
+        return { ok: false, lines };
+    }
+
+    lines.push("Advisor schema is healthy and ready for additional progression candidate types.");
+    return { ok: true, lines };
+}
+
 function fail(message) {
     return { ok: false, lines: [message] };
 }
@@ -162,9 +206,10 @@ function printTestList(ns) {
     ns.tprint("diagnostics/test.js - fast automation smoke tests");
     ns.tprint("Usage: run diagnostics/test.js <test>");
     ns.tprint("Tests:");
-    ns.tprint("  controller-state  Validate live controller target/money/security state");
-    ns.tprint("  telemetry-state   Validate the income telemetry collector snapshot");
-    ns.tprint("  all               Run every available test (default)");
+    ns.tprint("  controller-state     Validate live controller target/money/security state");
+    ns.tprint("  telemetry-state      Validate the income telemetry collector snapshot");
+    ns.tprint("  progression-advisor  Validate progression goal/candidate advisor schema");
+    ns.tprint("  all                  Run every available test (default)");
 }
 
 function formatAge(milliseconds) {
