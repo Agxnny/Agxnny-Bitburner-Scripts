@@ -13,6 +13,12 @@ const PREP_PENALTY_SCALE_SECONDS = 30 * 60;
 const PREP_PENALTY_MAX_EXPONENT = 8;
 const MONEY_TARGET_CANDIDATES = Object.freeze([0.25, 0.40, 0.55, 0.70, 0.85, 1.00]);
 
+// Partial-money strategies are only worthwhile once a target is large enough.
+// Smaller servers are cheap enough to prepare fully, so do not let the optimizer
+// choose 25%-85% for them. This is intentionally a single tuning constant so we
+// can raise/lower it after seeing real gameplay results.
+const PARTIAL_PREP_MIN_SERVER_MAX_MONEY = 5_000_000;
+
 // If player cash is at least 200% ABOVE a server's maximum money (3x its max),
 // that server is normally too small to materially advance the current economy.
 // We exclude it when at least one larger viable target remains. If every target
@@ -29,9 +35,10 @@ const PLAYER_CASH_TO_SERVER_MAX_LIMIT = 1 + PLAYER_CASH_EXCESS_IGNORE_PERCENT / 
  * distributed thread capacity available right now. Long prep is penalized
  * exponentially, then the strategy is compared by progression-goal ETA.
  *
- * Targets that are trivial relative to current player cash are filtered out when
- * a larger viable alternative exists. The rejected-target reasoning is published
- * so diagnostics can explain why a server was ignored.
+ * Targets below PARTIAL_PREP_MIN_SERVER_MAX_MONEY are always prepared to 100%
+ * before production. Targets that are trivial relative to current player cash
+ * are filtered out when a larger viable alternative exists. Both decisions are
+ * published so diagnostics can explain why a target/strategy was chosen.
  *
  * @param {NS} ns
  */
@@ -78,7 +85,7 @@ export async function main(ns) {
     const selected = candidates[0] ?? null;
     const updatedAt = Date.now();
     publishEconomyTargetState(ns, {
-        version: 6,
+        version: 7,
         updatedAt,
         plannerUpdatedAt: Number(planner?.analysisUpdatedAt ?? planner?.updatedAt ?? 0),
         economyUpdatedAt: Number(economy?.updatedAt ?? 0),
@@ -88,6 +95,10 @@ export async function main(ns) {
         executionCapacity: execution,
         controllerUpdatedAt: Number(controller?.updatedAt ?? 0),
         moneyTargetCandidates: MONEY_TARGET_CANDIDATES,
+        moneyTargetFloor: {
+            model: "SMALL_SERVER_FULL_PREP_V1",
+            partialPrepMinServerMaxMoney: PARTIAL_PREP_MIN_SERVER_MAX_MONEY,
+        },
         cashValueFilter: {
             model: "PLAYER_CASH_VS_SERVER_MAX_V1",
             ignoreWhenCashPercentAboveServerMax: PLAYER_CASH_EXCESS_IGNORE_PERCENT,
@@ -112,7 +123,7 @@ export async function main(ns) {
                 ...planner,
                 updatedAt,
                 selectedTarget: selectedAnalysis,
-                selectionModel: "GOAL_ETA_ADAPTIVE_MONEY_VALUE_FILTER_V6",
+                selectionModel: "GOAL_ETA_ADAPTIVE_MONEY_VALUE_FILTER_V7",
                 economicSelection: {
                     hostname: selected.hostname,
                     baselineRank: selected.baselineRank,
@@ -126,6 +137,8 @@ export async function main(ns) {
                     economicEtaSeconds: selected.economicEtaSeconds,
                     reason: selected.reason,
                     strategyAlternatives: selected.strategyAlternatives,
+                    smallServerFullPrep: selected.smallServerFullPrep,
+                    partialPrepMinServerMaxMoney: PARTIAL_PREP_MIN_SERVER_MAX_MONEY,
                     goalRemaining,
                     cash: playerCash,
                     goal: economy?.goal ?? null,
@@ -176,7 +189,11 @@ function applyCashValueFilter(candidates, playerCash) {
 }
 
 function evaluateBestTargetStrategy(ns, target, context) {
-    const strategies = MONEY_TARGET_CANDIDATES
+    const moneyMax = Math.max(0, Number(target?.money?.max ?? 0));
+    const smallServerFullPrep = moneyMax > 0 && moneyMax <= PARTIAL_PREP_MIN_SERVER_MAX_MONEY;
+    const allowedMoneyTargets = smallServerFullPrep ? [1] : MONEY_TARGET_CANDIDATES;
+
+    const strategies = allowedMoneyTargets
         .map((moneyTargetPercent) => evaluateTargetStrategy(ns, target, context, moneyTargetPercent))
         .filter(Boolean)
         .sort(compareStrategies);
@@ -184,8 +201,15 @@ function evaluateBestTargetStrategy(ns, target, context) {
     const best = strategies[0] ?? null;
     if (!best) return null;
 
+    const floorReason = smallServerFullPrep
+        ? `small-server floor: max $${formatCompactNumber(moneyMax)} <= $${formatCompactNumber(PARTIAL_PREP_MIN_SERVER_MAX_MONEY)}, forced 100%`
+        : "";
+
     return {
         ...best,
+        smallServerFullPrep,
+        partialPrepMinServerMaxMoney: PARTIAL_PREP_MIN_SERVER_MAX_MONEY,
+        reason: floorReason ? `${best.reason} | ${floorReason}` : best.reason,
         strategyAlternatives: strategies.map((strategy) => ({
             moneyTargetPercent: strategy.moneyTargetPercent,
             prepSeconds: strategy.prepSeconds,
