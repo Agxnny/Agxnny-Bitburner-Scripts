@@ -1,5 +1,6 @@
 import { readPlannerState } from "/lib/runtime-state.js";
 import { WORKER_SCRIPTS } from "/lib/execution.js";
+import { quietArgs, tprint } from "/lib/output.js";
 
 const TELEMETRY_SCRIPT = "/hacking/telemetry.js";
 const TEST_LAUNCHER_SCRIPT = "/diagnostics/test-launcher.js";
@@ -22,6 +23,7 @@ const SUPPORT_FILES = Object.freeze([
     "/lib/targets.js",
     "/lib/state.js",
     "/lib/execution.js",
+    "/lib/output.js",
 ]);
 
 /**
@@ -32,7 +34,7 @@ const SUPPORT_FILES = Object.freeze([
  */
 export async function main(ns) {
     if (ns.getHostname() !== "home") {
-        ns.tprint("ERROR: Run network/deploy.js from home.");
+        tprint(ns, "ERROR: Run network/deploy.js from home.");
         return;
     }
 
@@ -43,62 +45,51 @@ export async function main(ns) {
         .filter((hostname) => hostname && hostname !== "home");
 
     if (remoteHosts.length === 0) {
-        ns.tprint("No remote rooted RAM hosts in the latest planner snapshot.");
-        ns.tprint("Run hacking/planner.js after gaining root access to refresh the pool.");
+        tprint(ns, "No remote rooted RAM hosts in the latest planner snapshot.");
+        tprint(ns, "Run hacking/planner.js after gaining root access to refresh the pool.");
         return;
     }
 
     const files = [...new Set([...Object.values(WORKER_SCRIPTS), ...SUPPORT_FILES])];
     let success = 0;
 
-    ns.tprint("=== EXECUTION DEPLOYMENT ===");
+    tprint(ns, "=== EXECUTION DEPLOYMENT ===");
 
     for (const hostname of remoteHosts) {
         const ok = await ns.scp(files, hostname, "home");
         if (ok) {
             success += 1;
-            ns.tprint(`DEPLOYED  ${hostname}`);
+            tprint(ns, `DEPLOYED  ${hostname}`);
         } else {
-            ns.tprint(`FAILED    ${hostname}`);
+            tprint(ns, `FAILED    ${hostname}`);
         }
     }
 
-    ns.tprint(`Deployment complete: ${success}/${remoteHosts.length} host(s).`);
-    ns.tprint(`Files per host: ${files.length} (workers + planner/tactical/telemetry/diagnostic support)`);
+    tprint(ns, `Deployment complete: ${success}/${remoteHosts.length} host(s).`);
+    tprint(ns, `Files per host: ${files.length} (workers + planner/tactical/telemetry/diagnostic support)`);
 
-    startRemoteService(ns, remoteHosts, TELEMETRY_SCRIPT, "Telemetry collector", false);
-    startRemoteService(ns, remoteHosts, TEST_LAUNCHER_SCRIPT, "Diagnostic test launcher", false);
-    startRemoteService(ns, remoteHosts, REFRESH_SCRIPT, "Planner refresh coordinator", true);
+    const inheritedQuiet = quietArgs(ns);
+    startRemoteService(ns, remoteHosts, TELEMETRY_SCRIPT, "Telemetry collector", false, inheritedQuiet);
+    startRemoteService(ns, remoteHosts, TEST_LAUNCHER_SCRIPT, "Diagnostic test launcher", false, inheritedQuiet);
+    startRemoteService(ns, remoteHosts, REFRESH_SCRIPT, "Planner refresh coordinator", true, inheritedQuiet);
 
     if (String(ns.args[0] ?? "") === "--kickstart") {
         const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 2)));
-        ns.spawn("/kickstart.js", { threads: 1, spawnDelay: 0 }, nextStage);
+        ns.spawn("/kickstart.js", { threads: 1, spawnDelay: 0 }, nextStage, ...inheritedQuiet);
     }
 }
 
-/**
- * Keep one instance of a persistent support service off home.
- * For ordinary tiny services, prefer the smallest server that fits. The refresh
- * coordinator needs room for its own RAM plus a 7GB planner on another remote
- * host, so it prefers larger hosts to reduce launch starvation.
- *
- * @param {NS} ns
- * @param {string[]} remoteHosts
- * @param {string} script
- * @param {string} label
- * @param {boolean} preferLarge
- */
-function startRemoteService(ns, remoteHosts, script, label, preferLarge) {
+function startRemoteService(ns, remoteHosts, script, label, preferLarge, args = []) {
     for (const hostname of remoteHosts) {
         if (ns.isRunning(script, hostname)) {
-            ns.tprint(`${label} already running on ${hostname}.`);
+            tprint(ns, `${label} already running on ${hostname}.`);
             return;
         }
     }
 
     const scriptRam = ns.getScriptRam(script, "home");
     if (scriptRam <= 0) {
-        ns.tprint(`WARNING: ${label.toLowerCase()} script RAM could not be determined.`);
+        tprint(ns, `WARNING: ${label.toLowerCase()} script RAM could not be determined.`);
         return;
     }
 
@@ -113,12 +104,12 @@ function startRemoteService(ns, remoteHosts, script, label, preferLarge) {
             : a.freeRam - b.freeRam || a.hostname.localeCompare(b.hostname));
 
     for (const host of candidates) {
-        const pid = ns.exec(script, host.hostname, 1);
+        const pid = ns.exec(script, host.hostname, 1, ...args);
         if (pid > 0) {
-            ns.tprint(`${label} started on ${host.hostname} (${ns.format.ram(scriptRam)}).`);
+            tprint(ns, `${label} started on ${host.hostname} (${ns.format.ram(scriptRam)}).`);
             return;
         }
     }
 
-    ns.tprint(`WARNING: no remote host had enough free RAM for the ${label.toLowerCase()}.`);
+    tprint(ns, `WARNING: no remote host had enough free RAM for the ${label.toLowerCase()}.`);
 }
