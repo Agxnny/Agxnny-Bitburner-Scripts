@@ -127,7 +127,7 @@ The controller should never launch the next batch while `awaitingReview` is true
 
 ## Latest automatic batch observation
 
-Live observation on 2026-09-05:
+Live observation on 2026-09-05 before the security-calculation fix:
 
 ```text
 target: sigma-cosmetics
@@ -152,11 +152,47 @@ Interpretation:
 - money recovery works;
 - post-batch review barrier works;
 - controller safety repair works;
-- **batch security compensation does not yet work correctly.**
+- the original batch W2 security calculation was under-sized.
+
+## Batch security compensation fix
+
+Root cause was the batch runner calling:
+
+```text
+ns.growthAnalyzeSecurity(growThreads, target, 1)
+```
+
+Supplying `target` makes Bitburner cap the result to the grow threads currently needed to reach max money. The batch planner runs while the target is prepared at max money, so this incorrectly predicted effectively zero security from the future post-hack grow stage and produced a one-thread W2.
+
+The corrected batch calculation is:
+
+```text
+ns.growthAnalyzeSecurity(growThreads)
+```
+
+This estimates the uncapped security increase from every planned grow thread, which is the quantity W2 must compensate.
 
 ## Current highest-priority batch test
 
-Before pipelining, instrument or calculate the following for each batch:
+Pull the latest `main`, restart the stack, and validate the corrected W2 calculation in live automatic batching:
+
+```text
+run gitpull.js
+run startup.js
+```
+
+Then confirm:
+
+```text
+W2 thread count scales with G thread count
+final money returns to intended baseline
+final security is approximately +0.00–0.05
+no standalone correction weaken is required
+```
+
+Run several consecutive batches before declaring the fix stable. If security still drifts, capture the H/W1/G/W2 thread counts and final security delta before changing timing or adding pipelining.
+
+The next instrumentation step should record:
 
 ```text
 predicted hack security increase
@@ -166,10 +202,6 @@ weaken effect of W2
 predicted final security delta
 actual final security delta
 ```
-
-For the observed `25H / 1W / 298G / 1W` case, determine why the calculated W2 count was only one thread and why actual recovery left `+1.13`.
-
-Inspect exact API signatures/semantics for the current Bitburner version before changing formulas.
 
 ## Batch correctness acceptance criteria
 
