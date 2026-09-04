@@ -1,12 +1,14 @@
 {
   "files": [
     "hacking/controller.js",
+    "hacking/targets.js",
     "hacking/workers/hack.js",
     "hacking/workers/grow.js",
     "hacking/workers/weaken.js",
     "lib/network.js",
     "lib/runtime-state.js",
     "lib/state.js",
+    "lib/targets.js",
     "network/inspect.js",
     "network/root.js",
     "diagnostics/dashboard.js",
