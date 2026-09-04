@@ -2,9 +2,9 @@
 
 ## Core principle
 
-Game logic and presentation stay separate. Home is the **control plane**: orchestration, state coordination, GUI/dashboard, updater, and other lightweight persistent services belong there. Rooted and cloud servers are the **execution plane**: HGW workers and expensive short-lived analysis should run remotely whenever possible.
+Game logic and presentation stay separate. Home is the **control plane**: orchestration, state coordination, GUI/dashboard, updater, and lightweight persistent services belong there. Rooted and cloud servers are the **execution plane**: HGW workers, tactical analysis, and timed batch execution should run remotely whenever possible.
 
-The main GUI consumes structured runtime state; it does not perform expensive target analysis or own HGW policy. That keeps visibility cheap and lets the same planner/controller state feed diagnostics and future interfaces.
+The main GUI consumes structured runtime state; it does not perform expensive target analysis or own HGW policy.
 
 ## Startup/control-plane entrypoint
 
@@ -19,51 +19,33 @@ startup.js
 planner -> deploy remote services -> economy/target ready -> controller
 ```
 
-Quiet mode is unconditional from `startup.js`. Background automation still publishes state, but presentation belongs to the GUI rather than terminal spam.
+Quiet mode is unconditional from `startup.js`.
 
 ## Main GUI architecture
 
-`ui/dashboard.js` is the primary control-plane interface. It uses a simple dark control-panel layout rather than trying to reproduce every script log. The visual hierarchy is intentionally small:
+`ui/dashboard.js` is the primary control-plane interface. Current views are **Overview, Targets, Economy, Network, and Diagnostics**. Expensive work remains outside the GUI, and interactive operations should use lightweight state/command channels rather than importing costly APIs into the home-resident UI.
 
-- header with controller/phase/spending status badges;
-- four headline metrics on major views;
-- compact two-column cards;
-- a restrained tab bar;
-- progress/health indicators where they add meaning;
-- detailed diagnostic text only on the Diagnostics tab.
-
-Current views are **Overview, Targets, Economy, Network, and Diagnostics**. All expensive work remains outside the GUI. Interactive diagnostics continue to use Port 6 requests rather than direct heavy script launches.
-
-`diagnostics/dashboard.js` remains a focused troubleshooting panel and is not merged into the main GUI.
+`diagnostics/dashboard.js` remains a separate troubleshooting surface.
 
 ## Separate stock workspace
 
-Stock trading is intentionally a separate subsystem and is **not part of the main dashboard or normal startup**.
-
-The reserved surfaces are:
+Stock trading is intentionally separate from the HGW control plane and normal startup:
 
 ```text
-stocks/terminal.js   -> future trading-engine logs, decisions and order events
-ui/stocks.js         -> future portfolio, signals, positions, risk and controls
+stocks/terminal.js   -> future trading-engine logs / decisions / orders
+ui/stocks.js         -> future portfolio / signals / risk / controls
 ```
-
-Both are currently non-trading placeholders. This boundary is deliberate: stock APIs, trading state, and stock-specific GUI features should be able to grow without increasing the persistent RAM cost or complexity of the HGW control plane.
-
-Future stock work should introduce its own runtime-state contract and only bridge into the main control plane if there is a genuinely useful high-level summary.
 
 ## Home/control-plane policy
 
-`lib/execution.js` enforces `REMOTE_ONLY` worker execution. The worker pool excludes `home` completely rather than merely reserving a few GB.
+`lib/execution.js` enforces `REMOTE_ONLY` worker execution. Home is not a worker host.
 
 Consequences:
 
 - `hack.js`, `grow.js`, and `weaken.js` never launch on home;
-- tactical planning uses the same remote execution pool and therefore also avoids home;
-- if no remote host has enough RAM, the controller waits instead of falling back to home;
-- controller RAM totals represent remote execution capacity rather than mixed control + worker capacity;
-- economic strategy calculations exclude home from hack/grow/weaken thread capacity so predicted waves match real dispatch behavior.
-
-This leaves home RAM for controller/orchestration, GUI, updater, and future lightweight scheduling/control services.
+- tactical planning and the new batch runner are intended for remote hosts;
+- if remote capacity is unavailable, production waits rather than consuming control/UI RAM;
+- economic capacity models exclude home worker RAM.
 
 ## Target lifecycle
 
@@ -75,86 +57,137 @@ DISCOVERED
   -> PRODUCTION
 ```
 
-`MONEY_PREP` does not imply “grow to 100%.” Larger targets can use 25%, 40%, 55%, 70%, 85%, or 100% desired-money strategies, while small targets below the configured floor are forced to full preparation.
+Larger targets can use 25%, 40%, 55%, 70%, 85%, or 100% desired-money strategies, while small targets below the configured floor are forced to full preparation.
 
-A completed `HACK` is a strategic checkpoint. The intended next hardening step is a strict post-HACK review barrier so another production action cannot begin until the strategic refresh has acknowledged the completed cycle.
+## Sequential production path
+
+The current automatic controller still uses the existing sequential tactical path while the batch path is validated:
+
+```text
+controller
+    ↓
+tactical-planner.js
+    ↓
+WEAKEN or GROW or HACK
+    ↓
+wait for completion
+```
+
+This remains the safe fallback and prep mechanism.
+
+## Synchronized HWGW batch path
+
+The first batching milestone is `hacking/batch-runner.js`. It executes exactly one full batch against an already prepared target.
+
+Landing order:
+
+```text
+HACK              t0
+WEAKEN_HACK       t0 + gap
+GROW              t0 + 2 × gap
+WEAKEN_GROW       t0 + 3 × gap
+```
+
+The default gap is **200 ms**.
+
+All four action families are launched before the first effect lands. Each worker receives an `additionalMsec` value and passes it to the v3 HGW API. This is preferable to sleeping before calling `hack`, `grow`, or `weaken` because the action duration is established immediately and the game itself owns the added wait.
+
+The runner calculates:
+
+- requested hack fraction and actual integer-thread fraction;
+- grow recovery multiplier from the actual hack fraction;
+- hack-security compensation weaken threads;
+- grow-security compensation weaken threads;
+- hack/grow/weaken base action times;
+- absolute landing timestamps for all four stages;
+- full remote-host RAM reservation before launch.
+
+The batch is rejected unless the target is already close to minimum security and at the selected desired-money level.
+
+### Full-batch RAM reservation
+
+A batch must be all-or-nothing. Before launching, the runner simulates allocations across the current remote pool. The largest RAM stages are reserved first to reduce fragmentation risk.
+
+If any stage cannot fit, batch state becomes `BLOCKED` and **nothing launches**.
+
+If an unexpected `ns.exec` failure happens after launch begins, all already-started allocations from that batch are killed and state becomes `LAUNCH_FAILED`. This is intentionally conservative: a partial HWGW batch can leave the target in a badly desynchronized state.
+
+### Timed worker interface
+
+Workers remain backward compatible with sequential execution. Their argument shape now reserves:
+
+```text
+arg[0] target
+arg[1] job id
+arg[2] local allocation thread count
+arg[3] optional additionalMsec
+arg[4] optional batch id
+arg[5] optional batch stage
+```
+
+`hack.js` includes batch metadata in telemetry events. Grow/weaken currently only need the timing value.
+
+### Batch runtime state
+
+Port 12 stores the latest synchronized batch snapshot. Expected states include:
+
+```text
+PLANNING
+BLOCKED
+READY
+RUNNING
+LAUNCH_FAILED
+COMPLETE
+```
+
+The snapshot includes thread counts, actual hack fraction, timing window, per-stage landing timestamps, remote allocations, total RAM, runner host, and final target money/security when complete.
+
+This is the contract the GUI and controller can consume next without importing batch-analysis APIs into home.
+
+## Why one batch first
+
+A synchronized one-shot batch already removes the large inefficiency of waiting for H, then W, then G, then W serially. However, it is deliberately not yet a pipeline.
+
+Before overlapping multiple batches, we need to validate:
+
+- actual landing order;
+- timing drift between remote hosts;
+- money recovery accuracy;
+- security recovery accuracy;
+- safe gap size;
+- planner/refresh interactions around batch completion.
+
+Only after those are stable should the scheduler allow multiple batches in flight.
 
 ## Event-driven network and economy refresh
 
-The heavy target/RAM planner is not a periodic timer task. Important refresh events are:
+The heavy target/RAM planner remains event-driven. Current strategic events include HACK completion, root-pool expansion, cloud purchase, and manual money-goal changes.
 
-- **HACK completion** — full planner, progression/economy, and target-strategy review;
-- **Root-pool expansion** — planner, sync, then strategy review;
-- **Cloud-server purchase** — at most one approved server per pass, then planner + sync + economy refresh;
-- **Manual money-goal change** — economy/purchase-lock/target refresh without unnecessary network analysis.
-
-A lightweight rooting pass runs remotely every 30 seconds. Rooting state is Port 9, cloud-purchase state Port 10, and manual money-goal state Port 11.
+For the final automatic batching architecture, strategic review should move from raw hack completion to **completed batch/cycle acknowledgement** so the economy planner does not inspect a target halfway through its recovery stages. This is an important integration step before automatic batching replaces sequential production.
 
 ## Manual money-goal safety interlock
 
-The user can set an explicit total-cash target with `economy/manual-goal.js`. This is both an economic objective and a spending lock.
-
-```text
-manual-goal.js -> Port 11
-        ↓
-economy-planner.js -> MANUAL_MONEY goal on Port 7
-        ↓
-economy-targets.js -> optimize toward remaining cash
-        ↓
-cloud-buy.js -> independently checks Port 11 and refuses purchases
-```
-
-The direct Port 11 check prevents stale progression state from spending after the user has enabled a savings goal. Reaching the target does not clear the lock automatically.
+The user can set an explicit total-cash target with `economy/manual-goal.js` or the GUI. While active it becomes the economic objective and independently blocks automatic cloud purchasing.
 
 ## Automated cloud capacity
 
-`network/cloud-buy.js` acts only when no manual goal is active, the advisor-selected goal is an affordable `PURCHASED_SERVER`, and a server slot is available.
-
-Automated names are deterministic:
-
-```text
-hgw-001
-hgw-002
-hgw-003
-...
-```
-
-Only one purchase is allowed per strategic refresh. Successful purchases are followed by planner + sync so the new host joins the remote execution pool before final target selection.
+`network/cloud-buy.js` can buy one advisor-approved server per strategic refresh using deterministic names `hgw-001`, `hgw-002`, ... . Successful purchases are followed by planner + sync so the server joins the remote execution pool.
 
 ## Adaptive economic strategy
 
-For sufficiently large targets, the selector evaluates:
+For sufficiently large targets the economic selector evaluates:
 
 ```text
 25%, 40%, 55%, 70%, 85%, 100%
 ```
 
-Small targets at or below the current max-money floor are forced to 100%. Targets can also be filtered when player cash is large relative to a target's **maximum** money, provided another viable target remains.
+Economic estimates use remote-only capacity. The batch runner receives the chosen desired-money percentage and hack fraction explicitly, so later controller integration can preserve economic strategy decisions.
 
-Each strategy includes prep/recovery threads, remote capacity, worker waves, raw and exponentially weighted prep time, production-cycle time, expected cash rate, and progression-goal ETA. When a manual money goal is active, its remaining amount becomes the goal distance.
+## Runtime state
 
-## Strategy handoff
+Current state channels include controller, planner, tactical plan, telemetry, economy, target strategy, rooting, cloud purchasing, manual spending lock, diagnostics, and synchronized batch state on Port 12.
 
-```text
-economy-targets.js
-    selects hostname + moneyTargetPercent + hackFraction
-        ↓
-Port 2 planner economicSelection
-        ↓
-controller.js on home
-        ↓
-tactical-planner.js on remote host
-        ↓
-lib/threads.js
-        ↓
-remote-only worker pool
-```
-
-## Runtime state and telemetry
-
-The shared state model is the contract between automation and presentation. Current channels cover controller, planner, tactical plan, telemetry, economy, target strategy, rooting, cloud purchasing, manual spending lock, and diagnostic requests.
-
-New GUI features should prefer extending structured state or low-cost command queues instead of directly importing expensive APIs into home-resident presentation scripts. The future stock subsystem should follow the same pattern with its own state contract.
+The shared state model remains the contract between automation and presentation.
 
 ## Development stages
 
@@ -166,7 +199,7 @@ New GUI features should prefer extending structured state or low-cost command qu
 ### Stage 2 — network and resources
 - recursive discovery and automatic rooting
 - event-driven planner refresh
-- remote-only worker RAM pool
+- remote-only worker pool
 - new-host sync
 - controlled cloud-server purchasing
 - manual money-goal lock
@@ -175,29 +208,33 @@ New GUI features should prefer extending structured state or low-cost command qu
 - capacity-aware targeting
 - adaptive money percentages
 - exponential prep cost
-- strict post-HACK review barrier
-- strategy hysteresis
+- target hysteresis
 - hack-fraction optimization
 - predicted-versus-actual calibration
-- multi-target resource allocation
 
-### Stage 4 — control-plane GUI and guidance
-- polished unified GUI
+### Stage 4 — control-plane GUI
+- unified GUI
 - one-command quiet startup
-- richer target/progression/network presentation
 - safe GUI command channels
-- progression recommendations and controlled actions
-- actual-versus-predicted metrics
+- progression/network/economy visibility
 
-### Stage 5 — stock subsystem
+### Stage 5 — synchronized batching
+- timing-capable workers using `additionalMsec`
+- one-shot remote HWGW batch runner
+- full-batch RAM reservation
+- batch runtime state
+- timing/recovery validation
+
+### Stage 6 — automatic/pipelined batching
+- controller batch handoff
+- strict post-batch strategic review barrier
+- drift monitoring
+- adaptive landing gaps
+- multiple overlapping batches
+- collision-free RAM reservation
+- multi-target global scheduling
+
+### Stage 7 — stock subsystem
 - dedicated stock runtime state
-- independent stock terminal
-- independent stock GUI
-- risk controls and trade execution
-- optional high-level summary bridge to control plane
-
-### Stage 6 — batching
-- timed HWGW batches
-- timing/drift monitoring
-- batch health
-- global optimizer improvements
+- independent stock terminal and GUI
+- risk controls and trading execution
