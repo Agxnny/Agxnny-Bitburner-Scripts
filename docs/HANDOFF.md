@@ -104,9 +104,35 @@ Port 15 → latest completed batch
 
 The Batch tab shows current batch status, planned H/W1/G/W2 landing countdowns, planned total duration, W2 ETA, last completed recovery, actual stage order, minimum spacing, maximum drift, missing events, per-stage error/spread, and a **planned-vs-actual landing timeline**.
 
+## Pipeline scheduler work has started
+
+`hacking/batch-scheduler.js` now exists as a **dry-run-only pipeline planner**. It does not launch workers and does not replace the serialized batch runner yet.
+
+The scheduler deliberately separates two timing controls:
+
+```text
+stage gap      = H → W1 → G → W2 spacing inside one batch
+batch interval = H(N) → H(N+1) spacing between successive batches
+```
+
+The dry-run scheduler:
+
+- calculates H/W1/G/W2 sizing for a target;
+- reads retained Port 15 timing telemetry when it matches the same target;
+- conservatively recommends an intra-batch stage gap using observed drift/spread;
+- independently recommends an inter-batch interval;
+- creates a global landing calendar;
+- models stage RAM occupancy from planned start to planned landing;
+- sweeps that calendar to estimate peak aggregate RAM at pipeline depths 1–12;
+- publishes the latest dry-run result to **Port 16**.
+
+Current tuning remains conservative because Port 15 holds only one completed sample. Do not aggressively reduce timing gaps from one observation. A rolling timing-history layer is required before genuinely adaptive gap reduction.
+
+See `docs/BATCH_SCHEDULER.md` for the current design, limitations, and milestones.
+
 ## New observability layer
 
-The controller now publishes timing estimates for standalone H/G/W allocations under `execution.activeWorkers` and an aggregate `execution.currentAction` summary.
+The controller publishes timing estimates for standalone H/G/W allocations under `execution.activeWorkers` and an aggregate `execution.currentAction` summary.
 
 Each active worker includes:
 
@@ -121,7 +147,7 @@ expectedDurationMs
 expectedFinishAt
 ```
 
-The Overview GUI now includes:
+The Overview GUI includes:
 
 - current action ETA;
 - an Active Workers panel with action, target, host, threads, elapsed time, ETA/status;
@@ -137,18 +163,19 @@ This observability work is intentionally non-destructive. **Do not add automatic
 Recommended order:
 
 ```text
-1. Pull/restart and verify the new ETA/worker UI does not disrupt controller operation
-2. Allow at least one new synchronized batch to complete
-3. Inspect the Batch tab retained completed result
-4. Confirm H → W1 → G → W2 actual order remains correct
-5. Collect several samples of max landing error, minimum spacing, and allocation spread
-6. Decide whether the fixed 200 ms gap has sufficient safety margin
-7. Tune/adapt the gap only if measurements justify it
-8. Only then implement overlapping/pipelined batches
-9. After batch timing is stable, design watchdog kill/recovery behavior from observed runtimes
+1. Continue collecting serialized batch timing/recovery samples
+2. Confirm H → W1 → G → W2 actual order remains correct
+3. Compare measured max drift, minimum spacing, and allocation spread
+4. Run the dry-run scheduler against the same target and compare its timing/RAM model with reality
+5. Add rolling timing history so tuning is based on several batches, not only Port 15
+6. Add host-by-host time-window RAM reservation to the scheduler
+7. Redesign Port 14 consumption so one scheduler can route events for several live batch IDs without clearing the queue
+8. First live pipeline test must be capped at depth 2 with immediate admission stop on timing/recovery error
+9. Raise depth only after repeated depth-2 validation
+10. After batch timing is stable, design watchdog kill/recovery behavior from observed runtimes
 ```
 
-Before pipelining, several consecutive automatic batches should recover money/security correctly, require no standalone correction work, report all worker timing events, and preserve the intended landing order with understood timing margin.
+Before live pipelining, several consecutive automatic batches should recover money/security correctly, require no standalone correction work, report all worker timing events, and preserve the intended landing order with understood timing margin.
 
 ## Important architectural constraints
 
@@ -156,9 +183,18 @@ Before pipelining, several consecutive automatic batches should recover money/se
 
 H/G/W worker jobs do not use home as fallback capacity. Home is preserved for controller/UI work.
 
-### One batch at a time for now
+### One live batch at a time for now
 
-Do not jump directly to overlapping batches. The existing system deliberately serializes synchronized batches while correctness and timing are being validated.
+The existing execution path deliberately serializes synchronized batches while correctness and timing are being validated. The new batch scheduler is dry-run only and must not be mistaken for permission to launch overlapping batches yet.
+
+### Pipeline timing has two independent margins
+
+Future pipelining must protect both:
+
+- stage-to-stage spacing within a batch; and
+- batch-to-batch spacing across the global landing calendar.
+
+A safe stage gap does not guarantee a safe batch interval.
 
 ### Execution-mode changes are scheduling barriers
 
@@ -174,6 +210,8 @@ Do not jump directly to overlapping batches. The existing system deliberately se
 ### Full-batch review boundary
 
 Standalone HGW hacks may trigger strategy review after completion. Batch-associated hacks must be ignored until the **full batch** reaches `COMPLETE`.
+
+The current per-batch review barrier is intentionally incompatible with a steady pipeline and must be redesigned before live overlapping batches are enabled.
 
 ### Manual money goal is a hard spending lock
 
@@ -193,9 +231,11 @@ Tab selection is React-local and therefore immediate. Controller commands still 
 
 Port 4 remains the HACK event queue used by income/strategic refresh logic. Port 14 is dedicated to batch worker completion timing so GROW/WEAKEN timing events cannot accidentally trigger strategic review.
 
+Port 14 is currently cleared by the serialized runner before a batch. That must be removed before pipelining; one future scheduler should consume the shared queue and route events by `batchId`.
+
 ### Latest-completed batch is a snapshot, not history
 
-Port 15 retains one completed batch for GUI inspection. It is not yet a rolling history/statistics store. If timing trends across many batches are needed later, add a separate history layer rather than changing Port 15 semantics implicitly.
+Port 15 retains one completed batch for GUI inspection. It is not a rolling history/statistics store. Adaptive scheduler tuning needs a separate rolling history layer rather than changing Port 15 semantics implicitly.
 
 ### Worker lateness is diagnostic only
 
@@ -214,7 +254,7 @@ Tabs:
 - Network
 - Diagnostics
 
-The Batch tab is the primary synchronized-HWGW observability surface. Overview now also exposes active standalone worker timing and ETA.
+The Batch tab is the primary synchronized-HWGW observability surface. Overview also exposes active standalone worker timing and ETA.
 
 ## Useful commands
 
@@ -228,6 +268,7 @@ run economy/manual-goal.js status
 run network/inspect.js
 run network/root.js
 run hacking/batch-runner.js n00dles 0.10 200 1
+run hacking/batch-scheduler.js phantasy 0.10 200
 ```
 
 For repository updates in-game:
@@ -252,6 +293,7 @@ Keep GitHub main as the source of truth and refresh the docs after major changes
 
 - `docs/README.md` — documentation index
 - `docs/architecture.md` — architectural design and data flow
+- `docs/BATCH_SCHEDULER.md` — dry-run pipeline scheduler design and milestones
 - `docs/SYSTEM_MAP.md` — responsibility map by script/module
 - `docs/RUNTIME_STATE.md` — ports, controller commands, and state contracts
 - `docs/TESTING.md` — validation procedures and current acceptance criteria
