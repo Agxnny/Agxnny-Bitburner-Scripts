@@ -1,5 +1,6 @@
 {
   "files": [
+    "manifest.json",
     "kickstart.js",
     "hacking/controller.js",
     "hacking/dispatch.js",
