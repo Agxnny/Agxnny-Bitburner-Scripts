@@ -6,6 +6,7 @@
     "economy/manual-goal.js",
     "hacking/controller.js",
     "hacking/dispatch.js",
+    "hacking/batch-runner.js",
     "hacking/economy-planner.js",
     "hacking/economy-targets.js",
     "hacking/planner.js",
