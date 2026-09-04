@@ -1,23 +1,33 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
 import { publishControllerState, readPlannerState } from "/lib/runtime-state.js";
+import {
+    DEFAULT_HOME_RESERVE_GB,
+    WORKER_SCRIPTS,
+    distributeThreads,
+    summarizeExecutionPool,
+} from "/lib/execution.js";
 
 /**
- * Lightweight persistent HGW controller foundation.
+ * Lightweight persistent HGW controller.
  *
- * AUTO mode consumes the latest snapshot from hacking/planner.js instead of
- * performing network-wide target analysis itself. This keeps expensive analysis
- * out of the always-running process. Supplying a hostname still forces MANUAL
- * mode for diagnostics/testing.
+ * AUTO mode consumes cached planner state instead of performing network-wide
+ * analysis itself. The controller monitors one target and currently dispatches
+ * one HGW thread at a time across the rooted execution pool. This conservative
+ * foundation proves distributed execution without overcommitting RAM; the next
+ * thread-calculator layer will replace the single-thread request with calculated
+ * thread counts while reusing the same allocator.
  *
- * Workers are not launched yet; dispatcher/thread calculation comes next.
+ * Supplying a hostname forces MANUAL target mode. The latest planner snapshot is
+ * still used as the execution-host inventory when available.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     const manualTarget = ns.args.length > 0 ? String(ns.args[0]) : null;
+    let planner = readPlannerState(ns);
     let state = manualTarget
         ? createManualState(manualTarget)
-        : createStateFromPlanner(readPlannerState(ns));
+        : createStateFromPlanner(planner);
 
     if (!state) {
         ns.tprint("ERROR: AUTO mode has no planner snapshot.");
@@ -28,13 +38,44 @@ export async function main(ns) {
 
     ns.disableLog("sleep");
 
+    let activeJobs = [];
+    let jobSequence = 0;
+
     while (true) {
-        if (!manualTarget) {
-            state = adoptLatestPlannerTarget(ns, state);
+        planner = readPlannerState(ns);
+        activeJobs = activeJobs.filter((job) => ns.isRunning(job.pid, job.hostname));
+
+        // Do not switch targets while a worker from the previous target is still
+        // running. Adopt fresh planner choices between jobs instead.
+        if (!manualTarget && activeJobs.length === 0) {
+            state = adoptLatestPlannerTarget(planner, state);
         }
 
         updateObservedState(ns, state);
         chooseFoundationAction(state);
+        updateExecutionState(ns, state, planner, activeJobs);
+
+        if (activeJobs.length === 0) {
+            const dispatch = dispatchFoundationAction(ns, planner, state, ++jobSequence);
+            state.execution.lastDispatch = dispatch;
+            activeJobs = dispatch.allocations.map((allocation) => ({
+                hostname: allocation.hostname,
+                pid: allocation.pid,
+                threads: allocation.threads,
+                action: state.action,
+                target: state.hostname,
+            }));
+
+            if (dispatch.launched > 0) {
+                state.execution.activeJobs = activeJobs.length;
+                state.execution.activeThreads = dispatch.launched;
+                state.reason += ` | dispatched ${dispatch.launched} thread(s)`;
+            } else {
+                state.reason += " | waiting for deployable RAM";
+            }
+        }
+
+        state.updatedAt = Date.now();
         publishControllerState(ns, state);
 
         ns.clearLog();
@@ -63,14 +104,10 @@ function createStateFromPlanner(planner) {
 }
 
 /**
- * AUTO controllers can adopt a newly-published plan without carrying the
- * planner's analysis RAM cost themselves.
- *
- * @param {NS} ns
+ * @param {object|null} planner
  * @param {ReturnType<createTargetState>} currentState
  */
-function adoptLatestPlannerTarget(ns, currentState) {
-    const planner = readPlannerState(ns);
+function adoptLatestPlannerTarget(planner, currentState) {
     const selected = planner?.selectedTarget;
     if (!selected?.hostname) return currentState;
 
@@ -86,8 +123,7 @@ function adoptLatestPlannerTarget(ns, currentState) {
 
 /**
  * Copy cached planner analysis into controller state. The controller does not
- * recompute these fields; they remain the planner's latest snapshot until the
- * planner is run again.
+ * recompute these expensive fields.
  *
  * @param {ReturnType<createTargetState>} state
  * @param {object} analysis
@@ -110,8 +146,7 @@ function applyPlannerAnalysis(state, analysis) {
 }
 
 /**
- * Refresh only the volatile observations needed for phase decisions.
- * No hack-analysis, timing, or network-wide ranking APIs are used here.
+ * Refresh only volatile observations needed for phase decisions.
  *
  * @param {NS} ns
  * @param {ReturnType<createTargetState>} state
@@ -123,8 +158,63 @@ function updateObservedState(ns, state) {
     state.security.current = ns.getServerSecurityLevel(state.hostname);
     state.security.minimum = ns.getServerMinSecurityLevel(state.hostname);
     state.security.desired = state.security.minimum;
+}
 
-    state.updatedAt = Date.now();
+/**
+ * @param {NS} ns
+ * @param {ReturnType<createTargetState>} state
+ * @param {object|null} planner
+ * @param {object[]} activeJobs
+ */
+function updateExecutionState(ns, state, planner, activeJobs) {
+    const pool = summarizeExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB);
+    state.execution.homeReserveGb = pool.homeReserveGb;
+    state.execution.hostCount = pool.hostCount;
+    state.execution.maxRam = pool.maxRam;
+    state.execution.usedRam = pool.usedRam;
+    state.execution.freeRam = pool.freeRam;
+    state.execution.usableRam = pool.usableRam;
+    state.execution.activeJobs = activeJobs.length;
+    state.execution.activeThreads = activeJobs.reduce((sum, job) => sum + job.threads, 0);
+}
+
+/**
+ * Conservative first dispatcher: one thread per completed action. The allocator
+ * can already split larger requests across hosts; calculated requests come next.
+ *
+ * @param {NS} ns
+ * @param {object|null} planner
+ * @param {ReturnType<createTargetState>} state
+ * @param {number} sequence
+ */
+function dispatchFoundationAction(ns, planner, state, sequence) {
+    const script = WORKER_SCRIPTS[state.action];
+    if (!script) {
+        return emptyDispatch(state.hostname);
+    }
+
+    const jobId = `foundation-${Date.now()}-${sequence}`;
+    return distributeThreads(
+        ns,
+        planner,
+        script,
+        state.hostname,
+        1,
+        jobId,
+        DEFAULT_HOME_RESERVE_GB,
+    );
+}
+
+function emptyDispatch(target) {
+    return {
+        requested: 0,
+        launched: 0,
+        remaining: 0,
+        script: "",
+        scriptRam: 0,
+        target,
+        allocations: [],
+    };
 }
 
 /**
@@ -151,9 +241,9 @@ function chooseFoundationAction(state) {
         return;
     }
 
-    state.phase = TargetPhase.READY;
+    state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.HACK;
-    state.reason = "Target is prepared for production analysis";
+    state.reason = "Target is prepared; running conservative production hack";
 }
 
 function formatNumber(value) {
