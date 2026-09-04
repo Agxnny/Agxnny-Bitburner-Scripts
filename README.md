@@ -7,9 +7,9 @@ A modular Bitburner automation project for v3.x, currently focused on an early-g
 The codebase is intentionally split by responsibility:
 
 - **Workers** stay minimal and only perform assigned `hack`, `grow`, or `weaken` actions.
-- **Planner** performs expensive network discovery and baseline target ranking, then publishes cached state for lightweight consumers.
+- **Planner** performs expensive network discovery and baseline target ranking, then publishes cached state for lightweight consumers. Baseline refreshes no longer overwrite a valid economic target while the fresh economy pass is still running.
 - **Refresh coordinator** runs remotely and refreshes the full planner, economy state, and economic target choice every 30 seconds.
-- **Economic target selector** compares targets by estimated prep time, available RAM, expected production rate, and the current cash goal. A smaller prepared server can therefore outrank a richer server that would take too long to grow/weaken right now.
+- **Economic target selector** compares targets by live money/security state, estimated prep time, available RAM, expected production rate, and the current cash goal. A smaller prepared server can therefore outrank a richer server that would take too long to grow/weaken right now.
 - **Controller** runs persistently, tracks the live target state, adopts the latest planner-selected target between jobs, requests tactical plans, dispatches workers across the rooted RAM pool, and publishes controller state.
 - **Tactical planner** performs the expensive HGW thread calculations on a remote host, publishes one requested plan, then exits.
 - **Execution layer** distributes worker threads across home and rooted RAM hosts while preserving a home reserve.
@@ -40,7 +40,10 @@ run kickstart.js --quiet
 
 1. refresh `hacking/planner.js`,
 2. run `network/deploy.js`, which copies worker/support files to rooted RAM hosts and starts remote telemetry, diagnostics, and refresh services,
-3. start `hacking/controller.js` on home.
+3. wait for a fresh economic target decision from the remote refresh chain,
+4. start `hacking/controller.js` on home using that economic target.
+
+This prevents the controller from immediately committing to the baseline target during the short gap before the first economy pass finishes. If the economy pass cannot complete within the startup timeout, kickstart warns and falls back to the current planner target.
 
 The clean updater intentionally stops active automation and replaces repo-managed files, so run `kickstart.js` again after a pull.
 
@@ -82,6 +85,8 @@ Partial dispatches are therefore safe: if only part of a requested grow/weaken/h
 2. `hacking/economy-planner.js` refreshes player cash, progression goal, remaining money required, and observed HGW income,
 3. `hacking/economy-targets.js` evaluates the freshly-ranked targets and writes the economically preferred target back into Port 2.
 
+The planner publishes its baseline #1 separately and preserves the previous valid economic winner while the new economy pass is running. This avoids a target race where a periodic baseline refresh could temporarily switch the controller onto a richer but uneconomic prep target.
+
 The controller itself does not import these expensive analysis APIs. It simply sees the refreshed Port-2 target and can switch between jobs.
 
 ## Economic target selection
@@ -94,7 +99,7 @@ max money × hack percent per thread × hack chance / hack time
 
 That answers which server looks strongest in isolation. The economic selector answers a more useful early-game question: **which server is likely to get us to the current cash goal fastest from its present state?**
 
-For each eligible target it estimates current money, security prep, grow/weaken work, RAM-limited prep waves, expected cash/sec, recovery cost, and estimated time to reach the active progression goal.
+For each eligible target it reads live money and security, then estimates security prep, grow/weaken work, RAM-limited prep waves, expected cash/sec, recovery cost, and estimated time to reach the active progression goal. If the controller snapshot is not yet fresh during startup, it derives usable RAM directly from the planner execution-host snapshot instead of assuming near-zero capacity.
 
 When a progression goal still needs cash, targets are primarily ordered by estimated goal ETA. This allows a smaller, already-prepared target to beat a high-max-money server whose grow/weaken investment would delay cash for too long. When there is no outstanding cash goal, the selector falls back toward steady income rate while still accounting for prep cost.
 
@@ -133,7 +138,7 @@ run hacking/thread-plan.js
 run hacking/dispatch.js weaken foodnstuff 5
 ```
 
-`diagnostics/mem-audit.js` reads the managed manifest and prints the current RAM cost of every managed `.js` file. By default it sorts highest RAM first; `--path` sorts alphabetically. Imported library RAM is already included in the runnable script totals reported by Bitburner.
+`diagnostics/mem-audit.js` scans the live `.js` files installed on home and reports their current RAM cost. When `manifest.json` is available it also marks each file as managed or unmanaged; the audit still works if the manifest is missing. By default it sorts highest RAM first, while `--path` sorts alphabetically.
 
 The dashboard is intended for **live function checks only**, not as a home for every diagnostic. Expensive/manual tests stay explicit. Dashboard buttons write a request to Port 6, and the remote `diagnostics/test-launcher.js` launches the selected test off home.
 
@@ -182,7 +187,7 @@ diagnostics/
   dashboard.js
   economy-targets.js
   income.js
-  mem-audit.js              manifest-wide RAM report
+  mem-audit.js              live installed-script RAM report
   progression.js
   test.js
   test-launcher.js
@@ -208,8 +213,8 @@ Current examples from Bitburner v3.0.1 testing:
 
 The next major layers are:
 
-1. validate periodic economic target switching against real gameplay,
-2. add live-state target comparisons and target-switch hysteresis,
+1. validate economic target switching against real gameplay,
+2. add target-switch hysteresis,
 3. evaluate partial grow targets instead of assuming every server should reach 100%,
 4. continue reducing persistent home RAM usage,
 5. add more progression candidate types such as port openers,
