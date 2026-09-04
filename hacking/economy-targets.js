@@ -1,5 +1,6 @@
 import {
     publishEconomyTargetState,
+    publishPlannerState,
     readControllerState,
     readEconomyState,
     readPlannerState,
@@ -18,6 +19,10 @@ const SECURITY_TOLERANCE = 0.5;
  * cash rate of a small production cycle. This lets a smaller, already-prepared
  * target beat a theoretically richer target when the richer target would consume
  * too much time and RAM to prepare right now.
+ *
+ * The winning host is written back into the planner snapshot so the existing
+ * controller can adopt it between jobs without carrying the expensive economic
+ * analysis APIs itself.
  *
  * @param {NS} ns
  */
@@ -57,9 +62,10 @@ export async function main(ns) {
     });
 
     const selected = candidates[0] ?? null;
+    const updatedAt = Date.now();
     publishEconomyTargetState(ns, {
         version: 1,
-        updatedAt: Date.now(),
+        updatedAt,
         plannerUpdatedAt: Number(planner?.updatedAt ?? 0),
         economyUpdatedAt: Number(economy?.updatedAt ?? 0),
         goal: economy?.goal ?? null,
@@ -68,6 +74,29 @@ export async function main(ns) {
         selectedTarget: selected,
         rankings: candidates.map((candidate, index) => ({ ...candidate, economicRank: index + 1 })),
     });
+
+    if (selected) {
+        const selectedAnalysis = rankings.find((target) => target.hostname === selected.hostname);
+        if (selectedAnalysis) {
+            publishPlannerState(ns, {
+                ...planner,
+                updatedAt,
+                selectedTarget: selectedAnalysis,
+                selectionModel: "GOAL_ETA_WITH_PREP_COST_V1",
+                economicSelection: {
+                    hostname: selected.hostname,
+                    baselineRank: selected.baselineRank,
+                    prepSeconds: selected.prepSeconds,
+                    steadyIncomePerSecond: selected.steadyIncomePerSecond,
+                    goalEtaSeconds: selected.goalEtaSeconds,
+                    reason: selected.reason,
+                    goalRemaining,
+                    cash: Math.max(0, Number(economy?.cash ?? 0)),
+                    goal: economy?.goal ?? null,
+                },
+            });
+        }
+    }
 }
 
 function evaluateTarget(ns, target, context) {
@@ -147,7 +176,7 @@ function evaluateTarget(ns, target, context) {
         cycleSeconds,
         steadyIncomePerSecond,
         goalEtaSeconds,
-        reason: describeReason({ moneyPercent, securityDelta, prepSeconds, steadyIncomePerSecond, goalEtaSeconds: goalEtaSeconds, hasCashGoal: context.hasCashGoal }),
+        reason: describeReason({ prepSeconds, steadyIncomePerSecond, goalEtaSeconds, hasCashGoal: context.hasCashGoal }),
     };
 }
 
