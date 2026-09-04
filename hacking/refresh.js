@@ -1,8 +1,6 @@
-import { readPlannerState } from "/lib/runtime-state.js";
+import { readControllerState, readPlannerState } from "/lib/runtime-state.js";
 import { isQuiet, quietArgs } from "/lib/output.js";
 
-const FULL_REFRESH_MS = 30_000;
-const ECONOMY_REFRESH_MS = 30_000;
 const PLANNER_SCRIPT = "/hacking/planner.js";
 const ECONOMY_SCRIPT = "/hacking/economy-planner.js";
 const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
@@ -10,36 +8,54 @@ const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
 /**
  * Persistent remote refresh coordinator.
  *
- * Keeps expensive analysis off home while periodically refreshing the whole
- * decision chain every 30 seconds:
- *  - full network + baseline target state,
- *  - cash/progression state,
- *  - economic target choice with prep-time cost.
+ * The expensive full planner is event-driven rather than timer-driven:
+ *  - startup performs only the economy + economic-target pass because kickstart
+ *    has already produced the initial planner snapshot,
+ *  - after the controller completes a HACK operation, run the full planner,
+ *    refresh progression/economy state, and re-rank economic targets,
+ *  - do not mark the cycle reviewed until the entire chain succeeds.
+ *
+ * This keeps a target stable through its prep/production work and reconsiders it
+ * at the natural end of a completed HGW cycle instead of every 30 seconds.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     ns.disableLog("ALL");
-    let lastFullRefresh = Number(readPlannerState(ns)?.updatedAt ?? 0);
-    let lastEconomyRefresh = 0;
+
+    const initialController = readControllerState(ns);
+    let lastReviewedHackAt = Number(initialController?.cycle?.lastHackCompletedAt ?? 0);
+    let startupEconomyDone = false;
 
     while (true) {
-        const now = Date.now();
-
-        if (now - lastFullRefresh >= FULL_REFRESH_MS) {
-            const ok = await launchAndWait(ns, PLANNER_SCRIPT);
-            if (ok) lastFullRefresh = Date.now();
-        }
-
-        if (now - lastEconomyRefresh >= ECONOMY_REFRESH_MS) {
+        if (!startupEconomyDone) {
             const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
             if (economyOk) {
-                await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
-                lastEconomyRefresh = Date.now();
+                const targetOk = await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
+                if (targetOk) startupEconomyDone = true;
             }
         }
 
-        await ns.sleep(1000);
+        const controller = readControllerState(ns);
+        const hackCompletedAt = Number(controller?.cycle?.lastHackCompletedAt ?? 0);
+
+        if (hackCompletedAt > lastReviewedHackAt) {
+            const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT);
+            if (plannerOk) {
+                const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
+                if (economyOk) {
+                    const targetOk = await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
+                    if (targetOk) {
+                        lastReviewedHackAt = hackCompletedAt;
+                        if (!isQuiet(ns)) {
+                            ns.print(`Cycle review complete for hack at ${new Date(hackCompletedAt).toLocaleTimeString()}.`);
+                        }
+                    }
+                }
+            }
+        }
+
+        await ns.sleep(250);
     }
 }
 
