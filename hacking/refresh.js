@@ -1,6 +1,6 @@
 import { readPlannerState } from "/lib/runtime-state.js";
 
-const FULL_REFRESH_MS = 120_000;
+const FULL_REFRESH_MS = 30_000;
 const ECONOMY_REFRESH_MS = 30_000;
 const PLANNER_SCRIPT = "/hacking/planner.js";
 const ECONOMY_SCRIPT = "/hacking/economy-planner.js";
@@ -9,10 +9,11 @@ const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
 /**
  * Persistent remote refresh coordinator.
  *
- * Keeps expensive analysis off home while periodically refreshing:
- *  - full network + baseline target state every 2 minutes;
- *  - cash/progression state every 30 seconds;
- *  - economic target choice immediately after each economy refresh.
+ * Keeps expensive analysis off home while periodically refreshing the whole
+ * decision chain every 30 seconds:
+ *  - full network + baseline target state,
+ *  - cash/progression state,
+ *  - economic target choice with prep-time cost.
  *
  * The economic target selector writes its winning host back into Port 2, so the
  * existing controller automatically adopts the fresh priority between worker
