@@ -1,6 +1,6 @@
 # Agxnny Bitburner Scripts
 
-A modular Bitburner automation project for v3.x, currently focused on an early-game distributed HGW system with a control-only home node, remote worker execution, adaptive economic targeting, progression automation, a unified control-plane GUI, diagnostics, and a path toward multi-target HWGW batching.
+A modular Bitburner automation project for v3.x, currently focused on a distributed HGW/HWGW system with a control-only home node, remote worker execution, adaptive economic targeting, progression automation, a unified control-plane GUI, diagnostics, and staged migration toward fully pipelined multi-target batching.
 
 ## Quick start
 
@@ -31,31 +31,18 @@ run ui/dashboard.js
 
 The dashboard is intentionally simple and state-driven. It uses a restrained dark control-panel layout with status badges, headline metrics, compact cards, progress bars, and a small tab set instead of trying to put every script output on one screen.
 
-Current tabs:
-
-- **Overview** — target, 5-minute income, remote RAM, active money goal, live HGW state, execution state, economy, and system health.
-- **Targets** — selected economic strategy, prep/weighted prep, expected income, economic ETA, rankings, and filtered targets.
-- **Economy** — progression goal, manual savings lock, cloud-purchase state, and common money-goal commands.
-- **Network** — discovery/rooting metrics, port tools, and remote execution hosts.
-- **Diagnostics** — cached health checks, manual test buttons, state ages, and common diagnostic commands.
-
-The older `diagnostics/dashboard.js` remains a focused troubleshooting panel. `ui/dashboard.js` is the main control-plane GUI.
+Current tabs are **Overview, Targets, Economy, Network, and Diagnostics**. The older `diagnostics/dashboard.js` remains a focused troubleshooting panel.
 
 ## Stock trading workspace
 
-Stock trading is deliberately isolated from the HGW control plane and is **not started by `startup.js`**. It has its own terminal and GUI placeholders so it can be developed later without bloating the main dashboard or mixing trading logic into HGW orchestration.
+Stock trading is deliberately isolated from the HGW control plane and is **not started by `startup.js`**.
 
 ```text
 run stocks/terminal.js
 run ui/stocks.js
 ```
 
-At present both are display-only placeholders and **do not place trades**. The intended future split is:
-
-```text
-stocks/terminal.js   -> trading-engine logs / decisions / order events
-ui/stocks.js         -> portfolio, signals, positions, risk and controls
-```
+Both are currently non-trading placeholders for a later stock subsystem.
 
 ## Current architecture
 
@@ -67,10 +54,9 @@ ui/stocks.js         -> portfolio, signals, positions, risk and controls
 - **Controlled cloud purchasing** can buy one advisor-approved server per strategic refresh with deterministic names `hgw-001`, `hgw-002`, ... .
 - **Manual money goal** overrides the automatic cash goal and hard-locks automated purchasing until explicitly cleared.
 - **Economic strategy selector** compares live target state, remote-only worker capacity, prep waves, exponential prep cost, desired-money percentages, progression distance, and cash-relative target value.
-- **Controller** runs persistently on home and orchestrates HGW while tactical calculation and worker execution remain remote.
+- **Controller** still runs the normal production loop sequentially while the new synchronized HWGW batch path is validated separately.
 - **Telemetry** records real hack returns and rolling income rates.
 - **Main GUI** consumes cached state and presents it without owning strategy logic.
-- **Stock subsystem** is a separate future workspace with its own terminal and GUI.
 
 ## Manual money goal / spending lock
 
@@ -98,10 +84,11 @@ While active, the goal is persisted on home, published on Port 11, used by targe
 | 9 | rooting/tool state |
 | 10 | automated cloud-purchase state |
 | 11 | manual money-goal / spending lock |
+| 12 | latest synchronized HWGW batch state |
 
-## HGW flow
+## Current HGW flow
 
-The current controller is sequential HGW rather than timed batching:
+The main controller is still sequential while batching is validated:
 
 1. adopt the latest selected target and desired-money percentage;
 2. observe live money/security;
@@ -109,7 +96,45 @@ The current controller is sequential HGW rather than timed batching:
 4. weaken/grow/hack using remote workers only;
 5. after HACK completion, run the strategic review chain.
 
-There is deliberately no home worker fallback. If remote worker RAM is unavailable, the controller waits instead of consuming the control/UI node.
+There is deliberately no home worker fallback.
+
+## First HWGW batching milestone
+
+`hacking/batch-runner.js` now provides an experimental **single synchronized HWGW batch** for a prepared target. It is not yet wired into the controller automatically.
+
+The landing order is:
+
+```text
+HACK
+  + gap
+WEAKEN_HACK
+  + gap
+GROW
+  + gap
+WEAKEN_GROW
+```
+
+The default gap is **200 ms**. All workers are launched up front and use the v3 `additionalMsec` HGW option so their effects land in the required order. The runner reserves the entire batch across the remote RAM pool before launching anything; if the whole batch cannot fit, it refuses to launch rather than creating a partial unsafe batch.
+
+The worker scripts remain backward compatible with sequential execution. Their fourth argument is now an optional `additionalMsec`, and batch metadata can be supplied in later arguments.
+
+The batch runner currently requires the target to already be prepared: security must be near minimum and money must be at the chosen desired-money level. This makes the first batching step conservative while we validate timing and recovery accuracy.
+
+Example when connected to a sufficiently large remote execution host:
+
+```text
+run hacking/batch-runner.js n00dles 0.10 200 1
+```
+
+Arguments are:
+
+```text
+target  hackFraction  gapMs  moneyTargetPercent
+```
+
+Port 12 records `BLOCKED`, `READY`, `RUNNING`, `LAUNCH_FAILED`, or `COMPLETE` batch state including thread counts, landing times, allocations, final money, and final security.
+
+This is intentionally **one batch at a time**. The next batching step is controller integration and then safe overlapping/pipelined batches once timing drift has been measured.
 
 ## Adaptive economic strategy
 
@@ -141,9 +166,6 @@ At most one is purchased per strategic refresh. Manual money-goal mode disables 
 ```text
 run startup.js
 run ui/dashboard.js
-run stocks/terminal.js
-run ui/stocks.js
-run diagnostics/dashboard.js
 run diagnostics/mem-audit.js
 run diagnostics/economy-targets.js
 run diagnostics/income.js
@@ -173,6 +195,7 @@ economy/
   manual-goal.js
 
 hacking/
+  batch-runner.js
   controller.js
   planner.js
   refresh.js
@@ -220,20 +243,19 @@ docs/
 
 ## RAM philosophy
 
-Home RAM is control-plane capacity, not worker capacity. Persistent home processes should be small and useful; expensive short-lived analysis belongs on remote hosts. The GUI is intentionally state-driven so adding more visibility does not require adding expensive Netscript APIs to home.
-
-The stock subsystem is also kept separate so enabling stock trading later does not automatically increase the footprint of the main HGW dashboard.
+Home RAM is control-plane capacity, not worker capacity. Persistent home processes should be small and useful; expensive short-lived analysis and timed batch execution belong on remote hosts. The GUI remains state-driven so visibility does not add expensive Netscript APIs to home.
 
 ## Roadmap
 
-1. validate the polished unified GUI and one-command quiet startup;
-2. add safe GUI controls through low-RAM command/state channels;
-3. add the strict post-HACK strategic review barrier;
-4. add target/strategy hysteresis;
-5. split dispatch/scheduling out of the controller to reduce persistent home RAM;
-6. calibrate predicted income against real telemetry;
-7. flesh out the independent stock terminal/GUI and stock runtime-state contract;
-8. optimize the whole remote RAM pool across multiple targets;
-9. transition from sequential HGW to timed HWGW batches.
+1. validate single synchronized HWGW landing order and recovery accuracy;
+2. expose batch health/timing state in the main GUI;
+3. integrate the batch runner into production after targets are prepared;
+4. add a strict post-batch strategic review barrier;
+5. measure timing drift and tune the landing gap dynamically;
+6. add overlapping/pipelined batches with RAM reservation and collision prevention;
+7. add target/strategy hysteresis and predicted-versus-actual calibration;
+8. split more dispatch/scheduling work out of the home controller;
+9. optimize the whole remote RAM pool across multiple targets;
+10. flesh out the independent stock subsystem.
 
 See `docs/architecture.md` for the architectural direction.
