@@ -21,6 +21,7 @@ export async function main(ns) {
         ns.tprint(`Need:       $${ns.format.number(goal.remaining ?? 0, 2)} more`);
     }
     ns.tprint(`Usable RAM: ${Number(state.usableRam ?? 0).toFixed(2)}GB`);
+    if (state.prepPenalty?.model) ns.tprint(`Prep model: ${state.prepPenalty.model}`);
 
     if (selected) {
         ns.tprint(`Selected:   ${selected.hostname}`);
@@ -30,11 +31,16 @@ export async function main(ns) {
     ns.tprint("");
     ns.tprint("--- ECONOMIC RANKING ---");
     for (const target of (state.rankings ?? []).slice(0, 8)) {
+        const weighted = target.weightedPrepSeconds ?? target.prepSeconds;
+        const multiplier = Number(target.prepPenaltyMultiplier ?? 1);
+        const economic = target.economicEtaSeconds ?? target.goalEtaSeconds;
         ns.tprint(
             `#${target.economicRank} ${String(target.hostname).padEnd(18)}`
             + ` prep ${formatDuration(target.prepSeconds).padStart(8)}`
+            + ` -> ${formatDuration(weighted).padStart(8)}`
+            + ` | x${multiplier.toFixed(1)}`
             + ` | $${ns.format.number(target.steadyIncomePerSecond ?? 0, 2)}/s`
-            + ` | goal ${formatDuration(target.goalEtaSeconds)}`
+            + ` | economic ${formatDuration(economic)}`
             + ` | baseline #${target.baselineRank}`
         );
     }
@@ -47,5 +53,7 @@ function formatDuration(seconds) {
     const minutes = Math.floor(value / 60);
     if (minutes < 60) return `${minutes}m${Math.floor(value % 60)}s`;
     const hours = Math.floor(minutes / 60);
-    return `${hours}h${minutes % 60}m`;
+    if (hours < 48) return `${hours}h${minutes % 60}m`;
+    const days = Math.floor(hours / 24);
+    return `${days}d${hours % 24}h`;
 }
