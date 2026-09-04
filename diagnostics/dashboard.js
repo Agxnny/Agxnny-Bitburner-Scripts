@@ -14,7 +14,7 @@ export async function main(ns) {
 
     ns.ui.openTail();
     ns.ui.setTailTitle("Bitburner Control - Diagnostics");
-    ns.ui.resizeTail(860, 860);
+    ns.ui.resizeTail(860, 900);
 
     while (true) {
         render(ns);
@@ -48,10 +48,12 @@ function render(ns) {
         "hacking/workers/hack.js",
         "hacking/workers/grow.js",
         "hacking/workers/weaken.js",
+        "lib/execution.js",
         "lib/network.js",
         "lib/runtime-state.js",
         "lib/state.js",
         "lib/targets.js",
+        "network/deploy.js",
         "network/inspect.js",
         "network/root.js",
         "diagnostics/dashboard.js",
@@ -119,6 +121,7 @@ function renderController(ns, controller, stale) {
     const chance = Number(controller.analysis?.hackChance ?? 0) * 100;
     const hackTimeMs = Number(controller.analysis?.hackTimeMs ?? 0);
     const score = Number(controller.selection?.score ?? 0);
+    const execution = controller.execution ?? {};
 
     ns.print(`│ State        ${stale ? "STALE" : "LIVE"} (${ageSeconds}s old)   Mode ${String(controller.selection?.mode ?? "?")}`);
     ns.print(`│ Target       ${String(controller.hostname ?? "unknown")}   Rank ${formatRank(controller.selection?.rank)}`);
@@ -126,6 +129,8 @@ function renderController(ns, controller, stale) {
     ns.print(`│ Money        ${formatMoney(moneyCurrent)} / ${formatMoney(moneyMax)} (${moneyPercent.toFixed(1)}%)`);
     ns.print(`│ Security     ${securityCurrent.toFixed(2)} / ${securityMin.toFixed(2)} (+${securityDelta.toFixed(2)})`);
     ns.print(`│ Analysis     chance ${chance.toFixed(1)}% | hack ${(hackTimeMs / 1000).toFixed(1)}s | score ${formatScore(ns, score)}`);
+    ns.print(`│ RAM pool     ${Number(execution.hostCount ?? 0)} host(s) | ${formatRam(execution.usableRam ?? 0)} usable | reserve ${formatRam(execution.homeReserveGb ?? 0)}`);
+    ns.print(`│ Jobs         ${Number(execution.activeJobs ?? 0)} active | ${Number(execution.activeThreads ?? 0)} thread(s)`);
     ns.print(`│ Reason       ${String(controller.reason ?? "")}`);
 }
 
@@ -137,7 +142,8 @@ function renderTargetRanking(ns, targets, planner) {
     }
 
     const ageSeconds = Math.max(0, (Date.now() - Number(planner?.updatedAt ?? 0)) / 1000);
-    ns.print(`│ Cached plan  ${ageSeconds.toFixed(0)}s old | hacking level ${String(planner?.hackingLevel ?? "?")}`);
+    const ramHosts = Array.isArray(planner?.executionHosts) ? planner.executionHosts.length : 0;
+    ns.print(`│ Cached plan  ${ageSeconds.toFixed(0)}s old | hacking level ${String(planner?.hackingLevel ?? "?")} | RAM hosts ${ramHosts}`);
 
     for (const target of targets.slice(0, 6)) {
         const rank = `#${target.rank}`.padEnd(4);
