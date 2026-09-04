@@ -17,11 +17,10 @@ import { readTelemetryState } from "/lib/telemetry.js";
 const TEST_REQUEST_PORT = 6;
 const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
 const TABS = Object.freeze(["Overview", "Targets", "Economy", "Network", "Diagnostics"]);
-const UI_TICK_MS = 100;
+const UI_SYNC_MS = 100;
+const MAIN_TICK_MS = 25;
 const DATA_REFRESH_MS = 1000;
 
-let activeTab = "Overview";
-let requestedTab = "Overview";
 let requestedTest = null;
 let requestedGoalAction = null;
 let requestedControllerAction = null;
@@ -32,8 +31,8 @@ let goalInput = "";
 let goalLabelInput = "";
 let manualTargetInput = "";
 let cachedState = null;
+let stateVersion = 0;
 let lastDataRefresh = 0;
-let dirty = true;
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -42,18 +41,24 @@ export async function main(ns) {
     ns.ui.setTailTitle("Agxnny Control Plane");
     ns.ui.resizeTail(1120, 780);
 
+    cachedState = snapshot(ns);
+    stateVersion += 1;
+    lastDataRefresh = Date.now();
+
+    // Mount the React tree once. Repeated clearLog()/printRaw() calls remount the
+    // entire dashboard, which makes navigation and controls compete with the
+    // Netscript refresh loop. DashboardRoot owns presentation-only UI state and
+    // observes cached snapshots through stateVersion; callbacks remain Netscript-free.
+    ns.clearLog();
+    ns.printRaw(el(DashboardRoot));
+
     while (true) {
         const now = Date.now();
 
-        if (!cachedState || now - lastDataRefresh >= DATA_REFRESH_MS) {
+        if (now - lastDataRefresh >= DATA_REFRESH_MS) {
             cachedState = snapshot(ns);
+            stateVersion += 1;
             lastDataRefresh = now;
-            dirty = true;
-        }
-
-        if (requestedTab !== activeTab) {
-            activeTab = requestedTab;
-            dirty = true;
         }
 
         if (requestedTest) {
@@ -61,7 +66,7 @@ export async function main(ns) {
             requestedTest = null;
             ns.writePort(TEST_REQUEST_PORT, JSON.stringify({ test: test.id, requestedAt: now }));
             actionStatus = `${test.label} queued`;
-            dirty = true;
+            stateVersion += 1;
         }
 
         if (requestedControllerAction) {
@@ -69,7 +74,7 @@ export async function main(ns) {
             requestedControllerAction = null;
             ns.writePort(RuntimePort.CONTROL_REQUESTS, JSON.stringify({ ...action, requestedAt: now }));
             controllerActionStatus = controllerStatusText(action);
-            dirty = true;
+            stateVersion += 1;
         }
 
         if (requestedGoalAction) {
@@ -77,18 +82,36 @@ export async function main(ns) {
             requestedGoalAction = null;
             await applyGoalAction(ns, action, now);
             cachedState = snapshot(ns);
+            stateVersion += 1;
             lastDataRefresh = now;
-            dirty = true;
         }
 
-        if (dirty) {
-            ns.clearLog();
-            ns.printRaw(renderApp(cachedState));
-            dirty = false;
-        }
-
-        await ns.sleep(UI_TICK_MS);
+        await ns.sleep(MAIN_TICK_MS);
     }
+}
+
+function DashboardRoot() {
+    const [activeTab, setActiveTab] = React.useState("Overview");
+    const [, setRenderVersion] = React.useState(stateVersion);
+
+    React.useEffect(() => {
+        const timer = setInterval(() => {
+            setRenderVersion((current) => current === stateVersion ? current : stateVersion);
+        }, UI_SYNC_MS);
+        return () => clearInterval(timer);
+    }, []);
+
+    const s = cachedState ?? {};
+    return el("div", { style: styles.app },
+        header(s),
+        nav(activeTab, setActiveTab),
+        el("div", { style: styles.content }, activeView(s, activeTab)),
+        el("div", { style: styles.footer },
+            el("span", null, "CONTROL PLANE"),
+            el("span", null, "Workers: remote only"),
+            el("span", null, `Planner ${age(s.planner?.updatedAt)}`),
+        ),
+    );
 }
 
 function snapshot(ns) {
@@ -137,19 +160,6 @@ function controllerStatusText(action) {
     return "Controller request queued";
 }
 
-function renderApp(s) {
-    return el("div", { style: styles.app },
-        header(s),
-        nav(),
-        el("div", { style: styles.content }, activeView(s)),
-        el("div", { style: styles.footer },
-            el("span", null, "CONTROL PLANE"),
-            el("span", null, "Workers: remote only"),
-            el("span", null, `Planner ${age(s.planner?.updatedAt)}`),
-        ),
-    );
-}
-
 function header(s) {
     const c = s.controller ?? {};
     const live = Boolean(s.controller) && !isControllerStateStale(s.controller);
@@ -179,15 +189,15 @@ function header(s) {
     );
 }
 
-function nav() {
+function nav(activeTab, setActiveTab) {
     return el("div", { style: styles.nav }, ...TABS.map((tab) => el("button", {
         key: tab,
-        onClick: () => { requestedTab = tab; },
+        onClick: () => { setActiveTab(tab); },
         style: { ...styles.navButton, ...(activeTab === tab ? styles.navActive : {}) },
     }, tab)));
 }
 
-function activeView(s) {
+function activeView(s, activeTab) {
     if (activeTab === "Targets") return targetsView(s);
     if (activeTab === "Economy") return economyView(s);
     if (activeTab === "Network") return networkView(s);
@@ -330,7 +340,7 @@ function targetsView(s) {
                 el("input", {
                     value: manualTargetInput,
                     placeholder: "Hostname · e.g. foodnstuff",
-                    onChange: (event) => { manualTargetInput = String(event.target.value ?? ""); },
+                    onChange: (event) => { manualTargetInput = String(event.target.value ?? ""); stateVersion += 1; },
                     onKeyDown: (event) => {
                         if (event.key === "Enter" && manualTargetInput.trim()) {
                             requestedControllerAction = { action: "SET_MANUAL_TARGET", target: manualTargetInput.trim() };
@@ -389,7 +399,7 @@ function economyView(s) {
                 el("input", {
                     value: goalInput,
                     placeholder: "Target cash · e.g. 50m or 1.5b",
-                    onChange: (event) => { goalInput = String(event.target.value ?? ""); },
+                    onChange: (event) => { goalInput = String(event.target.value ?? ""); stateVersion += 1; },
                     onKeyDown: (event) => {
                         if (event.key === "Enter") requestedGoalAction = { type: "set", value: goalInput, label: goalLabelInput };
                     },
@@ -398,7 +408,7 @@ function economyView(s) {
                 el("input", {
                     value: goalLabelInput,
                     placeholder: "Optional label",
-                    onChange: (event) => { goalLabelInput = String(event.target.value ?? ""); },
+                    onChange: (event) => { goalLabelInput = String(event.target.value ?? ""); stateVersion += 1; },
                     onKeyDown: (event) => {
                         if (event.key === "Enter") requestedGoalAction = { type: "set", value: goalInput, label: goalLabelInput };
                     },
