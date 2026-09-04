@@ -11,15 +11,17 @@ export async function main(ns) {
 
     const rooted = servers.filter((server) => server.hasRoot);
     const rootable = servers.filter((server) => !server.hasRoot && server.canRootNow);
-    const blocked = servers.filter((server) => !server.hasRoot && !server.canRootNow);
+    const hackable = servers.filter((server) => server.canHackNow && server.target.hasMoney);
+    const progressionBlocked = servers.filter((server) => !server.canBecomeHackableNow && server.target.hasMoney);
     const moneyTargets = servers.filter((server) => server.target.hasMoney);
 
     ns.tprint("=== NETWORK OVERVIEW ===");
-    ns.tprint(`Discovered: ${servers.length}`);
-    ns.tprint(`Rooted:     ${rooted.length}`);
-    ns.tprint(`Rootable:   ${rootable.length}`);
-    ns.tprint(`Blocked:    ${blocked.length}`);
-    ns.tprint(`Money hosts:${moneyTargets.length}`);
+    ns.tprint(`Discovered:       ${servers.length}`);
+    ns.tprint(`Rooted:           ${rooted.length}`);
+    ns.tprint(`Rootable now:     ${rootable.length}`);
+    ns.tprint(`HGW-ready money:  ${hackable.length}`);
+    ns.tprint(`Blocked money:    ${progressionBlocked.length}`);
+    ns.tprint(`Money hosts total:${moneyTargets.length}`);
 
     if (rootable.length > 0) {
         ns.tprint("\n=== ROOTABLE NOW ===");
@@ -28,9 +30,9 @@ export async function main(ns) {
         }
     }
 
-    if (blocked.length > 0) {
-        ns.tprint("\n=== BLOCKED ===");
-        for (const server of blocked) {
+    if (progressionBlocked.length > 0) {
+        ns.tprint("\n=== PROGRESSION BLOCKERS ===");
+        for (const server of progressionBlocked) {
             ns.tprint(`${formatServer(server)} | ${formatBlocker(server)}`);
         }
     }
