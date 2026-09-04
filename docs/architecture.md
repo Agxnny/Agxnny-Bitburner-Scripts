@@ -27,6 +27,8 @@ planner → deploy/sync → economy/target → controller
 
 React callbacks never call Netscript APIs directly. Command callbacks assign plain-JS request state; the dashboard loop later writes Port 13 or files.
 
+The GUI now has a dedicated **Batch** tab. Overview remains focused on current control-plane status, while the Batch tab owns synchronized-HWGW observability: current batch state, latest completed recovery, landing-order measurements, per-stage errors/spread, and a planned-vs-actual landing timeline.
+
 ## Execution modes
 
 ### Normal HGW
@@ -60,7 +62,7 @@ Port 12 records initial state, predicted recovery, final state, and predicted-vs
 
 ## Batch landing telemetry
 
-Workers now receive the planned landing timestamp as a batch-only argument.
+Workers receive the planned landing timestamp as a batch-only argument.
 
 After completing their operation, batch-associated HACK/GROW/WEAKEN workers emit one lightweight completion event to **Port 14**:
 
@@ -99,7 +101,9 @@ landing.adjacentSpacing[]
 landing.stages[]
 ```
 
-This is the measurement surface used to decide whether the fixed 200 ms gap has enough safety margin before pipelining.
+When a batch reaches `COMPLETE`, the same completed snapshot is also copied to **Port 15**. Port 12 is free to advance immediately to the next current batch, while Port 15 remains stable for GUI inspection.
+
+The Batch tab renders `landing.stages[]` as a planned-vs-actual timeline. Each H/W1/G/W2 row plots planned and actual completion on the same horizontal axis, making systematic early/late landing visually obvious while preserving exact numeric errors and allocation spread below.
 
 ### Current serialization assumption
 
@@ -135,9 +139,10 @@ Batch-associated HACK events are ignored as standalone strategic checkpoints. `h
 | 9 | root/tool state |
 | 10 | cloud capacity automation state |
 | 11 | manual money goal / spending lock |
-| 12 | synchronized batch state |
+| 12 | current synchronized batch state |
 | 13 | controller command queue |
 | 14 | batch landing-timing event queue |
+| 15 | latest completed batch state |
 
 See `docs/RUNTIME_STATE.md` for the detailed state contract.
 
@@ -151,6 +156,8 @@ Stage 4 synchronized batching currently includes:
 - strict strategic-review barrier;
 - corrected W2 security compensation;
 - predicted-vs-actual recovery telemetry;
-- **current: actual landing drift/order telemetry**.
+- actual landing drift/order telemetry;
+- retained latest-completed batch state and dedicated Batch GUI workspace;
+- **current: repeated timing-margin measurement**.
 
 Stage 5 pipelining begins only after repeated timing measurements show understood and adequate landing margin.
