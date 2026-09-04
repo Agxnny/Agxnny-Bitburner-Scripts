@@ -53,7 +53,7 @@ security after batch: minimum
 standalone repair weaken: not required
 ```
 
-Recovery-model telemetry is recorded in Port 12. The current development step is **actual landing-drift measurement**.
+Recovery-model telemetry is recorded in Port 12. The current live-development step remains **actual landing-drift measurement**.
 
 Batch workers receive their planned landing timestamp and emit completion events to **Port 14**. The batch runner aggregates those events into Port 12 schema version 3, including actual stage order, per-stage landing error, within-stage allocation spread, minimum adjacent spacing, missing timing events, and maximum absolute drift.
 
@@ -73,7 +73,26 @@ GROW
 WEAKEN_GROW
 ```
 
-Do not implement overlapping batches until repeated timing samples show stable order and adequate spacing margin.
+## Pipeline scheduler prototype
+
+Work has started on `hacking/batch-scheduler.js` as a **dry-run-only** pipeline planner. It does not launch workers yet.
+
+The scheduler treats two timing controls separately:
+
+- **stage gap** — H → W1 → G → W2 spacing inside a batch;
+- **batch interval** — H(N) → H(N+1) spacing between successive batches.
+
+It builds a global landing calendar, uses matching Port 15 timing telemetry as a conservative drift/spread safety signal, models time-aware aggregate RAM occupancy, and estimates a simulated safe pipeline depth. Results are published to **Port 16**.
+
+The scheduler intentionally does not reduce timings aggressively from one completed batch. Rolling timing history and host-by-host future RAM reservation are required before live overlap is enabled.
+
+Dry-run example:
+
+```text
+run hacking/batch-scheduler.js phantasy 0.10 200
+```
+
+See `docs/BATCH_SCHEDULER.md` for the detailed design and safety milestones.
 
 ## Runtime ports
 
@@ -94,6 +113,7 @@ Do not implement overlapping batches until repeated timing samples show stable o
 | 13 | controller command queue |
 | 14 | batch worker landing-timing event queue |
 | 15 | latest completed batch snapshot |
+| 16 | dry-run pipeline scheduler analysis |
 
 Port 14 is currently safe because batching is serialized and the runner clears stale timing events immediately before launch. That behavior must be redesigned before pipelining.
 
@@ -109,12 +129,14 @@ run economy/manual-goal.js status
 run network/inspect.js
 run network/root.js
 run hacking/batch-runner.js n00dles 0.10 200 1
+run hacking/batch-scheduler.js phantasy 0.10 200
 ```
 
 ## Documentation
 
 - `docs/HANDOFF.md` — current milestone and next work
 - `docs/architecture.md` — architecture and data flow
+- `docs/BATCH_SCHEDULER.md` — dry-run pipeline scheduler design
 - `docs/RUNTIME_STATE.md` — ports/state contracts
 - `docs/TESTING.md` — validation and acceptance criteria
 - `docs/SYSTEM_MAP.md` — module responsibilities
@@ -124,7 +146,9 @@ run hacking/batch-runner.js n00dles 0.10 200 1
 
 1. collect repeated landing telemetry in the Batch tab;
 2. measure worst landing error, allocation spread, and minimum stage spacing;
-3. decide whether the 200 ms gap needs tuning/adaptation;
-4. implement overlapping/pipelined batches only after timing is understood;
-5. after batch timing is stable, design watchdog kill/recovery rules from observed worker timing;
-6. later optimize global RAM scheduling and multi-target execution.
+3. validate the dry-run scheduler's stage-gap, batch-interval, and RAM predictions;
+4. add rolling timing history and host-by-host future reservation;
+5. redesign Port 14 for multiple live batch IDs;
+6. first live pipeline test capped at depth 2;
+7. after batch timing is stable, design watchdog kill/recovery rules from observed worker timing;
+8. later optimize global RAM scheduling and multi-target execution.
