@@ -1,43 +1,54 @@
 import { isQuiet } from "/lib/output.js";
 
 /**
- * Print the RAM cost of every managed JavaScript file in manifest.json.
+ * Print the RAM cost of every JavaScript file currently installed on home.
+ *
+ * This intentionally scans the live filesystem instead of depending on
+ * manifest.json, so it also works immediately after updater problems and can
+ * reveal stale/unmanaged scripts that are still present.
  *
  * Usage:
  *   run diagnostics/mem-audit.js
  *   run diagnostics/mem-audit.js --path
- *   run diagnostics/mem-audit.js --quiet   // performs the scan without output
+ *   run diagnostics/mem-audit.js --managed
+ *   run diagnostics/mem-audit.js --quiet
  *
  * Default order is highest RAM first; --path sorts by file path.
+ * --managed limits the report to files listed in manifest.json when available.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     const quiet = isQuiet(ns);
-    const sortByPath = ns.args.some((arg) => String(arg).toLowerCase() === "--path");
-    const manifestPath = "manifest.json";
+    const args = ns.args.map((arg) => String(arg).toLowerCase());
+    const sortByPath = args.includes("--path");
+    const managedOnly = args.includes("--managed");
 
-    if (!ns.fileExists(manifestPath, "home")) {
-        if (!quiet) ns.tprint(`ERROR: ${manifestPath} is missing.`);
-        return;
+    let files = ns.ls("home", ".js")
+        .map(String)
+        .filter((file) => file.endsWith(".js"));
+
+    let managedSet = null;
+    if (ns.fileExists("manifest.json", "home")) {
+        try {
+            const manifest = JSON.parse(ns.read("manifest.json"));
+            if (Array.isArray(manifest?.files)) {
+                managedSet = new Set(manifest.files.map(String));
+            }
+        } catch {
+            // A broken manifest should never prevent a filesystem RAM audit.
+        }
     }
 
-    let manifest;
-    try {
-        manifest = JSON.parse(ns.read(manifestPath));
-    } catch (error) {
-        if (!quiet) ns.tprint(`ERROR: ${manifestPath} is invalid JSON: ${String(error)}`);
-        return;
+    if (managedOnly && managedSet) {
+        files = files.filter((file) => managedSet.has(file));
     }
-
-    const files = Array.isArray(manifest?.files)
-        ? manifest.files.map(String).filter((file) => file.endsWith(".js"))
-        : [];
 
     const rows = files.map((file) => ({
         file,
         ram: Math.max(0, Number(ns.getScriptRam(file, "home")) || 0),
         kind: file.startsWith("lib/") ? "module" : "script",
+        managed: managedSet ? managedSet.has(file) : null,
     }));
 
     rows.sort(sortByPath
@@ -46,17 +57,24 @@ export async function main(ns) {
 
     if (quiet) return;
 
-    ns.tprint("=== MANAGED SCRIPT RAM AUDIT ===");
+    ns.tprint("=== INSTALLED SCRIPT RAM AUDIT ===");
     ns.tprint(`Files: ${rows.length} | sort: ${sortByPath ? "path" : "RAM descending"}`);
+    if (managedOnly && !managedSet) {
+        ns.tprint("WARNING: --managed requested but manifest.json is unavailable; showing all installed .js files.");
+    }
     ns.tprint("");
 
     for (const row of rows) {
-        ns.tprint(`${row.ram.toFixed(2).padStart(6)} GB | ${row.kind.padEnd(6)} | ${row.file}`);
+        const managed = row.managed === null ? "?" : row.managed ? "M" : "U";
+        ns.tprint(`${row.ram.toFixed(2).padStart(6)} GB | ${row.kind.padEnd(6)} | ${managed} | ${row.file}`);
     }
 
     const runnable = rows.filter((row) => row.kind === "script");
     const modules = rows.filter((row) => row.kind === "module");
+    const unmanaged = rows.filter((row) => row.managed === false);
     ns.tprint("");
     ns.tprint(`Runnable scripts: ${runnable.length} | library modules: ${modules.length}`);
+    if (managedSet) ns.tprint(`Unmanaged installed .js files: ${unmanaged.length}`);
+    ns.tprint("Legend: M = listed in manifest, U = installed but unmanaged, ? = manifest unavailable.");
     ns.tprint("Note: imported library RAM is already reflected in each runnable script's reported total.");
 }
