@@ -1,6 +1,6 @@
 # Agxnny Bitburner Scripts
 
-A modular Bitburner automation project for v3.x, currently focused on an early-game distributed HGW system with low-RAM control, remote tactical planning, runtime telemetry, progression guidance, economic target selection, automatic rooting, adaptive money targeting, automated cloud-server purchasing, diagnostics, and a path toward multi-target HWGW batching.
+A modular Bitburner automation project for v3.x, currently focused on an early-game distributed HGW system with low-RAM control, remote tactical planning, runtime telemetry, progression guidance, economic target selection, automatic rooting, adaptive money targeting, controlled cloud-server purchasing, diagnostics, and a path toward multi-target HWGW batching.
 
 ## Current architecture
 
@@ -9,6 +9,7 @@ A modular Bitburner automation project for v3.x, currently focused on an early-g
 - **Refresh coordinator** runs remotely. It performs a lightweight rooting/tool check every 30 seconds, but only runs the heavy target/RAM planner after a completed `HACK` or when the execution pool expands.
 - **Automatic rooting** detects newly owned port-opening programs, roots every immediately rootable server, publishes the result on Port 9, then triggers a fresh planner/economy pass only when new servers were gained.
 - **Automated cloud purchasing** follows the progression advisor. When the selected progression goal is an affordable new cloud server, one server may be purchased per strategic refresh using the deterministic `hgw-001`, `hgw-002`, ... naming scheme. Existing manually named cloud servers are left unchanged.
+- **Manual money goal** is a user spending lock. While active, it overrides the automatic progression cash goal for target economics and blocks automated cloud purchases even if stale advisor state still says a server is affordable.
 - **New-host sync** copies execution/support files to newly rooted or newly purchased RAM hosts without rerunning the heavy startup deploy on home.
 - **Economic strategy selector** compares live target state, real distributed thread capacity, preparation waves, exponentially weighted prep time, expected production rate, the current progression cash goal, and multiple desired-money percentages. Small targets below the partial-prep threshold are forced to 100% money before production.
 - **Controller** runs persistently, adopts the selected server *and* desired-money strategy, requests tactical plans, dispatches workers across the rooted RAM pool, and publishes state.
@@ -32,6 +33,32 @@ run kickstart.js --quiet
 
 The clean updater intentionally stops active automation, so run `kickstart.js` again after a pull.
 
+## Manual money goal / purchase lock
+
+Set a cash target with convenient `k`, `m`, `b`, or `t` suffixes:
+
+```text
+run economy/manual-goal.js 50m
+run economy/manual-goal.js 1.5b "Save for milestone"
+```
+
+Inspect or clear it with:
+
+```text
+run economy/manual-goal.js status
+run economy/manual-goal.js clear
+```
+
+While a manual goal is active:
+
+- Port 11 records the manual target;
+- `hacking/economy-planner.js` uses the remaining amount to that target as the active economic goal;
+- automatic progression recommendations are still calculated for visibility but are not treated as the active spending goal;
+- `network/cloud-buy.js` has a direct hard lock and will publish `BLOCKED_MANUAL_GOAL` instead of purchasing;
+- setting or clearing the goal triggers a lightweight economy/target refresh without requiring a full network planner pass.
+
+Reaching the manual target does **not** automatically clear it. Automated purchasing stays locked until you explicitly run `clear`, which prevents reaching the savings target from immediately spending the money you just accumulated.
+
 ## Runtime state and ports
 
 | Port | Purpose |
@@ -46,6 +73,7 @@ The clean updater intentionally stops active automation, so run `kickstart.js` a
 | 8 | latest economic target/strategy ranking snapshot |
 | 9 | latest rooting/tool-discovery snapshot |
 | 10 | latest automated cloud-purchase snapshot |
+| 11 | manual money-goal / automated-spending lock snapshot |
 
 ## Hacking flow
 
@@ -62,14 +90,11 @@ Partial dispatches are safe: if only part of a requested action fits, the contro
 
 ## Event-driven planning, rooting, purchasing, and RAM-pool growth
 
-The heavy `hacking/planner.js` is not timer-driven during normal operation. `hacking/refresh.js` performs two meaningful refresh paths:
-
-- every 30 seconds, run the lightweight rooting check remotely;
-- after a completed `HACK`, run the full planner/economy/strategy review.
+The heavy `hacking/planner.js` is not timer-driven during normal operation. `hacking/refresh.js` performs meaningful refresh paths for HACK completion, execution-pool expansion, and manual money-goal changes.
 
 If a rooting pass gains one or more servers, the system immediately refreshes the planner, syncs runtime files to the new hosts, and recalculates the economic strategy using the expanded execution pool.
 
-The progression refresh can also trigger `network/cloud-buy.js`. It only purchases when the current advisor goal is `PURCHASED_SERVER` and that goal is affordable. At most **one** cloud server is bought in a single strategic pass, preventing a large cash balance from being drained by a purchase loop. After a purchase, the planner and sync pass run again so the new server joins the execution pool before target selection finishes.
+The progression refresh can also trigger `network/cloud-buy.js`. It only purchases when the current advisor goal is `PURCHASED_SERVER`, that goal is affordable, and no manual money goal is active. At most **one** cloud server is bought in a single strategic pass, preventing a large cash balance from being drained by a purchase loop. After a purchase, the planner and sync pass run again so the new server joins the execution pool before target selection finishes.
 
 Automated cloud servers use this naming scheme:
 
@@ -82,8 +107,6 @@ hgw-003
 
 The purchaser chooses the first unused managed name, so numbering remains stable even if older managed servers are missing. Existing manually named purchased servers are not renamed.
 
-Bitburner v3.0.1 uses the `ns.cloud` purchased-server API; the purchaser uses `ns.cloud.purchaseServer(hostname, ram)` and follows the RAM size selected by the progression advisor.
-
 ## Adaptive economic strategy selection
 
 The baseline target score remains:
@@ -92,30 +115,13 @@ The baseline target score remains:
 max money × hack percent per thread × hack chance / hack time
 ```
 
-That baseline answers which server looks strongest in isolation. The economic strategy selector answers the more useful early-game question:
-
-> Which server, prepared to what money level, is expected to reach the current progression goal fastest with the RAM we can actually dispatch?
-
 For targets large enough to justify partial preparation, the selector evaluates:
 
 ```text
 25%, 40%, 55%, 70%, 85%, 100%
 ```
 
-There is also a **small-server full-prep floor**. The initial test value is **$5,000,000 server max money**. If a server's maximum money is at or below that threshold, the partial percentages are not considered and the server is forced to **100% money before hacking**. This prevents a cheap early target from being attacked at 25% simply because its prep is short. The threshold is deliberately a single tuning constant so it can be adjusted after observing real gameplay.
-
-For every allowed server/percentage combination the selector:
-
-- reads live money and security;
-- calculates the grow amount needed only to reach that desired percentage;
-- calculates security-prep and grow-recovery weaken work;
-- measures actual hack/grow/weaken thread capacity host-by-host after used RAM and the home reserve are removed;
-- converts thread requirements into real worker waves;
-- estimates raw prep time and production-cycle time;
-- applies the 30-minute exponential prep penalty to long preparation commitments;
-- estimates steady cash/sec and progression-goal ETA.
-
-Each server keeps its best allowed percentage strategy, then those strategies compete globally. This allows a partially prepared larger server to compete against a fully prepared small server without making tiny targets artificially under-prepared.
+There is also a **small-server full-prep floor**. The current test value is **$5,000,000 server max money**. If a server's maximum money is at or below that threshold, the partial percentages are not considered and the server is forced to **100% money before hacking**.
 
 The selector also has a cash-relative target-value filter. It compares **player cash against the server's maximum money**, not the server's current money. The current test threshold ignores a target when player cash is at least 200% above that server's max (3x its max), provided another viable target remains. If every target would be filtered, AUTO mode falls back instead of becoming targetless.
 
@@ -128,15 +134,13 @@ run diagnostics/economy-targets.js
 run diagnostics/dashboard.js
 ```
 
-The economic diagnostic shows the winning server, chosen money percentage, target strategies, and alternatives. The dashboard's **Target Reasoning** section is intended for live troubleshooting: it shows why the economic selector chose the target, whether the controller matches that choice, current tactical state, prep/grow load, low-value targets that were ignored, and whether a small-server full-prep rule affected the selected strategy.
+The economic diagnostic shows the winning server, chosen money percentage, target strategies, and alternatives. The dashboard's **Target Reasoning** section is intended for live troubleshooting.
 
 ## Progression advisor
 
 `lib/progression.js` currently compares home RAM upgrades, buying a new cloud server, and the best next RAM-doubling upgrade across owned cloud servers. Home RAM receives extra weight while home is below the measured core-automation requirement.
 
-When a new-cloud-server candidate is selected and affordable, automation may now execute that recommendation. Cloud-server **upgrades are still advisory only**; automatic upgrade spending has not been enabled yet.
-
-Future candidates are intended to include port-opening programs and explicit save/hold recommendations without changing the consumer interface.
+When a new-cloud-server candidate is selected and affordable, automation may execute that recommendation unless the manual money-goal lock is active. Cloud-server **upgrades are still advisory only**; automatic upgrade spending has not been enabled yet.
 
 ## Telemetry
 
@@ -154,12 +158,11 @@ run diagnostics/economy-targets.js
 run diagnostics/income.js
 run diagnostics/progression.js
 run diagnostics/test.js --list
+run economy/manual-goal.js status
 run network/inspect.js
 run network/root.js
 run hacking/thread-plan.js
 ```
-
-`diagnostics/mem-audit.js` scans the live `.js` files installed on home and reports their current RAM cost. The dashboard remains focused on live function checks and target reasoning rather than becoming a giant report screen.
 
 ## Repository layout
 
@@ -168,6 +171,9 @@ kickstart.js
 gitpull.js
 gitpull-self-update.js
 manifest.json
+
+economy/
+  manual-goal.js
 
 hacking/
   controller.js
@@ -222,17 +228,17 @@ RAM optimization is treated by lifetime and role, not raw file size alone. Persi
 Current design examples:
 
 - the heavy target/RAM planner runs only after a completed HACK or genuine execution-pool expansion;
+- manual goal changes refresh only economy/purchase/target state rather than the heavy planner;
 - the lightweight root check runs remotely every 30 seconds;
 - newly rooted and newly purchased hosts are synced remotely;
 - cloud purchasing is a short-lived remote action rather than controller logic;
-- economic strategy calculation is short-lived and remote;
 - the controller remains the next major persistent-home RAM optimization target.
 
 ## Roadmap
 
 The next major layers are:
 
-1. validate adaptive money-target choices, the $5m full-prep floor, cash-relative value filtering, and advisor-driven server purchases against real gameplay;
+1. validate adaptive money-target choices, the $5m full-prep floor, cash-relative value filtering, manual savings goals, and advisor-driven server purchases against real gameplay;
 2. tune the cash/server-max ignore threshold after testing;
 3. add the strict post-HACK review barrier;
 4. add target/strategy-switch hysteresis so small score changes do not cause churn;
