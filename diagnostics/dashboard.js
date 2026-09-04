@@ -1,13 +1,11 @@
 import { analyzeNetwork, getAvailablePortOpeners } from "/lib/network.js";
-import { isControllerStateStale, readControllerState } from "/lib/runtime-state.js";
-import { rankEligibleTargets } from "/lib/targets.js";
+import { isControllerStateStale, readControllerState, readPlannerState } from "/lib/runtime-state.js";
 
 /**
- * Lightweight diagnostic dashboard for the early project stages.
+ * Optional diagnostic dashboard.
  *
- * Read-only: this script does not root servers, launch workers, or alter targets.
- * It continuously validates the network/capability layer, shows the ranked target
- * analyzer output, and displays the latest controller state.
+ * This remains read-only. Target rankings are consumed from the planner's cached
+ * snapshot instead of recomputed here, reducing duplicate analysis work.
  *
  * @param {NS} ns
  */
@@ -28,7 +26,8 @@ export async function main(ns) {
 function render(ns) {
     const servers = analyzeNetwork(ns);
     const tools = getAvailablePortOpeners(ns);
-    const rankedTargets = rankEligibleTargets(ns);
+    const planner = readPlannerState(ns);
+    const rankedTargets = Array.isArray(planner?.rankings) ? planner.rankings : [];
     const controller = readControllerState(ns);
     const controllerStale = isControllerStateStale(controller);
 
@@ -44,6 +43,7 @@ function render(ns) {
     const requiredFiles = [
         "gitpull.js",
         "hacking/controller.js",
+        "hacking/planner.js",
         "hacking/targets.js",
         "hacking/workers/hack.js",
         "hacking/workers/grow.js",
@@ -90,13 +90,13 @@ function render(ns) {
     }
 
     ns.print("├────────────────────────── TARGET RANKING ─────────────────────────────┤");
-    renderTargetRanking(ns, rankedTargets);
+    renderTargetRanking(ns, rankedTargets, planner);
 
     ns.print("├─────────────────────────── QUICK CHECKS ──────────────────────────────┤");
     ns.print(`│ Files      ${missingFiles.length === 0 ? "PASS" : "FAIL"}`);
     ns.print(`│ Discovery  ${servers.length > 0 ? "PASS" : "FAIL"}`);
     ns.print(`│ Workers    ${Object.values(workerRam).every((ram) => ram > 0) ? "PASS" : "FAIL"}`);
-    ns.print(`│ Targets    ${rankedTargets.length > 0 ? "PASS" : "WAIT"}`);
+    ns.print(`│ Planner    ${planner?.selectedTarget ? "PASS" : "WAIT"}`);
     ns.print(`│ Controller ${controller && !controllerStale ? "PASS" : "WAIT"}`);
     ns.print("└───────────────────────────────────────────────────────────────────────┘");
 }
@@ -129,12 +129,15 @@ function renderController(ns, controller, stale) {
     ns.print(`│ Reason       ${String(controller.reason ?? "")}`);
 }
 
-/** @param {NS} ns @param {object[]} targets */
-function renderTargetRanking(ns, targets) {
+/** @param {NS} ns @param {object[]} targets @param {object|null} planner */
+function renderTargetRanking(ns, targets, planner) {
     if (targets.length === 0) {
-        ns.print("│ No rooted money targets meet the current hacking level.");
+        ns.print("│ No cached planner data. Run hacking/planner.js.");
         return;
     }
+
+    const ageSeconds = Math.max(0, (Date.now() - Number(planner?.updatedAt ?? 0)) / 1000);
+    ns.print(`│ Cached plan  ${ageSeconds.toFixed(0)}s old | hacking level ${String(planner?.hackingLevel ?? "?")}`);
 
     for (const target of targets.slice(0, 6)) {
         const rank = `#${target.rank}`.padEnd(4);
