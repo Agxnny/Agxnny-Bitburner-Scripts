@@ -1,3 +1,5 @@
+import { positionalArgs, quietArgs, tprint } from "/lib/output.js";
+
 /**
  * Prepare the automation stack after a clean pull or before a test run.
  *
@@ -6,35 +8,37 @@
  *   2. deploy workers + tactical-planner dependencies to rooted RAM hosts,
  *   3. start the persistent controller.
  *
- * Each setup step synchronously replaces the previous one with spawnDelay 0, so
- * their RAM costs never overlap and no delayed kickstart stages are left queued.
+ * Run with --quiet to suppress setup/background printouts. The flag is propagated
+ * through the full launch chain so later dashboard/GUI operation can stay clean.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     if (ns.getHostname() !== "home") {
-        ns.tprint("ERROR: Run kickstart.js from home.");
+        tprint(ns, "ERROR: Run kickstart.js from home.");
         return;
     }
 
-    const stage = Math.max(0, Math.floor(Number(ns.args[0] ?? 0)));
+    const args = positionalArgs(ns);
+    const stage = Math.max(0, Math.floor(Number(args[0] ?? 0)));
+    const inheritedQuiet = quietArgs(ns);
     const spawnOptions = { threads: 1, spawnDelay: 0 };
 
     if (stage === 0) {
-        ns.tprint("=== KICKSTART ===");
-        ns.tprint("1/3 Refreshing planner state...");
-        ns.spawn("/hacking/planner.js", spawnOptions, "--kickstart", 1);
+        tprint(ns, "=== KICKSTART ===");
+        tprint(ns, "1/3 Refreshing planner state...");
+        ns.spawn("/hacking/planner.js", spawnOptions, "--kickstart", 1, ...inheritedQuiet);
     }
 
     if (stage === 1) {
-        ns.tprint("2/3 Deploying execution files...");
-        ns.spawn("/network/deploy.js", spawnOptions, "--kickstart", 2);
+        tprint(ns, "2/3 Deploying execution files...");
+        ns.spawn("/network/deploy.js", spawnOptions, "--kickstart", 2, ...inheritedQuiet);
     }
 
     if (stage === 2) {
-        ns.tprint("3/3 Starting controller...");
-        ns.spawn("/hacking/controller.js", spawnOptions);
+        tprint(ns, "3/3 Starting controller...");
+        ns.spawn("/hacking/controller.js", spawnOptions, ...inheritedQuiet);
     }
 
-    ns.tprint(`ERROR: Unknown kickstart stage ${stage}.`);
+    tprint(ns, `ERROR: Unknown kickstart stage ${stage}.`);
 }
