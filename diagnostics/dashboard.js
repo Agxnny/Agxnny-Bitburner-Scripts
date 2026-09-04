@@ -82,7 +82,7 @@ function render(ns) {
     ns.print("├─────────────────────────── QUICK CHECKS ──────────────────────────────┤");
     ns.print(`│ Planner    ${planner?.selectedTarget ? "PASS" : "WAIT"}`);
     ns.print(`│ Network    ${Number(network?.discovered ?? 0) > 0 ? "PASS" : "WAIT"}`);
-    ns.print(`│ Workers    ${["/hacking/workers/hack.js", "/hacking/workers/grow.js", "/hacking/workers/workers/weaken.js"].every((path) => Number(workerRam[path] ?? 0) > 0) ? "PASS" : "WAIT"}`);
+    ns.print(`│ Workers    ${["/hacking/workers/hack.js", "/hacking/workers/grow.js", "/hacking/workers/weaken.js"].every((path) => Number(workerRam[path] ?? 0) > 0) ? "PASS" : "WAIT"}`);
     ns.print(`│ Controller ${controller && !controllerStale ? "PASS" : "WAIT"}`);
     ns.print("└───────────────────────────────────────────────────────────────────────┘");
 }
