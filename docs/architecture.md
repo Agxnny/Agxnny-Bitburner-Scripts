@@ -60,7 +60,7 @@ Sequential tactical weaken/grow/hack execution.
 
 ### Automatic synchronized HWGW
 
-Current batching is intentionally **one complete batch at a time**.
+Current live batching is intentionally **one complete batch at a time**.
 
 The controller prepares the target, launches `hacking/batch-runner.js` remotely, waits for the full batch, then enforces a post-batch strategic-review barrier before another batch can launch.
 
@@ -76,6 +76,31 @@ WEAKEN_GROW       t0 + 3 × gap
 Default gap: 200 ms.
 
 The batch runner reserves the full remote worker footprint before launch. If the whole batch does not fit, no stage starts.
+
+## Pipeline scheduler prototype
+
+`hacking/batch-scheduler.js` is the first Stage 5 component, but it is currently **dry-run only**. It launches no workers and cannot replace the serialized runner yet.
+
+The scheduler models two independent timing controls:
+
+```text
+stage gap      = spacing H → W1 → G → W2 within one batch
+batch interval = spacing H(N) → H(N+1) between successive batches
+```
+
+This separation is critical because good within-batch timing does not guarantee that two neighboring batches cannot collide.
+
+The current dry-run planner builds a global landing calendar. Each stage is modeled as holding RAM from its calculated start time until its landing. A sweep across those start/finish events estimates peak aggregate remote RAM at candidate pipeline depths 1–12.
+
+When Port 15 contains a completed batch for the same target, its measured landing drift and allocation spread are used as conservative timing-safety inputs. The planner currently refuses to become aggressive from one sample: tuned timing never reduces below the requested stage gap, and rolling timing history is required before future automatic gap reduction.
+
+The dry-run analysis is published to **Port 16** and includes the tuned stage gap, tuned batch interval, stage template, calendar preview, simulated peak RAM, and advisory safe depth.
+
+The current RAM model is aggregate. A live scheduler must add **host-by-host time-window reservation**, because enough RAM globally does not guarantee that future stage allocations fit without fragmentation.
+
+Before live overlap, Port 14 must also change from a queue cleared by one serialized runner into a shared queue consumed by one scheduler that routes events by `batchId`.
+
+See `docs/BATCH_SCHEDULER.md` for the detailed pipeline milestones.
 
 ## Safe execution-mode transitions
 
@@ -150,6 +175,8 @@ The batch runner clears Port 14 immediately before launching a new batch. This i
 
 Batch-associated HACK events are ignored as standalone strategic checkpoints. `hacking/refresh.js` waits for Port 12 to report the entire batch `COMPLETE`. The controller then waits for a fresh economic-target snapshot before launching the next batch.
 
+That per-batch review barrier must be redesigned before a steady pipeline can run; otherwise every completed batch would stop new admissions.
+
 ## Remote-only worker policy
 
 `lib/execution.js` excludes home from worker capacity. If remote capacity is unavailable, automation waits instead of consuming control/UI RAM.
@@ -180,6 +207,7 @@ Batch-associated HACK events are ignored as standalone strategic checkpoints. `h
 | 13 | controller command queue |
 | 14 | batch landing-timing event queue |
 | 15 | latest completed batch state |
+| 16 | dry-run pipeline scheduler analysis |
 
 See `docs/RUNTIME_STATE.md` for the detailed state contract.
 
@@ -198,4 +226,6 @@ Stage 4 synchronized batching currently includes:
 - standalone active-worker ETA/late observability;
 - **current: repeated timing-margin measurement**.
 
-Stage 5 pipelining begins only after repeated timing measurements show understood and adequate landing margin. Automatic worker watchdog termination remains deferred until after this timing work is stable.
+Stage 5 work has begun with a non-executing pipeline scheduler that models stage-gap tuning, batch-interval tuning, a global landing calendar, and time-aware aggregate RAM. Live pipelining remains disabled until repeated timing data, rolling history, host-specific reservation, multi-batch Port 14 routing, and depth-2 safety/recovery logic are implemented.
+
+Automatic worker watchdog termination remains deferred until after batch timing is stable.
