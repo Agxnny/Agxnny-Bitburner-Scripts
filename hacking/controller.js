@@ -69,6 +69,16 @@ export async function main(ns) {
             recordFinishedBatch(ns, executionMode, finishedBatchJob);
         }
 
+        // A mode request is a scheduling barrier. Tactical analysis is safe to
+        // cancel immediately because it has no target-side effects; already
+        // running H/G/W workers or a batch are allowed to finish naturally.
+        if (executionMode.pending && tacticalJob) {
+            ns.kill(tacticalJob.pid, tacticalJob.hostname);
+            tacticalJob = null;
+            pendingRequestId = "";
+            executionMode.lastMessage = `Switching to ${executionMode.pending}; tactical analysis cancelled, waiting for active execution to reach a safe boundary`;
+        }
+
         const controllerIdle = activeJobs.length === 0 && !tacticalJob && !batchJob;
 
         if (executionMode.pending && controllerIdle) {
@@ -112,7 +122,16 @@ export async function main(ns) {
             activeOperation = null;
         }
 
-        if (batchJob) {
+        if (executionMode.pending) {
+            pendingRequestId = "";
+            state.tactical.status = `SWITCHING_${executionMode.pending}`;
+            const blockers = [];
+            if (activeJobs.length > 0) blockers.push(`${activeJobs.length} worker job(s)`);
+            if (batchJob) blockers.push("current batch");
+            state.reason = blockers.length
+                ? `Switching execution mode to ${executionMode.pending}; no new work will be scheduled while waiting for ${blockers.join(" + ")} to finish`
+                : `Switching execution mode to ${executionMode.pending}; waiting for safe boundary`;
+        } else if (batchJob) {
             pendingRequestId = "";
             state.tactical.status = "BATCH_RUNNING";
             state.reason = `Synchronized HWGW batch running on ${batchJob.hostname}`;
@@ -302,8 +321,12 @@ function consumeControllerRequests(ns, state, prep, targetControl, executionMode
         if (action === "SET_EXECUTION_MODE") {
             const mode = String(request?.mode ?? "").trim().toUpperCase();
             if (mode === "HGW" || mode === "BATCH") {
-                executionMode.pending = mode;
-                executionMode.lastMessage = `Execution mode change queued: ${mode}`;
+                if (mode === executionMode.mode && !executionMode.pending) {
+                    executionMode.lastMessage = mode === "BATCH" ? "Batched HWGW mode already active" : "Normal sequential HGW mode already active";
+                } else {
+                    executionMode.pending = mode;
+                    executionMode.lastMessage = `Switching execution mode to ${mode}; new work is paused until the current safe boundary`;
+                }
                 changed = true;
             }
         }
@@ -417,6 +440,8 @@ function syncExecutionModeState(state, executionMode, batchJob) {
     state.executionMode = {
         mode: executionMode.mode,
         pending: executionMode.pending,
+        transitioning: Boolean(executionMode.pending),
+        transitionTarget: executionMode.pending,
         batchGapMs: DEFAULT_BATCH_GAP_MS,
         batchRunning: Boolean(batchJob),
         batchRunnerHost: String(batchJob?.hostname ?? ""),
@@ -718,7 +743,7 @@ function getEstimatedActionTimeMs(state, action) {
 function printControllerState(ns, state) {
     ns.print("=== CONTROLLER STATE ===");
     ns.print(`Target:    ${state.hostname} | ${state.phase} | ${state.action}`);
-    ns.print(`Execution: ${state.executionMode?.mode ?? "HGW"}${state.executionMode?.batchRunning ? " / BATCH RUNNING" : state.executionMode?.awaitingReview ? " / REVIEW" : ""}`);
+    ns.print(`Execution: ${state.executionMode?.mode ?? "HGW"}${state.executionMode?.pending ? ` / SWITCHING → ${state.executionMode.pending}` : state.executionMode?.batchRunning ? " / BATCH RUNNING" : state.executionMode?.awaitingReview ? " / REVIEW" : ""}`);
     ns.print(`Targeting: ${state.targetControl?.mode ?? "AUTO"}${state.targetControl?.manualTarget ? ` / ${state.targetControl.manualTarget}` : ""}`);
     ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%) | desired ${(state.money.desiredPercent * 100).toFixed(0)}%`);
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
