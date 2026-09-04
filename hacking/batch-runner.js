@@ -102,6 +102,11 @@ export async function main(ns) {
     const maxMoney = ns.getServerMaxMoney(target);
     const security = ns.getServerSecurityLevel(target);
     const minSecurity = ns.getServerMinSecurityLevel(target);
+    const moneyPercent = maxMoney > 0 ? money / maxMoney : 0;
+    const securityDelta = Math.max(0, security - minSecurity);
+    const predicted = plan.state.predicted ?? {};
+    const predictedMoneyPercent = Number(predicted.finalMoneyPercent ?? 0);
+    const predictedSecurityDelta = Number(predicted.finalSecurityDelta ?? 0);
 
     const complete = {
         ...plan.state,
@@ -113,10 +118,14 @@ export async function main(ns) {
         final: {
             money,
             maxMoney,
-            moneyPercent: maxMoney > 0 ? money / maxMoney : 0,
+            moneyPercent,
             security,
             minSecurity,
-            securityDelta: Math.max(0, security - minSecurity),
+            securityDelta,
+        },
+        comparison: {
+            moneyPercentError: moneyPercent - predictedMoneyPercent,
+            securityDeltaError: securityDelta - predictedSecurityDelta,
         },
         updatedAt: finishedAt,
     };
@@ -124,7 +133,9 @@ export async function main(ns) {
 
     if (!quiet) {
         ns.tprint(`[BATCH] COMPLETE ${target} | ${(complete.actualHackFraction * 100).toFixed(1)}% hack | gap ${gapMs}ms | ${launched.length} job(s)`);
-        ns.tprint(`[BATCH] Final money ${(complete.final.moneyPercent * 100).toFixed(1)}% | security +${complete.final.securityDelta.toFixed(3)}`);
+        ns.tprint(`[BATCH] Predicted money ${(predictedMoneyPercent * 100).toFixed(2)}% | security +${predictedSecurityDelta.toFixed(3)}`);
+        ns.tprint(`[BATCH] Actual    money ${(moneyPercent * 100).toFixed(2)}% | security +${securityDelta.toFixed(3)}`);
+        ns.tprint(`[BATCH] Error     money ${(complete.comparison.moneyPercentError * 100).toFixed(3)}pp | security ${signed(complete.comparison.securityDeltaError, 3)}`);
     }
 }
 
@@ -137,8 +148,8 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
     const securityDelta = Math.max(0, security - minSecurity);
 
     const baseState = {
-        version: 1,
-        model: "SINGLE_HWGW_ADDITIONAL_MSEC_V1",
+        version: 2,
+        model: "SINGLE_HWGW_ADDITIONAL_MSEC_V2",
         batchId,
         target,
         plannerUpdatedAt: Number(planner?.updatedAt ?? 0),
@@ -148,6 +159,15 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
         runnerHost: ns.getHostname(),
         status: "PLANNING",
         reason: "",
+        initial: {
+            money,
+            maxMoney,
+            moneyPercent: maxMoney > 0 ? money / maxMoney : 0,
+            desiredMoney,
+            security,
+            minSecurity,
+            securityDelta,
+        },
         createdAt: Date.now(),
         updatedAt: Date.now(),
     };
@@ -175,6 +195,32 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
     const growSecurity = Math.max(0, ns.growthAnalyzeSecurity(growThreads));
     const weakenHackThreads = Math.max(1, Math.ceil(hackSecurity / weakenPerThread));
     const weakenGrowThreads = Math.max(1, Math.ceil(growSecurity / weakenPerThread));
+    const weakenHackEffect = weakenHackThreads * weakenPerThread;
+    const weakenGrowEffect = weakenGrowThreads * weakenPerThread;
+
+    // Recovery prediction follows the planned landing order and applies the
+    // minimum-security floor after each weaken. This gives later telemetry a
+    // stable expected baseline without requiring the GUI to duplicate batch math.
+    const predictedAfterHackMoney = Math.max(0, money * (1 - actualHackFraction));
+    const predictedFinalMoney = Math.min(maxMoney, predictedAfterHackMoney * recoveryMultiplier);
+    const predictedAfterHackSecurityDelta = securityDelta + hackSecurity;
+    const predictedAfterW1SecurityDelta = Math.max(0, predictedAfterHackSecurityDelta - weakenHackEffect);
+    const predictedAfterGrowSecurityDelta = predictedAfterW1SecurityDelta + growSecurity;
+    const predictedFinalSecurityDelta = Math.max(0, predictedAfterGrowSecurityDelta - weakenGrowEffect);
+
+    const predicted = {
+        afterHackMoney: predictedAfterHackMoney,
+        finalMoney: predictedFinalMoney,
+        finalMoneyPercent: maxMoney > 0 ? predictedFinalMoney / maxMoney : 0,
+        hackSecurityIncrease: hackSecurity,
+        growSecurityIncrease: growSecurity,
+        weakenHackEffect,
+        weakenGrowEffect,
+        afterHackSecurityDelta: predictedAfterHackSecurityDelta,
+        afterWeakenHackSecurityDelta: predictedAfterW1SecurityDelta,
+        afterGrowSecurityDelta: predictedAfterGrowSecurityDelta,
+        finalSecurityDelta: predictedFinalSecurityDelta,
+    };
 
     const times = {
         hack: ns.getHackTime(target),
@@ -201,6 +247,7 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
     if (!allocationResult.ok) return fail(baseState, allocationResult.reason, {
         actualHackFraction,
         threads: { hack: hackThreads, weakenHack: weakenHackThreads, grow: growThreads, weakenGrow: weakenGrowThreads },
+        predicted,
     });
 
     const totalRam = allocationResult.stages.reduce((sum, stage) => sum + stage.ram, 0);
@@ -211,8 +258,10 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
             status: "READY",
             reason: "Prepared target and full HWGW allocation fit the remote pool",
             actualHackFraction,
+            recoveryMultiplier,
             threads: { hack: hackThreads, weakenHack: weakenHackThreads, grow: growThreads, weakenGrow: weakenGrowThreads },
-            securityEffects: { hack: hackSecurity, grow: growSecurity },
+            securityEffects: { hack: hackSecurity, grow: growSecurity, weakenHack: weakenHackEffect, weakenGrow: weakenGrowEffect },
+            predicted,
             timing: {
                 ...times,
                 firstLandingAt,
@@ -277,6 +326,11 @@ function fail(baseState, reason, extra = {}) {
 function finiteCeil(value) {
     if (!Number.isFinite(value) || value <= 0) return 0;
     return Math.ceil(value);
+}
+
+function signed(value, digits = 3) {
+    const n = Number(value ?? 0);
+    return `${n >= 0 ? "+" : ""}${n.toFixed(digits)}`;
 }
 
 function clamp(value, minimum, maximum) {
