@@ -26,6 +26,7 @@
     "network/inspect.js",
     "network/root.js",
     "diagnostics/dashboard.js",
+    "diagnostics/economy-targets.js",
     "diagnostics/income.js",
     "diagnostics/progression.js",
     "diagnostics/test.js",
