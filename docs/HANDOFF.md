@@ -85,56 +85,66 @@ security recovery: 3.00 / 3.00
 standalone correction weaken: not required
 ```
 
-A following automatic cycle continued to size W2 correctly (`25H / 1W / 299G / 24W`). The corrected sizing has remained stable enough in live operation to advance to instrumentation, while continued passive observation remains useful.
+Following automatic cycles continued to size W2 correctly, including `25H / 1W / 299G / 24W`, and returned to the expected money/security baseline. The W2 sizing defect is considered sufficiently validated to proceed with timing instrumentation.
 
 ## Highest-priority known issue
 
-**Measure predicted-vs-actual batch recovery, then measure landing drift.**
+**Measure actual H/W1/G/W2 landing drift and stage ordering over repeated batches.**
 
-The original W2 defect was caused by calling:
+Recovery-model telemetry is already present in Port 12. The next timing layer is now implemented:
 
-```text
-ns.growthAnalyzeSecurity(growThreads, target, 1)
-```
+- workers receive their planned landing timestamp as a batch-only argument;
+- each completed batch worker writes a tiny timing event to **Port 14**;
+- the batch runner drains Port 14 while the batch is active;
+- if a stage is split across hosts, the stage's actual landing is the completion timestamp of its **last allocation**;
+- the earliest allocation completion and within-stage spread are also retained;
+- Port 12 batch state version 3 publishes aggregated landing telemetry.
 
-Supplying a host caps the security estimate to grow threads needed from the target's current money state. Because batch planning occurs on a prepared target, that produced effectively zero predicted future grow security. The runner now correctly uses:
-
-```text
-ns.growthAnalyzeSecurity(growThreads)
-```
-
-The next instrumentation layer is now implemented in `hacking/batch-runner.js`. Port 12 batch state version 2 records:
+The `landing` object now includes:
 
 ```text
-initial money/security state
-predicted money after HACK
-predicted final money / money percent
-predicted HACK security increase
-predicted GROW security increase
-predicted W1 weaken effect
-predicted W2 weaken effect
-predicted security delta after each stage
-actual final money/security
-predicted-vs-actual money error
-predicted-vs-actual security error
+expectedOrder
+actualOrder
+orderCorrect
+expectedJobs
+reportedJobs
+missingJobs
+minimumSpacingMs
+maxAbsLandingErrorMs
+adjacentSpacing[]
+stages[]
 ```
 
-This keeps recovery math in the batch runner rather than duplicating it in the GUI.
+Each stage result includes:
+
+```text
+plannedLandingAt
+firstCompletionAt
+actualLandingAt
+allocationSpreadMs
+landingErrorMs
+expectedJobs
+reportedJobs
+missingJobs
+complete
+```
+
+Port 14 is a temporary event queue for the currently serialized single-batch model. The batch runner clears stale timing events immediately before launch. This must be revisited when overlapping batches are introduced.
 
 ## Immediate next development sequence
 
 Recommended order:
 
 ```text
-1. Pull/restart and collect predicted-vs-actual recovery over several batches
-2. Confirm recovery-model error is consistently small
-3. Add actual stage completion timestamps / landing-error telemetry
-4. Measure landing drift and stage ordering over repeated batches
-5. Tune or adapt the landing gap if needed
+1. Pull/restart and collect Port 12 landing telemetry over several batches
+2. Confirm H → W1 → G → W2 actual order remains correct
+3. Measure maximum landing error, minimum adjacent spacing, and within-stage allocation spread
+4. Decide whether the fixed 200 ms gap has sufficient safety margin
+5. Tune or adapt the landing gap only if measurements justify it
 6. Only then implement overlapping/pipelined batches
 ```
 
-A useful acceptance criterion before pipelining is several consecutive automatic batches that recover money to the intended baseline and security to roughly `+0.00–0.05`, without standalone correction work, with measured landing order/drift understood.
+Before pipelining, several consecutive automatic batches should recover money/security correctly, require no standalone correction work, report all worker timing events, and preserve the intended landing order with understood timing margin.
 
 ## Important architectural constraints
 
@@ -167,6 +177,10 @@ React event callbacks must not call Netscript APIs. They may only update React-l
 `ui/dashboard.js` mounts its React tree once. The main loop refreshes a cached runtime snapshot and increments a plain-JS version counter; the mounted React root observes that version and re-renders without `clearLog()` / `printRaw()` remount churn.
 
 Tab selection is React-local and therefore immediate. Controller commands still cross the Netscript boundary through queued plain-JS requests processed by the main loop.
+
+### Batch timing events stay separate from strategic telemetry
+
+Port 4 remains the HACK event queue used by income/strategic refresh logic. Port 14 is dedicated to batch worker completion timing so GROW/WEAKEN timing events cannot accidentally trigger strategic review.
 
 ## Important user-facing controls
 
