@@ -1,11 +1,22 @@
 import { analyzeNetwork, getAvailablePortOpeners } from "/lib/network.js";
-import { isControllerStateStale, readControllerState, readPlannerState } from "/lib/runtime-state.js";
+import {
+    isControllerStateStale,
+    readControllerState,
+    readPlannerState,
+    readTacticalPlanState,
+} from "/lib/runtime-state.js";
+import { readTelemetryState } from "/lib/telemetry.js";
+import { buildProgressionAdvice, GoalType } from "/lib/progression.js";
 
 /**
  * Optional diagnostic dashboard.
  *
  * This remains read-only. Target rankings are consumed from the planner's cached
  * snapshot instead of recomputed here, reducing duplicate analysis work.
+ *
+ * The dashboard intentionally does not mirror every standalone diagnostic. It
+ * only carries compact live checks for subsystems where continuous visibility is
+ * useful while developing the automation.
  *
  * @param {NS} ns
  */
@@ -14,7 +25,7 @@ export async function main(ns) {
 
     ns.ui.openTail();
     ns.ui.setTailTitle("Bitburner Control - Diagnostics");
-    ns.ui.resizeTail(860, 900);
+    ns.ui.resizeTail(860, 970);
 
     while (true) {
         render(ns);
@@ -27,9 +38,12 @@ function render(ns) {
     const servers = analyzeNetwork(ns);
     const tools = getAvailablePortOpeners(ns);
     const planner = readPlannerState(ns);
+    const tactical = readTacticalPlanState(ns);
     const rankedTargets = Array.isArray(planner?.rankings) ? planner.rankings : [];
     const controller = readControllerState(ns);
     const controllerStale = isControllerStateStale(controller);
+    const telemetry = readTelemetryState(ns);
+    const progression = buildProgressionAdvice(ns, telemetry);
 
     const rooted = servers.filter((s) => s.hasRoot);
     const rootable = servers.filter((s) => !s.hasRoot && s.canRootNow);
@@ -50,9 +64,11 @@ function render(ns) {
         "hacking/workers/weaken.js",
         "lib/execution.js",
         "lib/network.js",
+        "lib/progression.js",
         "lib/runtime-state.js",
         "lib/state.js",
         "lib/targets.js",
+        "lib/telemetry.js",
         "network/deploy.js",
         "network/inspect.js",
         "network/root.js",
@@ -94,6 +110,9 @@ function render(ns) {
     ns.print("├────────────────────────── TARGET RANKING ─────────────────────────────┤");
     renderTargetRanking(ns, rankedTargets, planner);
 
+    ns.print("├──────────────────────── LIVE FUNCTION CHECKS ────────────────────────┤");
+    renderLiveChecks(ns, { controller, controllerStale, planner, tactical, telemetry, progression });
+
     ns.print("├─────────────────────────── QUICK CHECKS ──────────────────────────────┤");
     ns.print(`│ Files      ${missingFiles.length === 0 ? "PASS" : "FAIL"}`);
     ns.print(`│ Discovery  ${servers.length > 0 ? "PASS" : "FAIL"}`);
@@ -101,6 +120,43 @@ function render(ns) {
     ns.print(`│ Planner    ${planner?.selectedTarget ? "PASS" : "WAIT"}`);
     ns.print(`│ Controller ${controller && !controllerStale ? "PASS" : "WAIT"}`);
     ns.print("└───────────────────────────────────────────────────────────────────────┘");
+}
+
+function renderLiveChecks(ns, state) {
+    const telemetryAge = state.telemetry?.updatedAt
+        ? Math.max(0, Date.now() - Number(state.telemetry.updatedAt))
+        : Infinity;
+    const telemetryHealthy = Boolean(state.telemetry) && telemetryAge <= 5000;
+
+    const tacticalAge = state.tactical?.updatedAt
+        ? Math.max(0, Date.now() - Number(state.tactical.updatedAt))
+        : Infinity;
+    const tacticalHealthy = Boolean(state.tactical) && tacticalAge <= 15000;
+
+    const advice = state.progression;
+    const selected = advice?.selected;
+    const home = advice?.candidates?.find((candidate) => candidate.type === GoalType.HOME_RAM);
+    const cloud = advice?.candidates?.find((candidate) => candidate.type === GoalType.PURCHASED_SERVER);
+    const homeCore = advice?.context?.homeCore;
+    const advisorHealthy = Number(advice?.version ?? 0) >= 4
+        && Boolean(selected?.id)
+        && Array.isArray(advice?.candidates)
+        && Boolean(home)
+        && (Boolean(cloud) || Number(advice?.context?.cloud?.owned ?? 0) >= Number(advice?.context?.cloud?.serverLimit ?? Infinity));
+
+    ns.print(`│ Controller state   ${state.controller && !state.controllerStale ? "PASS" : "WAIT"}`);
+    ns.print(`│ Planner state      ${state.planner?.selectedTarget ? "PASS" : "WAIT"}`);
+    ns.print(`│ Tactical state     ${tacticalHealthy ? `PASS (${formatAge(tacticalAge)})` : state.tactical ? `STALE (${formatAge(tacticalAge)})` : "WAIT"}`);
+    ns.print(`│ Income telemetry   ${telemetryHealthy ? `PASS (${formatAge(telemetryAge)})` : state.telemetry ? `STALE (${formatAge(telemetryAge)})` : "WAIT"}`);
+    ns.print(`│ Progression logic  ${advisorHealthy ? "PASS" : "FAIL"} | v${Number(advice?.version ?? 0)} | ${String(selected?.type ?? "none")}`);
+
+    if (homeCore) {
+        ns.print(`│ Home threshold     ${Number(advice.context.homeRam ?? 0)}GB / ${Number(homeCore.thresholdRam ?? 0)}GB | ${homeCore.belowThreshold ? "BOOSTED" : "NORMAL"}`);
+    }
+
+    if (selected) {
+        ns.print(`│ Advisor selection  ${selected.title} | value ${Number(selected.valueScore ?? 0).toFixed(2)}`);
+    }
 }
 
 /** @param {NS} ns @param {object|null} controller @param {boolean} stale */
@@ -179,6 +235,12 @@ function formatMoney(value) {
 function formatRank(rank) {
     const value = Number(rank);
     return value > 0 ? `#${value}` : "manual";
+}
+
+function formatAge(milliseconds) {
+    if (!Number.isFinite(milliseconds)) return "unknown";
+    if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`;
+    return `${(milliseconds / 1000).toFixed(1)}s`;
 }
 
 /** @param {NS} ns @param {number} score */
