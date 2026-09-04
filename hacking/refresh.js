@@ -1,4 +1,4 @@
-import { readPlannerState, readRootState } from "/lib/runtime-state.js";
+import { readCloudPurchaseState, readPlannerState, readRootState } from "/lib/runtime-state.js";
 import { readTelemetryState } from "/lib/telemetry.js";
 import { isQuiet, quietArgs } from "/lib/output.js";
 
@@ -7,20 +7,18 @@ const ROOT_SCRIPT = "/network/root.js";
 const PLANNER_SCRIPT = "/hacking/planner.js";
 const SYNC_SCRIPT = "/network/sync.js";
 const ECONOMY_SCRIPT = "/hacking/economy-planner.js";
+const CLOUD_BUY_SCRIPT = "/network/cloud-buy.js";
 const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
 
 /**
  * Persistent remote refresh coordinator.
  *
- * Heavy target/RAM analysis is event-driven rather than timer-driven. This
- * coordinator performs lightweight rooting checks every 30 seconds, and runs the
- * full planner only after either:
- *   - a HACK has completed, or
- *   - the rooting pass gained one or more new servers.
- *
- * Newly rooted RAM hosts are synced immediately after the planner discovers them,
- * so they can join the worker pool without rerunning the heavy startup deploy on
- * the 8GB home node.
+ * Heavy target/RAM analysis is event-driven. The coordinator performs lightweight
+ * rooting checks every 30 seconds and runs the full strategic chain after a HACK
+ * or execution-pool expansion. When the progression advisor selects an affordable
+ * new cloud server, one server may be purchased per strategic refresh. A purchase
+ * immediately triggers planner + sync again so the new RAM joins the pool before
+ * target selection finishes.
  *
  * @param {NS} ns
  */
@@ -34,11 +32,8 @@ export async function main(ns) {
 
     while (true) {
         if (!startupEconomyDone) {
-            const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
-            if (economyOk) {
-                const targetOk = await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
-                if (targetOk) startupEconomyDone = true;
-            }
+            const result = await runEconomyPurchaseTargetChain(ns);
+            if (result.ok) startupEconomyDone = true;
         }
 
         const now = Date.now();
@@ -64,17 +59,15 @@ export async function main(ns) {
             const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT, true);
             if (plannerOk) {
                 await launchAndWait(ns, SYNC_SCRIPT, true);
-                const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
-                if (economyOk) {
-                    const targetOk = await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
-                    if (targetOk) {
-                        if (hackNeedsReview) lastReviewedHackAt = hackCompletedAt;
-                        if (!isQuiet(ns)) {
-                            const reason = hackNeedsReview && rootExpansion
-                                ? "HACK completion + new root access"
-                                : hackNeedsReview ? "HACK completion" : "new root access";
-                            ns.print(`Target/RAM review complete after ${reason}.`);
-                        }
+                const result = await runEconomyPurchaseTargetChain(ns);
+                if (result.ok) {
+                    if (hackNeedsReview) lastReviewedHackAt = hackCompletedAt;
+                    if (!isQuiet(ns)) {
+                        const reasons = [];
+                        if (hackNeedsReview) reasons.push("HACK completion");
+                        if (rootExpansion) reasons.push("new root access");
+                        if (result.purchased) reasons.push(`cloud purchase ${result.hostname}`);
+                        ns.print(`Target/RAM review complete after ${reasons.join(" + ")}.`);
                     }
                 }
             }
@@ -82,6 +75,42 @@ export async function main(ns) {
 
         await ns.sleep(250);
     }
+}
+
+/**
+ * Refresh progression state, optionally buy exactly one advisor-selected cloud
+ * server, then publish the final economic target decision. Never loops purchases
+ * in one pass, so a large cash balance cannot drain the account in one refresh.
+ */
+async function runEconomyPurchaseTargetChain(ns) {
+    const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
+    if (!economyOk) return { ok: false, purchased: false, hostname: "" };
+
+    const previousPurchaseAt = Number(readCloudPurchaseState(ns)?.updatedAt ?? 0);
+    const buyerOk = await launchAndWait(ns, CLOUD_BUY_SCRIPT, true);
+    let purchased = false;
+    let hostname = "";
+
+    if (buyerOk) {
+        const purchase = readCloudPurchaseState(ns);
+        purchased = Boolean(purchase?.purchased) && Number(purchase?.updatedAt ?? 0) > previousPurchaseAt;
+        hostname = purchased ? String(purchase?.hostname ?? "") : "";
+    }
+
+    if (purchased) {
+        const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT, true);
+        if (!plannerOk) return { ok: false, purchased, hostname };
+        await launchAndWait(ns, SYNC_SCRIPT, true);
+
+        // Recalculate progression once after the purchase so Port 7 reflects the
+        // reduced cash/new server count. Do not invoke the buyer a second time in
+        // this same strategic pass.
+        const refreshedEconomyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
+        if (!refreshedEconomyOk) return { ok: false, purchased, hostname };
+    }
+
+    const targetOk = await launchAndWait(ns, ECONOMIC_TARGET_SCRIPT);
+    return { ok: targetOk, purchased, hostname };
 }
 
 async function launchAndWait(ns, script, forceQuiet = false) {
