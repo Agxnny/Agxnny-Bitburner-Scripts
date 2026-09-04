@@ -39,6 +39,8 @@ Current fields include concepts equivalent to:
 ```text
 mode: HGW | BATCH
 pending: requested mode change, if any
+transitioning: whether a safe-boundary mode handoff is in progress
+transitionTarget: pending target mode
 batchGapMs: current synchronized landing gap
 batchRunning: whether batch coordinator is active
 batchRunnerHost: remote coordinator host
@@ -47,6 +49,41 @@ batchCompletedAt: completed batch timestamp used by barrier
 lastBatchId: latest completed batch id
 lastMessage: user-facing controller explanation
 ```
+
+### `execution.activeWorkers`
+
+Standalone/distributed H/G/W allocations launched by the controller are published for GUI observability while they remain active.
+
+Each entry includes:
+
+```text
+pid
+hostname
+threads
+action
+target
+startedAt
+expectedDurationMs
+expectedFinishAt
+```
+
+The estimate is captured when the tactical action is dispatched. It is observational data, not a watchdog contract.
+
+### `execution.currentAction`
+
+When standalone H/G/W allocations are active, the controller also publishes an aggregate summary:
+
+```text
+action
+target
+startedAt
+expectedDurationMs
+expectedFinishAt
+```
+
+The GUI uses this for a simple current-action ETA. When no standalone workers are active this field is `null`.
+
+The current GUI may label a worker `LATE` after its estimate plus an observation margin of `max(5s, 15%)`. This is presentation-only: **no worker is automatically killed yet**.
 
 ## Ports 2–11
 
@@ -82,6 +119,20 @@ READY → RUNNING → COMPLETE
 Current batch-state schema version is `3` with model `SINGLE_HWGW_ADDITIONAL_MSEC_V3`.
 
 Core fields include batch id, target, status/reason, requested/actual hack fraction, gap, H/W1/G/W2 thread counts, stage allocations, planned landing timestamps, total RAM, recovery telemetry, final money/security, and landing telemetry.
+
+### Planned timing fields
+
+The current batch state includes planned timing values used by the Batch GUI:
+
+```text
+timing.firstLandingAt
+timing.lastLandingAt
+timing.landingWindowMs
+stages[].landingAt
+launchStartedAt
+```
+
+These support a planned total-duration estimate, per-stage landing countdowns, and a countdown to final W2 landing while the batch is active.
 
 ### Recovery-model telemetry
 
@@ -121,7 +172,7 @@ complete
 
 A stage may be allocated across several hosts. Its `actualLandingAt` is the latest completion timestamp among all allocations for that stage; `firstCompletionAt` and `allocationSpreadMs` expose how widely split allocations completed.
 
-Port 12 is intentionally the **current/latest batch** slot. Once another batch begins it may replace the just-completed state.
+Port 12 is intentionally the **current/latest batch** slot. Once another batch begins it may replace the just-completed state. The Overview GUI therefore does not treat a stale `COMPLETE` payload as an active batch.
 
 ## Port 13 — controller command queue
 
