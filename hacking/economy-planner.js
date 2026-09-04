@@ -17,7 +17,7 @@ export async function main(ns) {
     const selected = advice?.selected ?? null;
 
     const snapshot = {
-        version: 1,
+        version: 2,
         updatedAt: Date.now(),
         mode: String(advice?.mode ?? "OBSERVING"),
         cash: Math.max(0, Number(advice?.context?.cash ?? 0)),
@@ -33,6 +33,7 @@ export async function main(ns) {
             ready: Boolean(selected.ready),
             valueScore: Number(selected.valueScore ?? 0),
             recommendation: String(selected.recommendation ?? ""),
+            metadata: selected.metadata ?? {},
         } : null,
         candidates: Array.isArray(advice?.candidates)
             ? advice.candidates.slice(0, 5).map((candidate) => ({
@@ -43,6 +44,7 @@ export async function main(ns) {
                 remaining: Math.max(0, Number(candidate.remaining ?? 0)),
                 ready: Boolean(candidate.ready),
                 valueScore: Number(candidate.valueScore ?? 0),
+                metadata: candidate.metadata ?? {},
             }))
             : [],
     };
