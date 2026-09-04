@@ -23,8 +23,17 @@ export async function main(ns) {
     ns.tprint(`Advice:      ${goal.recommendation}`);
     ns.tprint("");
     ns.tprint(`Candidates:  ${advice.candidates.length}`);
-    for (const candidate of advice.candidates) {
-        ns.tprint(`- ${candidate.type}: ${candidate.title} | priority ${candidate.priority} | ${candidate.ready ? "READY" : candidate.mode}`);
+
+    for (let i = 0; i < advice.candidates.length; i += 1) {
+        const candidate = advice.candidates[i];
+        const value = Number(candidate.valueScore ?? 0);
+        const addedRam = Number(candidate.valueMetrics?.addedRam ?? 0);
+        const ramPerMillion = Number(candidate.valueMetrics?.ramPerMillionDollars ?? 0);
+        const marker = i === 0 ? "<-- SELECTED" : "";
+
+        ns.tprint(`- ${candidate.type}: ${candidate.title} ${marker}`.trimEnd());
+        ns.tprint(`  Cost $${ns.format.number(candidate.cost, 2)} | +${addedRam.toFixed(0)}GB | value ${value.toFixed(2)} | ${candidate.ready ? "READY" : candidate.mode}`);
+        ns.tprint(`  Raw RAM value: ${ramPerMillion.toFixed(2)} GB / $1m | model ${candidate.model?.valueModel ?? "unknown"}`);
     }
 }
 
