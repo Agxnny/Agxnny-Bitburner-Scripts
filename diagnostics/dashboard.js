@@ -6,8 +6,8 @@ import {
     readTacticalPlanState,
 } from "/lib/runtime-state.js";
 import { readTelemetryState } from "/lib/telemetry.js";
-import { buildProgressionAdvice, GoalType } from "/lib/progression.js";
 
+const DIAGNOSTIC_TEST_REQUEST_PORT = 6;
 const MANUAL_TESTS = Object.freeze([
     { id: "all", label: "Run smoke tests" },
     { id: "progression-advisor", label: "Test progression" },
@@ -16,25 +16,17 @@ const MANUAL_TESTS = Object.freeze([
 let manualTestStatus = "Ready";
 
 /**
- * Optional diagnostic dashboard.
- *
- * This remains read-only except for explicit user-clicked diagnostic test
- * launches. Target rankings are consumed from the planner's cached snapshot
- * instead of recomputed here, reducing duplicate analysis work.
- *
- * The dashboard intentionally does not mirror every standalone diagnostic. It
- * only carries compact live checks for subsystems where continuous visibility is
- * useful while developing the automation, plus a few manual buttons for tests
- * we may want to rerun on demand without putting them on timers.
+ * Read-only live dashboard plus explicit user-triggered manual test requests.
+ * Expensive progression analysis stays out of this process; the progression
+ * advisor is exercised through the manual test button instead.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     ns.disableLog("ALL");
-
     ns.ui.openTail();
     ns.ui.setTailTitle("Bitburner Control - Diagnostics");
-    ns.ui.resizeTail(860, 1030);
+    ns.ui.resizeTail(860, 1000);
 
     while (true) {
         render(ns);
@@ -52,7 +44,6 @@ function render(ns) {
     const controller = readControllerState(ns);
     const controllerStale = isControllerStateStale(controller);
     const telemetry = readTelemetryState(ns);
-    const progression = buildProgressionAdvice(ns, telemetry);
 
     const rooted = servers.filter((s) => s.hasRoot);
     const rootable = servers.filter((s) => !s.hasRoot && s.canRootNow);
@@ -73,7 +64,6 @@ function render(ns) {
         "hacking/workers/weaken.js",
         "lib/execution.js",
         "lib/network.js",
-        "lib/progression.js",
         "lib/runtime-state.js",
         "lib/state.js",
         "lib/targets.js",
@@ -83,6 +73,7 @@ function render(ns) {
         "network/root.js",
         "diagnostics/dashboard.js",
         "diagnostics/test.js",
+        "diagnostics/test-launcher.js",
     ];
 
     const missingFiles = requiredFiles.filter((file) => !ns.fileExists(file, "home"));
@@ -121,7 +112,7 @@ function render(ns) {
     renderTargetRanking(ns, rankedTargets, planner);
 
     ns.print("├──────────────────────── LIVE FUNCTION CHECKS ────────────────────────┤");
-    renderLiveChecks(ns, { controller, controllerStale, planner, tactical, telemetry, progression });
+    renderLiveChecks(ns, { controller, controllerStale, planner, tactical, telemetry });
 
     ns.print("├──────────────────────── MANUAL TEST CONTROLS ────────────────────────┤");
     renderManualTestControls(ns);
@@ -146,30 +137,11 @@ function renderLiveChecks(ns, state) {
         : Infinity;
     const tacticalHealthy = Boolean(state.tactical) && tacticalAge <= 15000;
 
-    const advice = state.progression;
-    const selected = advice?.selected;
-    const home = advice?.candidates?.find((candidate) => candidate.type === GoalType.HOME_RAM);
-    const cloud = advice?.candidates?.find((candidate) => candidate.type === GoalType.PURCHASED_SERVER);
-    const homeCore = advice?.context?.homeCore;
-    const advisorHealthy = Number(advice?.version ?? 0) >= 4
-        && Boolean(selected?.id)
-        && Array.isArray(advice?.candidates)
-        && Boolean(home)
-        && (Boolean(cloud) || Number(advice?.context?.cloud?.owned ?? 0) >= Number(advice?.context?.cloud?.serverLimit ?? Infinity));
-
     ns.print(`│ Controller state   ${state.controller && !state.controllerStale ? "PASS" : "WAIT"}`);
     ns.print(`│ Planner state      ${state.planner?.selectedTarget ? "PASS" : "WAIT"}`);
     ns.print(`│ Tactical state     ${tacticalHealthy ? `PASS (${formatAge(tacticalAge)})` : state.tactical ? `STALE (${formatAge(tacticalAge)})` : "WAIT"}`);
     ns.print(`│ Income telemetry   ${telemetryHealthy ? `PASS (${formatAge(telemetryAge)})` : state.telemetry ? `STALE (${formatAge(telemetryAge)})` : "WAIT"}`);
-    ns.print(`│ Progression logic  ${advisorHealthy ? "PASS" : "FAIL"} | v${Number(advice?.version ?? 0)} | ${String(selected?.type ?? "none")}`);
-
-    if (homeCore) {
-        ns.print(`│ Home threshold     ${Number(advice.context.homeRam ?? 0)}GB / ${Number(homeCore.thresholdRam ?? 0)}GB | ${homeCore.belowThreshold ? "BOOSTED" : "NORMAL"}`);
-    }
-
-    if (selected) {
-        ns.print(`│ Advisor selection  ${selected.title} | value ${Number(selected.valueScore ?? 0).toFixed(2)}`);
-    }
+    ns.print("│ Progression logic  MANUAL - use Test progression button");
 }
 
 /** @param {NS} ns */
@@ -178,7 +150,7 @@ function renderManualTestControls(ns) {
         "button",
         {
             key: test.id,
-            onClick: () => launchManualTest(ns, test),
+            onClick: () => queueManualTest(ns, test),
             style: {
                 marginRight: "8px",
                 marginBottom: "4px",
@@ -196,10 +168,7 @@ function renderManualTestControls(ns) {
 
     children.push(React.createElement(
         "span",
-        {
-            key: "status",
-            style: { marginLeft: "4px", fontFamily: "monospace", opacity: 0.85 },
-        },
+        { key: "status", style: { marginLeft: "4px", fontFamily: "monospace", opacity: 0.85 } },
         ` ${manualTestStatus}`,
     ));
 
@@ -210,12 +179,11 @@ function renderManualTestControls(ns) {
     ));
 }
 
-/** @param {NS} ns @param {{id:string,label:string}} test */
-function launchManualTest(ns, test) {
-    const pid = ns.run("/diagnostics/test.js", 1, test.id);
-    manualTestStatus = pid > 0
-        ? `${test.label} launched (pid ${pid})`
-        : `${test.label} could not start - check free home RAM`;
+/** Queue a test request; a remote launcher consumes Port 6 and runs the test. */
+function queueManualTest(ns, test) {
+    const request = JSON.stringify({ test: test.id, requestedAt: Date.now() });
+    ns.writePort(DIAGNOSTIC_TEST_REQUEST_PORT, request);
+    manualTestStatus = `${test.label} queued`;
 }
 
 /** @param {NS} ns @param {object|null} controller @param {boolean} stale */
@@ -284,7 +252,6 @@ function formatRam(gb) {
 function formatMoney(value) {
     const number = Number(value);
     if (!Number.isFinite(number)) return "$0";
-
     if (Math.abs(number) >= 1e9) return `$${(number / 1e9).toFixed(2)}b`;
     if (Math.abs(number) >= 1e6) return `$${(number / 1e6).toFixed(2)}m`;
     if (Math.abs(number) >= 1e3) return `$${(number / 1e3).toFixed(2)}k`;
