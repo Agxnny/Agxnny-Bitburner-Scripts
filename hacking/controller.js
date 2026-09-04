@@ -1,40 +1,39 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
-import { publishControllerState } from "/lib/runtime-state.js";
-import { analyzeTarget, rankEligibleTargets } from "/lib/targets.js";
+import { publishControllerState, readPlannerState } from "/lib/runtime-state.js";
 
 /**
- * Foundation controller with automatic target selection.
+ * Lightweight persistent HGW controller foundation.
  *
- * With no argument, the controller periodically selects the highest-ranked
- * currently-eligible money target. Supplying a hostname keeps manual-target
- * behavior for diagnostics and testing.
+ * AUTO mode consumes the latest snapshot from hacking/planner.js instead of
+ * performing network-wide target analysis itself. This keeps expensive analysis
+ * out of the always-running process. Supplying a hostname still forces MANUAL
+ * mode for diagnostics/testing.
  *
- * This still does not launch workers. Scheduling and thread calculations remain
- * separate layers that will consume the structured state built here.
+ * Workers are not launched yet; dispatcher/thread calculation comes next.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     const manualTarget = ns.args.length > 0 ? String(ns.args[0]) : null;
-    let state = createInitialState(ns, manualTarget);
+    let state = manualTarget
+        ? createManualState(manualTarget)
+        : createStateFromPlanner(readPlannerState(ns));
 
     if (!state) {
-        ns.tprint("ERROR: No currently-eligible money target was found.");
+        ns.tprint("ERROR: AUTO mode has no planner snapshot.");
+        ns.tprint("Run: run hacking/planner.js");
+        ns.tprint("Then start the controller again.");
         return;
     }
 
     ns.disableLog("sleep");
 
-    let nextAutoSelectionAt = 0;
-
     while (true) {
-        if (!manualTarget && Date.now() >= nextAutoSelectionAt) {
-            state = refreshAutomaticSelection(ns, state);
-            nextAutoSelectionAt = Date.now() + 5000;
+        if (!manualTarget) {
+            state = adoptLatestPlannerTarget(ns, state);
         }
 
-        const analysis = analyzeTarget(ns, state.hostname);
-        updateObservedState(state, analysis);
+        updateObservedState(ns, state);
         chooseFoundationAction(state);
         publishControllerState(ns, state);
 
@@ -45,81 +44,86 @@ export async function main(ns) {
     }
 }
 
-/** @param {NS} ns @param {string|null} manualTarget */
-function createInitialState(ns, manualTarget) {
-    if (manualTarget) {
-        const analysis = analyzeTarget(ns, manualTarget);
-        const state = createTargetState(manualTarget);
-        applyAnalysis(state, analysis, "MANUAL", 0);
-        return state;
-    }
-
-    const best = rankEligibleTargets(ns)[0];
-    if (!best) return null;
-
-    const state = createTargetState(best.hostname);
-    applyAnalysis(state, best, "AUTO", best.rank);
+/** @param {string} hostname */
+function createManualState(hostname) {
+    const state = createTargetState(hostname);
+    state.selection.mode = "MANUAL";
+    state.selection.rank = 0;
     return state;
 }
 
-/** @param {NS} ns @param {ReturnType<createTargetState>} currentState */
-function refreshAutomaticSelection(ns, currentState) {
-    const ranked = rankEligibleTargets(ns);
-    const best = ranked[0];
-    if (!best) return currentState;
+/** @param {object|null} planner */
+function createStateFromPlanner(planner) {
+    const selected = planner?.selectedTarget;
+    if (!selected?.hostname) return null;
 
-    if (best.hostname !== currentState.hostname) {
-        const nextState = createTargetState(best.hostname);
-        applyAnalysis(nextState, best, "AUTO", best.rank);
+    const state = createTargetState(selected.hostname);
+    applyPlannerAnalysis(state, selected);
+    return state;
+}
+
+/**
+ * AUTO controllers can adopt a newly-published plan without carrying the
+ * planner's analysis RAM cost themselves.
+ *
+ * @param {NS} ns
+ * @param {ReturnType<createTargetState>} currentState
+ */
+function adoptLatestPlannerTarget(ns, currentState) {
+    const planner = readPlannerState(ns);
+    const selected = planner?.selectedTarget;
+    if (!selected?.hostname) return currentState;
+
+    if (selected.hostname !== currentState.hostname) {
+        const nextState = createTargetState(selected.hostname);
+        applyPlannerAnalysis(nextState, selected);
         return nextState;
     }
 
-    applyAnalysis(currentState, best, "AUTO", best.rank);
+    applyPlannerAnalysis(currentState, selected);
     return currentState;
 }
 
 /**
- * Copy analyzer output into the controller-owned state contract.
+ * Copy cached planner analysis into controller state. The controller does not
+ * recompute these fields; they remain the planner's latest snapshot until the
+ * planner is run again.
  *
  * @param {ReturnType<createTargetState>} state
- * @param {ReturnType<analyzeTarget>} analysis
- * @param {string} mode
- * @param {number} rank
+ * @param {object} analysis
  */
-function applyAnalysis(state, analysis, mode, rank) {
-    state.selection.mode = mode;
-    state.selection.rank = rank;
-    state.selection.score = analysis.score;
-    state.selection.scoreModel = analysis.scoreModel;
+function applyPlannerAnalysis(state, analysis) {
+    state.selection.mode = "AUTO";
+    state.selection.rank = Number(analysis.rank ?? 0);
+    state.selection.score = Number(analysis.score ?? 0);
+    state.selection.scoreModel = String(analysis.scoreModel ?? "");
 
-    state.analysis.hackChance = analysis.hacking.chance;
-    state.analysis.hackPercentPerThread = analysis.hacking.percentPerThread;
-    state.analysis.hackTimeMs = analysis.timing.hackMs;
-    state.analysis.growTimeMs = analysis.timing.growMs;
-    state.analysis.weakenTimeMs = analysis.timing.weakenMs;
-    state.analysis.growth = analysis.growth;
+    state.analysis.hackChance = Number(analysis.hacking?.chance ?? 0);
+    state.analysis.hackPercentPerThread = Number(analysis.hacking?.percentPerThread ?? 0);
+    state.analysis.hackTimeMs = Number(analysis.timing?.hackMs ?? 0);
+    state.analysis.growTimeMs = Number(analysis.timing?.growMs ?? 0);
+    state.analysis.weakenTimeMs = Number(analysis.timing?.weakenMs ?? 0);
+    state.analysis.growth = Number(analysis.growth ?? 0);
 
-    state.strategy.score = analysis.score;
-    state.strategy.expectedIncomePerSecond = analysis.score;
+    state.strategy.score = state.selection.score;
+    state.strategy.expectedIncomePerSecond = state.selection.score;
 }
 
 /**
- * Refresh volatile target observations from the analyzer snapshot.
+ * Refresh only the volatile observations needed for phase decisions.
+ * No hack-analysis, timing, or network-wide ranking APIs are used here.
  *
+ * @param {NS} ns
  * @param {ReturnType<createTargetState>} state
- * @param {ReturnType<analyzeTarget>} analysis
  */
-function updateObservedState(state, analysis) {
-    state.money.current = analysis.money.current;
-    state.money.max = analysis.money.max;
+function updateObservedState(ns, state) {
+    state.money.current = ns.getServerMoneyAvailable(state.hostname);
+    state.money.max = ns.getServerMaxMoney(state.hostname);
 
-    state.security.current = analysis.security.current;
-    state.security.minimum = analysis.security.minimum;
-    state.security.desired = analysis.security.minimum;
+    state.security.current = ns.getServerSecurityLevel(state.hostname);
+    state.security.minimum = ns.getServerMinSecurityLevel(state.hostname);
+    state.security.desired = state.security.minimum;
 
-    // Ranking inputs such as chance and timings can change with player/server
-    // state, so keep the live controller snapshot current between ranking passes.
-    applyAnalysis(state, analysis, state.selection.mode, state.selection.rank);
     state.updatedAt = Date.now();
 }
 
