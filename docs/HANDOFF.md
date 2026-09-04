@@ -17,8 +17,6 @@ After a major architectural change, refresh the documentation set before conside
 - `docs/architecture.md`
 - any directly affected reference docs in `docs/`
 
-Markdown documentation is not part of the in-game manifest and does not need to be downloaded into Bitburner unless desired for reference.
-
 ## Project objective
 
 Build a modular, low-RAM Bitburner automation system that evolves from simple distributed HGW into adaptive, synchronized, eventually pipelined/multi-target HWGW.
@@ -28,11 +26,8 @@ Core design goals:
 - Home is primarily the **control/UI plane**.
 - Rooted and purchased/cloud servers form the **remote execution plane**.
 - H/G/W workers remain minimal and dumb.
-- Expensive analysis runs as short-lived remote services where possible.
 - Important decisions are published as structured runtime state.
 - The GUI consumes state and sends commands; it does not own hacking logic.
-- Progression, purchasing, targeting, scheduling, and presentation remain separable layers.
-- Automatic systems should explain why they are waiting, blocked, or acting.
 - RAM efficiency is a first-class constraint.
 
 ## Current major milestone
@@ -64,8 +59,6 @@ repair target if recovery was imperfect
 next batch
 ```
 
-The strict review barrier is important: batch hack telemetry must **not** trigger strategy review before W1/G/W2 have finished.
-
 ## Latest live validation
 
 On 2026-09-05, the original automatic batch-mode production cycle on `sigma-cosmetics` exposed the W2 security-compensation defect:
@@ -76,72 +69,53 @@ money recovery: 100%
 security recovery: +1.13 above minimum
 ```
 
-After correcting the grow-security calculation, the first live corrected batch on the same target used:
+After correcting the grow-security calculation, corrected batches used approximately:
 
 ```text
-threads: 25H / 1W / 298G / 24W
+threads: 25H / 1W / 298–299G / 24W
 money recovery: 100%
-security recovery: 3.00 / 3.00
+security recovery: minimum
 standalone correction weaken: not required
 ```
 
-Following automatic cycles continued to size W2 correctly, including `25H / 1W / 299G / 24W`, and returned to the expected money/security baseline. The W2 sizing defect is considered sufficiently validated to proceed with timing instrumentation.
+The W2 sizing defect is considered validated enough to proceed with timing instrumentation.
 
 ## Highest-priority known issue
 
 **Measure actual H/W1/G/W2 landing drift and stage ordering over repeated batches.**
 
-Recovery-model telemetry is already present in Port 12. The next timing layer is now implemented:
+Recovery-model telemetry is already present in Port 12. Timing instrumentation is also implemented:
 
 - workers receive their planned landing timestamp as a batch-only argument;
-- each completed batch worker writes a tiny timing event to **Port 14**;
+- each completed batch worker writes a timing event to **Port 14**;
 - the batch runner drains Port 14 while the batch is active;
 - if a stage is split across hosts, the stage's actual landing is the completion timestamp of its **last allocation**;
-- the earliest allocation completion and within-stage spread are also retained;
-- Port 12 batch state version 3 publishes aggregated landing telemetry.
+- earliest completion and within-stage spread are retained;
+- Port 12 schema version 3 publishes aggregated landing telemetry.
 
-The `landing` object now includes:
+Port 12 is the current batch slot, so a new batch can overwrite the just-completed result. To keep completed measurements visible, every `COMPLETE` payload is now also copied to **Port 15**, the latest-completed batch snapshot.
 
-```text
-expectedOrder
-actualOrder
-orderCorrect
-expectedJobs
-reportedJobs
-missingJobs
-minimumSpacingMs
-maxAbsLandingErrorMs
-adjacentSpacing[]
-stages[]
-```
-
-Each stage result includes:
+The main GUI now has a dedicated **Batch** tab that reads both states:
 
 ```text
-plannedLandingAt
-firstCompletionAt
-actualLandingAt
-allocationSpreadMs
-landingErrorMs
-expectedJobs
-reportedJobs
-missingJobs
-complete
+Port 12 → current batch
+Port 15 → latest completed batch
 ```
 
-Port 14 is a temporary event queue for the currently serialized single-batch model. The batch runner clears stale timing events immediately before launch. This must be revisited when overlapping batches are introduced.
+The Batch tab shows current batch status, last completed recovery, actual stage order, minimum spacing, maximum drift, missing events, per-stage error/spread, and a **planned-vs-actual landing timeline**. Each H/W1/G/W2 row plots planned and actual completion markers on the same horizontal axis so systematic early/late landing is visible immediately.
 
 ## Immediate next development sequence
 
 Recommended order:
 
 ```text
-1. Pull/restart and collect Port 12 landing telemetry over several batches
-2. Confirm H → W1 → G → W2 actual order remains correct
-3. Measure maximum landing error, minimum adjacent spacing, and within-stage allocation spread
-4. Decide whether the fixed 200 ms gap has sufficient safety margin
-5. Tune or adapt the landing gap only if measurements justify it
-6. Only then implement overlapping/pipelined batches
+1. Pull/restart and allow at least one new batch to complete
+2. Inspect the Batch tab retained completed result
+3. Confirm H → W1 → G → W2 actual order remains correct
+4. Collect several samples of max landing error, minimum spacing, and allocation spread
+5. Decide whether the fixed 200 ms gap has sufficient safety margin
+6. Tune/adapt the gap only if measurements justify it
+7. Only then implement overlapping/pipelined batches
 ```
 
 Before pipelining, several consecutive automatic batches should recover money/security correctly, require no standalone correction work, report all worker timing events, and preserve the intended landing order with understood timing margin.
@@ -164,10 +138,6 @@ Standalone HGW hacks may trigger strategy review after completion. Batch-associa
 
 A manual cash goal blocks automatic cloud-server purchases and upgrades independently of possibly stale economy state.
 
-### Cloud capacity retry is independent of HACK completion
-
-`hacking/refresh.js` retries an already-selected, affordable cloud purchase/upgrade every few seconds. It does not require a hack event. The expensive planner/economy chain is rerun only after a successful capacity change or another strategic event.
-
 ### GUI React callbacks must stay Netscript-free
 
 React event callbacks must not call Netscript APIs. They may only update React-local presentation state or assign plain JS request/input state. Netscript port/file operations remain in the asynchronous dashboard loop.
@@ -182,26 +152,24 @@ Tab selection is React-local and therefore immediate. Controller commands still 
 
 Port 4 remains the HACK event queue used by income/strategic refresh logic. Port 14 is dedicated to batch worker completion timing so GROW/WEAKEN timing events cannot accidentally trigger strategic review.
 
+### Latest-completed batch is a snapshot, not history
+
+Port 15 retains one completed batch for GUI inspection. It is not yet a rolling history/statistics store. If timing trends across many batches are needed later, add a separate history layer rather than changing Port 15 semantics implicitly.
+
 ## Important user-facing controls
 
 Main GUI: `ui/dashboard.js`
 
-Overview:
+Tabs:
 
-- `Use normal HGW`
-- `Use batched HWGW`
-- `Prep target to 100%`
-- `Resume auto HGW / batching`
+- Overview
+- Targets
+- Economy
+- **Batch**
+- Network
+- Diagnostics
 
-Targets:
-
-- runtime manual target override;
-- clear manual target to return to economic auto-selection.
-
-Economy:
-
-- manual money goal / savings lock;
-- cloud automation state and reason.
+The Batch tab is now the primary synchronized-HWGW observability surface.
 
 ## Useful commands
 
@@ -234,8 +202,6 @@ Read docs/HANDOFF.md first, then inspect the current live files before editing a
 The current priority is the highest-priority known issue in the handoff document.
 Keep GitHub main as the source of truth and refresh the docs after major changes.
 ```
-
-Then fetch the actual files involved in the current task before proposing or writing code.
 
 ## Related documentation
 
