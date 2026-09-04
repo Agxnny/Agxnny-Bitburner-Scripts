@@ -28,6 +28,8 @@ export async function main(ns) {
     const branch = String(flags.branch);
     const baseUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}`;
     const manifestPath = "repo-manifest.json";
+    const selfPath = "gitpull.js";
+    const helperPath = "gitpull-self-update.js";
 
     ns.tprint(`Pulling ${owner}/${repo}@${branch}...`);
     ns.tprint("Clean pull: existing managed files will be removed and replaced.");
@@ -67,18 +69,14 @@ export async function main(ns) {
     }
 
     const files = manifest.files.map(String);
-    const selfPath = "gitpull.js";
-    const orderedFiles = [
-        ...files.filter((file) => file !== selfPath),
-        ...files.filter((file) => file === selfPath),
-    ];
+    const normalFiles = files.filter((file) => file !== selfPath);
 
     let succeeded = 0;
     let replaced = 0;
     let added = 0;
     const failed = [];
 
-    for (const file of orderedFiles) {
+    for (const file of normalFiles) {
         const existed = ns.fileExists(file, "home");
 
         if (existed) {
@@ -116,18 +114,37 @@ export async function main(ns) {
     ns.rm(manifestPath, "home");
 
     ns.tprint("");
-    ns.tprint("========== CLEAN PULL COMPLETE ==========");
-    ns.tprint(`Successful : ${succeeded}/${files.length}`);
+    ns.tprint("========== CLEAN PULL STATUS ==========");
+    ns.tprint(`Successful : ${succeeded}/${normalFiles.length} pre-handoff file(s)`);
     ns.tprint(`Replaced   : ${replaced}`);
     ns.tprint(`Added      : ${added}`);
     ns.tprint(`Failed     : ${failed.length}`);
 
-    if (failed.length === 0) {
-        ns.tprint("CONFIRMED: All managed files were freshly installed.");
-    } else {
+    if (failed.length > 0) {
         ns.tprint(`Failed files: ${failed.join(", ")}`);
         ns.tprint("WARNING: Failed files may be missing because clean pull removes the old copy first.");
+        ns.tprint("Self-update skipped because the main pull was not clean.");
+        return;
     }
+
+    if (!files.includes(selfPath)) {
+        ns.tprint(`WARNING: ${selfPath} is not listed in manifest.json.`);
+        ns.tprint("CONFIRMED: All other managed files were freshly installed.");
+        return;
+    }
+
+    if (!ns.fileExists(helperPath, "home")) {
+        ns.tprint(`ERROR: ${helperPath} is missing; cannot replace the running updater.`);
+        return;
+    }
+
+    ns.tprint("CONFIRMED: All non-running managed files were freshly installed.");
+    ns.tprint(`HANDOFF: Replacing ${selfPath} after this process exits...`);
+
+    // spawn() terminates this script before starting the helper. That allows the
+    // helper to delete and freshly download gitpull.js, which cannot be removed
+    // while it is the currently running script.
+    ns.spawn(helperPath, 1, owner, repo, branch);
 }
 
 /** @param {NS} ns */
@@ -135,4 +152,5 @@ function printHelp(ns) {
     ns.tprint("gitpull.js - clean-update Bitburner scripts from GitHub");
     ns.tprint("Usage: run gitpull.js [--branch main]");
     ns.tprint("Existing managed files are deleted before fresh copies are downloaded.");
+    ns.tprint("gitpull.js itself is replaced by a handoff helper after the updater exits.");
 }
