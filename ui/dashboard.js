@@ -2,6 +2,7 @@ import {
     RuntimePort,
     isControllerStateStale,
     publishManualMoneyGoalState,
+    readBatchState,
     readCloudPurchaseState,
     readControllerState,
     readEconomyState,
@@ -29,6 +30,7 @@ let goalStatus = "Ready";
 let controllerActionStatus = "Ready";
 let goalInput = "";
 let goalLabelInput = "";
+let manualTargetInput = "";
 let cachedState = null;
 let lastDataRefresh = 0;
 let dirty = true;
@@ -66,9 +68,7 @@ export async function main(ns) {
             const action = requestedControllerAction;
             requestedControllerAction = null;
             ns.writePort(RuntimePort.CONTROL_REQUESTS, JSON.stringify({ ...action, requestedAt: now }));
-            controllerActionStatus = action.action === "PREP_TARGET"
-                ? `Prep request queued for ${action.target || "current target"}`
-                : "Resume automatic HGW request queued";
+            controllerActionStatus = controllerStatusText(action);
             dirty = true;
         }
 
@@ -82,7 +82,8 @@ export async function main(ns) {
         }
 
         if (dirty) {
-            redraw(ns);
+            ns.clearLog();
+            ns.printRaw(renderApp(cachedState));
             dirty = false;
         }
 
@@ -101,19 +102,13 @@ function snapshot(ns) {
         root: readRootState(ns),
         purchase: readCloudPurchaseState(ns),
         manualGoal: readManualMoneyGoalState(ns),
+        batch: readBatchState(ns),
     };
 }
 
 async function applyGoalAction(ns, action, now) {
     if (action.type === "clear") {
-        const state = {
-            version: 1,
-            active: false,
-            targetCash: 0,
-            title: "",
-            updatedAt: now,
-            clearedAt: now,
-        };
+        const state = { version: 1, active: false, targetCash: 0, title: "", updatedAt: now, clearedAt: now };
         await ns.write(MANUAL_GOAL_CONFIG, JSON.stringify(state), "w");
         publishManualMoneyGoalState(ns, state);
         goalStatus = "Money goal cleared · automatic spending enabled";
@@ -127,22 +122,18 @@ async function applyGoalAction(ns, action, now) {
     }
 
     const title = String(action.label ?? "").trim() || "Manual cash goal";
-    const state = {
-        version: 1,
-        active: true,
-        targetCash,
-        title,
-        updatedAt: now,
-        setAt: now,
-    };
+    const state = { version: 1, active: true, targetCash, title, updatedAt: now, setAt: now };
     await ns.write(MANUAL_GOAL_CONFIG, JSON.stringify(state), "w");
     publishManualMoneyGoalState(ns, state);
     goalStatus = `Goal set to ${moneyFmt(targetCash)} · automatic spending locked`;
 }
 
-function redraw(ns) {
-    ns.clearLog();
-    ns.printRaw(renderApp(cachedState));
+function controllerStatusText(action) {
+    if (action.action === "PREP_TARGET") return `Prep request queued for ${action.target || "current target"}`;
+    if (action.action === "RESUME_AUTO") return "Resume automatic HGW request queued";
+    if (action.action === "SET_MANUAL_TARGET") return `Manual target request queued: ${action.target}`;
+    if (action.action === "CLEAR_MANUAL_TARGET") return "Automatic target selection request queued";
+    return "Controller request queued";
 }
 
 function renderApp(s) {
@@ -161,20 +152,22 @@ function renderApp(s) {
 function header(s) {
     const c = s.controller ?? {};
     const live = Boolean(s.controller) && !isControllerStateStale(s.controller);
-    const target = s.economic?.selectedTarget;
     const locked = Boolean(s.manualGoal?.active);
     const prep = c.prep ?? {};
+    const manualTarget = c.targetControl?.mode === "MANUAL";
+
     return el("div", { style: styles.header },
         el("div", null,
             el("div", { style: styles.eyebrow }, "AGXNNY AUTOMATION"),
             el("div", { style: styles.title }, "Bitburner Control Plane"),
-            el("div", { style: styles.subtitle }, target
-                ? `${target.hostname} • ${pct(target.moneyTargetPercent)} money strategy`
-                : "Waiting for economic strategy"),
+            el("div", { style: styles.subtitle }, c.hostname
+                ? `${c.hostname} • ${manualTarget ? "manual target" : "automatic target"}`
+                : "Waiting for controller target"),
         ),
         el("div", { style: styles.badges },
             badge(live ? "CONTROLLER ONLINE" : "CONTROLLER WAITING", live ? "good" : "dim"),
             badge(String(c.phase ?? "BOOTING"), live ? "accent" : "dim"),
+            manualTarget ? badge("MANUAL TARGET", "accent") : null,
             prep.active ? badge(`PREP ${prep.stage || "ACTIVE"}`, "warn") : null,
             prep.hold ? badge("PREPARED HOLD", "good") : null,
             badge(locked ? "SPENDING LOCKED" : "AUTO SPEND", locked ? "warn" : "good"),
@@ -205,6 +198,7 @@ function overviewView(s) {
     const exec = c.execution ?? {};
     const tele = s.telemetry ?? {};
     const goal = s.economy?.goal ?? {};
+    const batch = s.batch ?? {};
     const moneyProgress = Number(m.max ?? 0) > 0 ? Number(m.current ?? 0) / Number(m.max ?? 1) : 0;
 
     return el("div", null,
@@ -212,11 +206,12 @@ function overviewView(s) {
             heroMetric("TARGET", c.hostname ?? "waiting", `${c.phase ?? "—"} / ${c.action ?? "—"}`),
             heroMetric("INCOME · 5M", `${moneyFmt(tele.incomePerSecond5m)}/s`, `${Number(tele.hackEvents ?? 0)} hack events`),
             heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} execution hosts`),
-            heroMetric("CASH GOAL", moneyFmt(goal.remaining), goal.title ?? "No active goal"),
+            heroMetric("BATCH", batch.status ?? "idle", batch.hostname || "no batch active"),
         ),
         card("Target prep controls", prepControls(s), true),
         grid(
             card("Active HGW", el("div", null,
+                kv("Target mode", c.targetControl?.mode ?? "AUTO"),
                 kv("Desired money", pct(m.desiredPercent)),
                 progressBar(moneyProgress, `${pct(moneyProgress)} of server max`),
                 kv("Money", `${moneyFmt(m.current)} / ${moneyFmt(m.max)}`),
@@ -241,9 +236,7 @@ function prepControls(s) {
     const c = s.controller ?? {};
     const prep = c.prep ?? {};
     const target = String(c.hostname ?? "");
-    const mode = prep.hold ? "PREPARED / HOLDING"
-        : prep.active ? `PREP ${prep.stage || "ACTIVE"}`
-            : "AUTOMATIC HGW";
+    const mode = prep.hold ? "PREPARED / HOLDING" : prep.active ? `PREP ${prep.stage || "ACTIVE"}` : "AUTOMATIC HGW";
     const noTarget = !target;
 
     return el("div", null,
@@ -265,7 +258,7 @@ function prepControls(s) {
                 }, "Resume auto HGW"),
             ),
         ),
-        el("div", { style: styles.goalHint }, "Prep mode deliberately keeps growing even as security rises. Once money reaches 100%, it switches to weaken-only until minimum security, then holds the target prepared for batching."),
+        el("div", { style: styles.goalHint }, "Prep keeps growing even while security rises, then weakens to minimum and holds the target for batching."),
         el("div", { style: styles.goalStatus }, prep.lastMessage || controllerActionStatus),
     );
 }
@@ -274,9 +267,44 @@ function targetsView(s) {
     const selected = s.economic?.selectedTarget;
     const rankings = Array.isArray(s.economic?.rankings) ? s.economic.rankings : [];
     const rejected = Array.isArray(s.economic?.rejectedTargets) ? s.economic.rejectedTargets : [];
+    const targetControl = s.controller?.targetControl ?? {};
 
     return el("div", null,
-        selected ? card("Selected strategy", el("div", null,
+        card("Manual target override", el("div", null,
+            el("div", { style: styles.targetForm },
+                el("input", {
+                    value: manualTargetInput,
+                    placeholder: "Hostname · e.g. foodnstuff",
+                    onChange: (event) => { manualTargetInput = String(event.target.value ?? ""); },
+                    onKeyDown: (event) => {
+                        if (event.key === "Enter" && manualTargetInput.trim()) {
+                            requestedControllerAction = { action: "SET_MANUAL_TARGET", target: manualTargetInput.trim() };
+                        }
+                    },
+                    style: styles.input,
+                }),
+                el("button", {
+                    disabled: !manualTargetInput.trim(),
+                    onClick: () => {
+                        const target = manualTargetInput.trim();
+                        if (target) requestedControllerAction = { action: "SET_MANUAL_TARGET", target };
+                    },
+                    style: { ...styles.primaryButton, ...(!manualTargetInput.trim() ? styles.disabledButton : {}) },
+                }, "Set manual target"),
+                el("button", {
+                    onClick: () => { requestedControllerAction = { action: "CLEAR_MANUAL_TARGET" }; },
+                    style: styles.clearButton,
+                }, "Clear / auto target"),
+            ),
+            el("div", { style: styles.goalHint }, "Manual targeting overrides only the controller hostname. Clear it to return to the economic selector. Target changes wait for current workers/tactical analysis to finish."),
+            el("div", { style: styles.goalStatus }, targetControl.lastMessage || controllerActionStatus),
+            el("div", { style: styles.miniGrid },
+                kv("Controller mode", targetControl.mode ?? "AUTO"),
+                kv("Active target", s.controller?.hostname ?? "waiting"),
+                kv("Economic target", selected?.hostname ?? "waiting"),
+            ),
+        ), true),
+        selected ? card("Selected economic strategy", el("div", null,
             el("div", { style: styles.strategyTitle }, `${selected.hostname} · ${pct(selected.moneyTargetPercent)} money`),
             el("div", { style: styles.strategyStats },
                 stat("Prep", duration(selected.prepSeconds)),
@@ -285,8 +313,10 @@ function targetsView(s) {
                 stat("Economic ETA", duration(selected.economicEtaSeconds)),
             ),
             note(selected.reason ?? "No cached reason"),
-        ), true) : card("Selected strategy", note("Waiting for economic target state."), true),
-        card("Economic ranking", el("div", null, ...rankings.slice(0, 10).map((r, i) => targetRow(r, i))), true),
+        ), true) : card("Selected economic strategy", note("Waiting for economic target state."), true),
+        card("Economic ranking", rankings.length
+            ? el("div", null, ...rankings.slice(0, 10).map((r, i) => targetRow(r, i)))
+            : note("No economic ranking available yet."), true),
         card("Filtered targets", rejected.length
             ? el("div", null, ...rejected.slice(0, 8).map((r) => kv(String(r.hostname), String(r.reason ?? "filtered"))))
             : note("No targets currently filtered by the cash-relative value rule."), true),
@@ -328,7 +358,7 @@ function economyView(s) {
                     style: styles.clearButton,
                 }, "Clear goal / auto spend"),
             ),
-            el("div", { style: styles.goalHint }, "Accepts plain amounts or k / m / b / t suffixes. Setting a goal immediately locks automated purchases."),
+            el("div", { style: styles.goalHint }, "Accepts plain amounts or k / m / b / t suffixes. Setting a goal immediately locks automated cloud spending."),
             el("div", { style: styles.goalStatus }, goalStatus),
         ), true),
         grid(
@@ -343,17 +373,21 @@ function economyView(s) {
                 kv("Status", manual.active ? "ACTIVE" : "OFF"),
                 kv("Target", manual.active ? moneyFmt(manual.targetCash) : "—"),
                 kv("Label", manual.title || "—"),
-                kv("Auto purchasing", manual.active ? "BLOCKED" : "ENABLED"),
+                kv("Auto cloud spend", manual.active ? "BLOCKED" : "ENABLED"),
             )),
-            card("Cloud purchasing", el("div", null,
+            card("Cloud capacity automation", el("div", null,
                 kv("Status", purchase.status ?? "No state"),
-                kv("Last host", purchase.hostname || "—"),
-                kv("RAM", purchase.ram ? ramFmt(purchase.ram) : "—"),
-                note(purchase.reason ?? "No purchase activity yet"),
+                kv("Action", purchase.action ?? "NONE"),
+                kv("Server", purchase.hostname || "—"),
+                kv("RAM", purchase.targetRam ? `${ramFmt(purchase.previousRam)} → ${ramFmt(purchase.targetRam)}` : purchase.ram ? ramFmt(purchase.ram) : "—"),
+                kv("Cost", purchase.cost ? moneyFmt(purchase.cost) : "—"),
+                note(purchase.reason ?? "No cloud-capacity activity yet"),
             )),
-            card("Useful commands", el("div", null,
-                command("Check goal", "run economy/manual-goal.js status"),
-                command("Economy report", "run diagnostics/economy-targets.js"),
+            card("Automatic progression", el("div", null,
+                kv("Selected type", e.automaticGoal?.type ?? "—"),
+                kv("Selected goal", e.automaticGoal?.title ?? "—"),
+                kv("Ready", e.automaticGoal?.ready ? "YES" : "NO"),
+                note("Cloud purchases and upgrades execute only when the progression advisor selects that cloud action and no manual savings lock is active."),
             )),
         ),
     );
@@ -362,9 +396,7 @@ function economyView(s) {
 function networkView(s) {
     const n = s.planner?.network ?? {};
     const root = s.root ?? {};
-    const hosts = Array.isArray(s.planner?.executionHosts)
-        ? s.planner.executionHosts.filter((h) => h.hostname !== "home")
-        : [];
+    const hosts = Array.isArray(s.planner?.executionHosts) ? s.planner.executionHosts.filter((h) => h.hostname !== "home") : [];
     return el("div", null,
         el("div", { style: styles.heroGrid },
             heroMetric("DISCOVERED", String(n.discovered ?? 0), "network hosts"),
@@ -372,7 +404,7 @@ function networkView(s) {
             heroMetric("HGW TARGETS", String(n.hgwTargets ?? 0), "money servers"),
             heroMetric("PORT TOOLS", `${root.portToolCount ?? n.portToolCount ?? 0}/5`, age(root.updatedAt)),
         ),
-        card("Remote execution hosts", el("div", null, ...hosts.slice(0, 18).map(hostRow)), true),
+        card("Remote execution hosts", hosts.length ? el("div", null, ...hosts.slice(0, 18).map(hostRow)) : note("No remote execution hosts available."), true),
         card("Rooting status", el("div", null,
             kv("Rootable now", String(n.rootableNow ?? 0)),
             kv("Newly rooted", String(root.newlyRooted ?? 0)),
@@ -402,13 +434,13 @@ function diagnosticsView(s) {
             kv("Planner", age(s.planner?.updatedAt)),
             kv("Economy", age(s.economy?.updatedAt)),
             kv("Target strategy", age(s.economic?.updatedAt)),
-            kv("Root", age(s.root?.updatedAt)),
-            kv("Cloud purchase", age(s.purchase?.updatedAt)),
+            kv("Cloud capacity", age(s.purchase?.updatedAt)),
+            kv("Batch", age(s.batch?.updatedAt)),
         )),
         card("Commands", el("div", null,
             command("RAM audit", "run diagnostics/mem-audit.js"),
             command("Income report", "run diagnostics/income.js"),
-            command("Network inspect", "run network/inspect.js"),
+            command("Progression", "run diagnostics/progression.js"),
             command("Root check", "run network/root.js"),
         )),
     );
@@ -518,11 +550,7 @@ function parseMoney(value) {
     if (!match) return NaN;
     const number = Number(match[1]);
     const suffix = match[2];
-    const multiplier = suffix === "k" ? 1e3
-        : suffix === "m" ? 1e6
-            : suffix === "b" ? 1e9
-                : suffix === "t" ? 1e12
-                    : 1;
+    const multiplier = suffix === "k" ? 1e3 : suffix === "m" ? 1e6 : suffix === "b" ? 1e9 : suffix === "t" ? 1e12 : 1;
     return number * multiplier;
 }
 
@@ -602,8 +630,10 @@ const styles = {
     actionButton: { fontFamily: "monospace", marginRight: "8px", marginBottom: "8px", padding: "7px 10px", borderRadius: "5px", border: "1px solid #32536a", background: "#112334", color: "#b8dcf4", cursor: "pointer" },
     actionStatus: { color: "#7f8e9c", fontSize: "10px", marginTop: "4px" },
     goalForm: { display: "grid", gridTemplateColumns: "1.25fr 1fr auto auto", gap: "8px", alignItems: "center" },
+    targetForm: { display: "grid", gridTemplateColumns: "1fr auto auto", gap: "8px", alignItems: "center" },
     controlGrid: { display: "grid", gridTemplateColumns: "1fr auto", gap: "16px", alignItems: "center" },
     controlActions: { display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "flex-end" },
+    miniGrid: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: "10px", marginTop: "8px" },
     input: { minWidth: 0, fontFamily: "monospace", color: "#d8e1e9", background: "#0b1117", border: "1px solid #2b3945", borderRadius: "5px", padding: "8px 9px", outline: "none", fontSize: "11px" },
     primaryButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #2e5c7d", background: "#12304a", color: "#bfe4ff", cursor: "pointer", whiteSpace: "nowrap" },
     clearButton: { fontFamily: "monospace", padding: "8px 11px", borderRadius: "5px", border: "1px solid #5b4930", background: "#271e11", color: "#f0cf91", cursor: "pointer", whiteSpace: "nowrap" },
