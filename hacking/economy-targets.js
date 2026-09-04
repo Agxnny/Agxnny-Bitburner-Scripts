@@ -8,7 +8,6 @@ import {
 
 const DEFAULT_HACK_FRACTION = 0.10;
 const SECURITY_TOLERANCE = 0.5;
-const HOME_RESERVE_GB = 1;
 const PREP_PENALTY_SCALE_SECONDS = 30 * 60;
 const PREP_PENALTY_MAX_EXPONENT = 8;
 const MONEY_TARGET_CANDIDATES = Object.freeze([0.25, 0.40, 0.55, 0.70, 0.85, 1.00]);
@@ -32,8 +31,10 @@ const PLAYER_CASH_TO_SERVER_MAX_LIMIT = 1 + PLAYER_CASH_EXCESS_IGNORE_PERCENT / 
  * For every eligible server, evaluate several desired-money percentages rather
  * than assuming 100% preparation. Each strategy is charged for the live
  * security/grow work required to reach its desired money level using the real
- * distributed thread capacity available right now. Long prep is penalized
- * exponentially, then the strategy is compared by progression-goal ETA.
+ * distributed thread capacity available right now. Home is intentionally
+ * excluded from worker capacity so predictions match the remote-only HGW policy.
+ * Long prep is penalized exponentially, then the strategy is compared by
+ * progression-goal ETA.
  *
  * Targets below PARTIAL_PREP_MIN_SERVER_MAX_MONEY are always prepared to 100%
  * before production. Targets that are trivial relative to current player cash
@@ -60,6 +61,7 @@ export async function main(ns) {
         weakenRam,
         hackRam,
     });
+    if (execution.hostCount === 0) return;
 
     const weakenPerThread = Math.max(0.000001, Number(ns.weakenAnalyze(1)) || 0.05);
     const goalRemaining = Math.max(0, Number(economy?.goal?.remaining ?? 0));
@@ -85,7 +87,7 @@ export async function main(ns) {
     const selected = candidates[0] ?? null;
     const updatedAt = Date.now();
     publishEconomyTargetState(ns, {
-        version: 7,
+        version: 8,
         updatedAt,
         plannerUpdatedAt: Number(planner?.analysisUpdatedAt ?? planner?.updatedAt ?? 0),
         economyUpdatedAt: Number(economy?.updatedAt ?? 0),
@@ -123,7 +125,7 @@ export async function main(ns) {
                 ...planner,
                 updatedAt,
                 selectedTarget: selectedAnalysis,
-                selectionModel: "GOAL_ETA_ADAPTIVE_MONEY_VALUE_FILTER_V7",
+                selectionModel: "GOAL_ETA_ADAPTIVE_MONEY_REMOTE_WORKERS_V8",
                 economicSelection: {
                     hostname: selected.hostname,
                     baselineRank: selected.baselineRank,
@@ -363,11 +365,10 @@ function getLiveExecutionCapacity(ns, planner, workerRam) {
 
     for (const entry of hosts) {
         const hostname = String(entry?.hostname ?? "");
-        if (!hostname) continue;
+        if (!hostname || hostname === "home") continue;
         const maxRam = Math.max(0, Number(entry?.maxRam ?? 0));
         const usedRam = Math.max(0, Number(ns.getServerUsedRam(hostname)) || 0);
-        const reserve = hostname === "home" ? HOME_RESERVE_GB : 0;
-        const freeRam = Math.max(0, maxRam - usedRam - reserve);
+        const freeRam = Math.max(0, maxRam - usedRam);
         if (freeRam <= 0) continue;
 
         hostCount += 1;
@@ -378,6 +379,8 @@ function getLiveExecutionCapacity(ns, planner, workerRam) {
     }
 
     return {
+        policy: "REMOTE_ONLY",
+        excludesHome: true,
         hostCount,
         usableRam,
         growThreads: Math.max(1, growThreads),
