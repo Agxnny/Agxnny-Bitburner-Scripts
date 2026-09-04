@@ -4,6 +4,11 @@ import { DEFAULT_HOME_RESERVE_GB, WORKER_SCRIPTS, distributeThreads, getExecutio
 import { isQuiet, positionalArgs, quietArgs } from "/lib/output.js";
 
 const TACTICAL_PLANNER_SCRIPT = "/hacking/tactical-planner.js";
+const BATCH_RUNNER_SCRIPT = "/hacking/batch-runner.js";
+const DEFAULT_BATCH_GAP_MS = 200;
+const BATCH_SECURITY_TOLERANCE = 0.05;
+const BATCH_MONEY_TOLERANCE = 0.995;
+const BATCH_RETRY_MS = 2_000;
 const MAX_RECENT_EVENTS = 8;
 const EMPTY_PORT = "NULL PORT DATA";
 const PREP_MONEY_RATIO = 0.999999;
@@ -28,17 +33,20 @@ export async function main(ns) {
     let activeJobs = [];
     let activeOperation = null;
     let tacticalJob = null;
+    let batchJob = null;
+    let lastBatchAttemptAt = 0;
     let pendingRequestId = "";
     let requestSequence = 0;
     let jobSequence = 0;
     const recentEvents = [];
     const prep = createPrepMode();
     const targetControl = createTargetControl(manualTarget);
+    const executionMode = createExecutionMode();
 
     while (true) {
         planner = readPlannerState(ns);
 
-        if (consumeControllerRequests(ns, state, prep, targetControl)) {
+        if (consumeControllerRequests(ns, state, prep, targetControl, executionMode)) {
             pendingRequestId = "";
         }
 
@@ -47,15 +55,23 @@ export async function main(ns) {
         const operationJustFinished = hadActiveJobs && activeJobs.length === 0 && activeOperation;
 
         if (tacticalJob && !ns.isRunning(tacticalJob.pid, tacticalJob.hostname)) tacticalJob = null;
+        if (batchJob && !ns.isRunning(batchJob.pid, batchJob.hostname)) batchJob = null;
 
-        if (targetControl.pending && activeJobs.length === 0 && !tacticalJob) {
+        const controllerIdle = activeJobs.length === 0 && !tacticalJob && !batchJob;
+
+        if (executionMode.pending && controllerIdle) {
+            applyExecutionModeCommand(executionMode, prep);
+            pendingRequestId = "";
+        }
+
+        if (targetControl.pending && controllerIdle) {
             const result = applyTargetCommand(planner, state, prep, targetControl);
             state = result.state;
             manualTarget = targetControl.manualTarget;
             pendingRequestId = "";
         }
 
-        if (!manualTarget && !prep.active && !prep.hold && activeJobs.length === 0 && !tacticalJob) {
+        if (!manualTarget && !prep.active && !prep.hold && controllerIdle) {
             const previousTarget = state.hostname;
             const previousMoneyTarget = state.money.desiredPercent;
             state = adoptLatestPlannerTarget(planner, state);
@@ -66,10 +82,12 @@ export async function main(ns) {
         const previousPrepStage = prep.stage;
         if (prep.active) choosePrepAction(state, prep);
         else if (prep.hold) choosePrepHoldAction(state, prep);
+        else if (executionMode.mode === "BATCH") chooseBatchFoundationAction(state);
         else chooseFoundationAction(state);
         if (prep.stage !== previousPrepStage) pendingRequestId = "";
         syncPrepState(state, prep);
         syncTargetControlState(state, targetControl);
+        syncExecutionModeState(state, executionMode, batchJob);
         updateExecutionState(ns, state, planner, activeJobs);
 
         if (operationJustFinished) {
@@ -82,12 +100,31 @@ export async function main(ns) {
             activeOperation = null;
         }
 
-        if (activeJobs.length > 0) {
+        if (batchJob) {
+            pendingRequestId = "";
+            state.tactical.status = "BATCH_RUNNING";
+            state.reason = `Synchronized HWGW batch running on ${batchJob.hostname}`;
+        } else if (activeJobs.length > 0) {
             state.tactical.status = prep.active ? `PREP_${prep.stage}_RUNNING` : "WAITING_WORKERS";
             state.reason += ` | waiting for ${activeJobs.length} worker job(s)`;
         } else if (prep.hold) {
             pendingRequestId = "";
             state.tactical.status = "PREPARED_HOLD";
+        } else if (executionMode.mode === "BATCH" && state.action === ActionType.NONE) {
+            pendingRequestId = "";
+            state.tactical.status = "BATCH_READY";
+            if (Date.now() - lastBatchAttemptAt >= BATCH_RETRY_MS) {
+                lastBatchAttemptAt = Date.now();
+                const request = launchBatchRunner(ns, planner, state);
+                if (request.pid > 0) {
+                    batchJob = request;
+                    state.tactical.status = "BATCH_RUNNING";
+                    state.reason = `Launched synchronized HWGW batch on ${request.hostname}`;
+                } else {
+                    state.tactical.status = "BATCH_BLOCKED";
+                    state.reason += " | no remote host has enough free RAM to launch the batch coordinator";
+                }
+            }
         } else {
             const tacticalPlan = readTacticalPlanState(ns);
             if (isRequestedPlan(tacticalPlan, state.hostname, pendingRequestId)) {
@@ -145,6 +182,7 @@ export async function main(ns) {
 
         syncPrepState(state, prep);
         syncTargetControlState(state, targetControl);
+        syncExecutionModeState(state, executionMode, batchJob);
         state.updatedAt = Date.now();
         publishControllerState(ns, state);
         if (!quiet) {
@@ -178,7 +216,15 @@ function createTargetControl(manualTarget) {
     };
 }
 
-function consumeControllerRequests(ns, state, prep, targetControl) {
+function createExecutionMode() {
+    return {
+        mode: "HGW",
+        pending: "",
+        lastMessage: "Normal sequential HGW mode",
+    };
+}
+
+function consumeControllerRequests(ns, state, prep, targetControl, executionMode) {
     const port = ns.getPortHandle(RuntimePort.CONTROL_REQUESTS);
     let changed = false;
 
@@ -214,7 +260,7 @@ function consumeControllerRequests(ns, state, prep, targetControl) {
 
         if (action === "RESUME_AUTO") {
             resetPrep(prep);
-            prep.lastMessage = "Automatic HGW resumed";
+            prep.lastMessage = executionMode.mode === "BATCH" ? "Automatic batched HWGW resumed" : "Automatic HGW resumed";
             changed = true;
         }
 
@@ -232,9 +278,29 @@ function consumeControllerRequests(ns, state, prep, targetControl) {
             targetControl.lastMessage = "Return to automatic target selection queued";
             changed = true;
         }
+
+        if (action === "SET_EXECUTION_MODE") {
+            const mode = String(request?.mode ?? "").trim().toUpperCase();
+            if (mode === "HGW" || mode === "BATCH") {
+                executionMode.pending = mode;
+                executionMode.lastMessage = `Execution mode change queued: ${mode}`;
+                changed = true;
+            }
+        }
     }
 
     return changed;
+}
+
+function applyExecutionModeCommand(executionMode, prep) {
+    const mode = executionMode.pending;
+    executionMode.pending = "";
+    if (mode !== "HGW" && mode !== "BATCH") return;
+    executionMode.mode = mode;
+    resetPrep(prep);
+    executionMode.lastMessage = mode === "BATCH"
+        ? "Batched HWGW mode active; controller will prep and launch synchronized batches"
+        : "Normal sequential HGW mode active";
 }
 
 function applyTargetCommand(planner, currentState, prep, targetControl) {
@@ -299,6 +365,17 @@ function syncTargetControlState(state, targetControl) {
     };
 }
 
+function syncExecutionModeState(state, executionMode, batchJob) {
+    state.executionMode = {
+        mode: executionMode.mode,
+        pending: executionMode.pending,
+        batchGapMs: DEFAULT_BATCH_GAP_MS,
+        batchRunning: Boolean(batchJob),
+        batchRunnerHost: String(batchJob?.hostname ?? ""),
+        lastMessage: executionMode.lastMessage,
+    };
+}
+
 function choosePrepAction(state, prep) {
     state.money.desiredPercent = 1;
 
@@ -336,6 +413,29 @@ function choosePrepHoldAction(state, prep) {
     state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.NONE;
     state.reason = `Prep complete: ${prep.target || state.hostname} is held at 100% money / minimum security until Resume Auto`;
+}
+
+function chooseBatchFoundationAction(state) {
+    const desiredMoney = state.money.max * state.money.desiredPercent;
+    const securityDelta = Math.max(0, state.security.current - state.security.minimum);
+
+    if (securityDelta > BATCH_SECURITY_TOLERANCE) {
+        state.phase = TargetPhase.SECURITY_PREP;
+        state.action = ActionType.WEAKEN;
+        state.reason = `Batch mode prep: security +${formatNumber(securityDelta)} must be within +${BATCH_SECURITY_TOLERANCE.toFixed(2)}`;
+        return;
+    }
+
+    if (state.money.max > 0 && state.money.current < desiredMoney * BATCH_MONEY_TOLERANCE) {
+        state.phase = TargetPhase.MONEY_PREP;
+        state.action = ActionType.GROW;
+        state.reason = `Batch mode prep: money below ${(state.money.desiredPercent * 100).toFixed(0)}% strategy target`;
+        return;
+    }
+
+    state.phase = TargetPhase.PRODUCTION;
+    state.action = ActionType.NONE;
+    state.reason = `Batch-ready at ${(state.money.desiredPercent * 100).toFixed(0)}% money and near-minimum security`;
 }
 
 function createManualState(hostname, analysis = null) {
@@ -398,7 +498,7 @@ function applyEconomicStrategy(state, planner) {
     const hackFraction = applies ? Number(economic?.hackFraction ?? 0.10) : 0.10;
     const moneyTargetPercent = applies ? Number(economic?.moneyTargetPercent ?? 1) : 1;
 
-    state.strategy.hackPercent = clamp(hackFraction, 0.001, 0.99);
+    state.strategy.hackPercent = clamp(hackFraction, 0.001, 0.90);
     state.strategy.growTargetPercent = clamp(moneyTargetPercent, 0.01, 1);
     state.money.desiredPercent = state.strategy.growTargetPercent;
     if (applies) {
@@ -424,6 +524,29 @@ function updateExecutionState(ns, state, planner, activeJobs) {
     state.execution.usableRam = pool.usableRam;
     state.execution.activeJobs = activeJobs.length;
     state.execution.activeThreads = activeJobs.reduce((sum, job) => sum + job.threads, 0);
+}
+
+function launchBatchRunner(ns, planner, state) {
+    const scriptRam = ns.getScriptRam(BATCH_RUNNER_SCRIPT, "home");
+    if (!(scriptRam > 0)) return { pid: 0, hostname: "", scriptRam };
+
+    const hackFraction = clamp(Number(state.strategy.hackPercent ?? 0.10), 0.001, 0.90);
+    const moneyTargetPercent = clamp(Number(state.money.desiredPercent ?? 1), 0.01, 1);
+    for (const host of getExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB)) {
+        if (host.usableRam < scriptRam) continue;
+        const pid = ns.exec(
+            BATCH_RUNNER_SCRIPT,
+            host.hostname,
+            1,
+            state.hostname,
+            hackFraction,
+            DEFAULT_BATCH_GAP_MS,
+            moneyTargetPercent,
+            ...quietArgs(ns),
+        );
+        if (pid > 0) return { pid, hostname: host.hostname, scriptRam, target: state.hostname };
+    }
+    return { pid: 0, hostname: "", scriptRam, target: state.hostname };
 }
 
 function launchTacticalPlanner(ns, planner, state, prep, sequence) {
@@ -544,6 +667,7 @@ function getEstimatedActionTimeMs(state, action) {
 function printControllerState(ns, state) {
     ns.print("=== CONTROLLER STATE ===");
     ns.print(`Target:    ${state.hostname} | ${state.phase} | ${state.action}`);
+    ns.print(`Execution: ${state.executionMode?.mode ?? "HGW"}${state.executionMode?.batchRunning ? " / BATCH RUNNING" : ""}`);
     ns.print(`Targeting: ${state.targetControl?.mode ?? "AUTO"}${state.targetControl?.manualTarget ? ` / ${state.targetControl.manualTarget}` : ""}`);
     ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%) | desired ${(state.money.desiredPercent * 100).toFixed(0)}%`);
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
