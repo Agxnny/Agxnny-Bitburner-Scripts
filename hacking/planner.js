@@ -55,4 +55,9 @@ export async function main(ns) {
     const totalRam = executionHosts.reduce((sum, host) => sum + host.maxRam, 0);
     ns.tprint(`RAM hosts: ${executionHosts.length} (${ns.format.ram(totalRam)} total max RAM)`);
     ns.tprint("Planner snapshot published.");
+
+    if (String(ns.args[0] ?? "") === "--kickstart") {
+        const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 1)));
+        ns.spawn("/kickstart.js", 1, nextStage);
+    }
 }
