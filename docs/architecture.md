@@ -1,20 +1,16 @@
 # Architecture
 
-## Documentation and source of truth
+## Source of truth
 
-The GitHub `main` branch is the source of truth. Before modifying an existing script, fetch/read the current repository version rather than relying on an older chat snippet.
-
-For a new development chat, read `docs/HANDOFF.md` first. The rest of the documentation set is indexed in `docs/README.md`.
-
-After major architectural changes, refresh the affected docs before considering the change complete.
+GitHub `main` is the source of truth. Read `docs/HANDOFF.md` first for current work, then fetch current files before editing.
 
 ## Core principle
 
-Game logic and presentation stay separate. Home is the **control plane**: orchestration, state coordination, GUI/dashboard, updater, and lightweight persistent services belong there. Rooted and cloud servers are the **execution plane**: HGW workers, tactical analysis, and timed batch execution should run remotely whenever possible.
+Home is the **control/UI plane**. Rooted and cloud servers are the **execution plane**. H/G/W workers, tactical analysis, and timed batch execution run remotely whenever possible.
 
-The GUI consumes structured runtime state and sends lightweight command messages. It does not own expensive target analysis or worker scheduling.
+The GUI consumes structured runtime state and sends lightweight commands; it does not own target analysis or worker scheduling.
 
-## Startup/control-plane entrypoint
+## Startup
 
 ```text
 startup.js
@@ -22,126 +18,28 @@ startup.js
         ↓
     spawns /kickstart.js --quiet
         ↓
-planner -> deploy remote services -> economy/target ready -> controller
+planner → deploy/sync → economy/target → controller
 ```
 
-## Home/control-plane policy
+## GUI architecture
 
-`lib/execution.js` enforces `REMOTE_ONLY` worker execution. Home is not worker capacity.
+`ui/dashboard.js` mounts its React tree once. Runtime snapshots are refreshed by the asynchronous Netscript loop and exposed through plain-JS cached state. Tab selection is React-local.
 
-Consequences:
-
-- hack/grow/weaken workers never launch on home;
-- tactical planning and batch execution are intended for remote hosts;
-- if remote capacity is unavailable, automation waits rather than consuming control/UI RAM;
-- economic capacity models exclude home worker RAM.
-
-## GUI command architecture
-
-`ui/dashboard.js` deliberately separates the React presentation layer from Netscript I/O.
-
-The React tree is mounted once with `ns.printRaw(...)`. It is **not** cleared and remounted on every data refresh. The asynchronous Netscript loop refreshes a plain-JS cached runtime snapshot and increments a version counter; the mounted React root observes that counter and renders the latest cached data.
-
-Presentation-only interaction, especially tab selection, lives in React-local state and therefore does not wait for the Netscript loop. React event callbacks that need controller/file actions only assign plain-JS request state. Netscript APIs are executed later by the dashboard main loop.
-
-```text
-runtime ports/files
-      ↓ Netscript snapshot
-cachedState + stateVersion
-      ↓
-persistent DashboardRoot
-      ↓
-React-local tabs / rendered views
-
-React command click
-      ↓ plain JS request variable
-async dashboard loop
-      ↓ Netscript writePort/write
-controller or service
-```
-
-This avoids the previous repeated `clearLog()` + `printRaw()` remount cycle, which could make tab and mode interactions sluggish or appear hung while a full dashboard tree was being rebuilt.
-
-Port 13 is the controller command queue. Current commands include:
-
-```text
-PREP_TARGET
-RESUME_AUTO
-SET_MANUAL_TARGET
-CLEAR_MANUAL_TARGET
-SET_EXECUTION_MODE HGW|BATCH
-```
-
-The Overview tab exposes the execution selector. Mode changes wait until current tactical/worker/batch work is idle, then the controller switches without restarting the automation stack.
-
-## Automatic vs manual target control
-
-Automatic targeting remains planner/economy driven:
-
-```text
-economy-targets.js
-    ↓
-planner economicSelection / selectedTarget
-    ↓
-controller
-```
-
-Manual targeting is a runtime controller override:
-
-```text
-Targets GUI
-    ↓ Port 13
-SET_MANUAL_TARGET hostname
-    ↓
-controller validates hostname against planner.rankings
-    ↓
-manual hostname remains fixed until CLEAR_MANUAL_TARGET
-```
-
-Target changes are applied only when current worker jobs, tactical analysis, and batch work are idle. Clearing the override returns the controller to the latest planner-selected automatic target.
-
-Manual target mode currently defaults to 100% desired money and a 10% hack fraction. This intentionally separates hostname override from future manual strategy controls.
-
-## Prep-and-hold lifecycle
-
-Manual prep mode adds an explicit batching preparation path:
-
-```text
-PREP_GROW
-    grow continuously to ~100% money
-        ↓
-PREP_WEAKEN
-    weaken continuously to minimum security
-        ↓
-PREPARED_HOLD
-```
-
-The tactical planner accepts forced prep modes so security growth during the money-fill phase does not cause normal security-first logic to alternate back and forth.
-
-Resume releases the hold and returns to whichever execution mode is selected: normal HGW or automatic batching.
+React callbacks never call Netscript APIs directly. Command callbacks assign plain-JS request state; the dashboard loop later writes Port 13 or files.
 
 ## Execution modes
 
 ### Normal HGW
 
-The controller uses the tactical planner to perform sequential security prep, money prep, and production HACK actions.
+Sequential tactical weaken/grow/hack execution.
 
 ### Automatic synchronized HWGW
 
-Batch mode is currently **one complete synchronized batch at a time**. It intentionally does not pipeline overlapping batches yet.
+Current batching is intentionally **one complete batch at a time**.
 
-The controller first ensures the target is close enough to its selected strategy baseline:
+The controller prepares the target, launches `hacking/batch-runner.js` remotely, waits for the full batch, then enforces a post-batch strategic-review barrier before another batch can launch.
 
-```text
-security within +0.05
-money >= 99.5% of selected desired-money baseline
-        ↓
-launch batch-runner.js remotely
-```
-
-`hacking/batch-runner.js` reserves the full worker footprint before launching any stage. If the complete batch does not fit the remote pool, no stage is launched.
-
-Landing order:
+Landing plan:
 
 ```text
 HACK              t0
@@ -150,113 +48,77 @@ GROW              t0 + 2 × gap
 WEAKEN_GROW       t0 + 3 × gap
 ```
 
-The default gap is 200 ms. Workers use `additionalMsec` so their completion times converge on the planned landing timestamps.
+Default gap: 200 ms.
 
-Batch state is published on Port 12 with thread counts, landing timestamps, allocations, RAM requirements, and final recovery state.
+The batch runner reserves the full remote worker footprint before launch. If the whole batch does not fit, no stage starts.
+
+## Batch recovery model
+
+The original W2 security-compensation defect was caused by using host-aware `growthAnalyzeSecurity` while the target was already prepared. The runner now uses uncapped `ns.growthAnalyzeSecurity(growThreads)` and live corrected batches recover to the expected baseline.
+
+Port 12 records initial state, predicted recovery, final state, and predicted-vs-actual recovery errors.
+
+## Batch landing telemetry
+
+Workers now receive the planned landing timestamp as a batch-only argument.
+
+After completing their operation, batch-associated HACK/GROW/WEAKEN workers emit one lightweight completion event to **Port 14**:
+
+```text
+batchId
+stage
+jobId
+threads
+plannedLandingAt
+finishedAt
+landingErrorMs
+```
+
+Port 14 is separate from Port 4 so GROW/WEAKEN timing events cannot affect strategic HACK-completion handling.
+
+The batch runner drains Port 14 while jobs are active and aggregates worker events by stage. Because a stage may be split across remote hosts:
+
+```text
+firstCompletionAt = earliest allocation completion
+actualLandingAt   = latest allocation completion
+allocationSpread  = actualLandingAt - firstCompletionAt
+```
+
+A stage is not considered fully landed until its last allocation finishes.
+
+Port 12 schema version 3 publishes:
+
+```text
+landing.expectedOrder
+landing.actualOrder
+landing.orderCorrect
+landing.minimumSpacingMs
+landing.maxAbsLandingErrorMs
+landing.missingJobs
+landing.adjacentSpacing[]
+landing.stages[]
+```
+
+This is the measurement surface used to decide whether the fixed 200 ms gap has enough safety margin before pipelining.
+
+### Current serialization assumption
+
+The batch runner clears Port 14 immediately before launching a new batch. This is safe only because one batch is allowed in flight. Overlapping/pipelined batches must replace this with a multi-batch-safe event-consumption strategy.
 
 ## Strict post-batch strategic-review boundary
 
-Batch-internal HACK telemetry is not treated as a standalone strategic checkpoint. `hacking/refresh.js` waits for Port 12 to report the entire batch as `COMPLETE` before running the strategic chain.
+Batch-associated HACK events are ignored as standalone strategic checkpoints. `hacking/refresh.js` waits for Port 12 to report the entire batch `COMPLETE`. The controller then waits for a fresh economic-target snapshot before launching the next batch.
 
-The controller enforces the other half of this boundary: when its batch runner exits successfully, it enters `BATCH_REVIEW` and refuses to launch another batch until Port 8 has a newer economic-target snapshot than the completed batch.
+## Remote-only worker policy
 
-```text
-batch COMPLETE
-    ↓
-controller: BATCH_REVIEW
-    ↓
-refresh: planner -> sync -> economy -> economic target
-    ↓
-Port 8 updated after batch completion
-    ↓
-controller releases review barrier
-    ↓
-next batch may launch
-```
+`lib/execution.js` excludes home from worker capacity. If remote capacity is unavailable, automation waits instead of consuming control/UI RAM.
 
-This prevents a second batch from launching using strategy state calculated before the previous batch finished recovering.
+## Manual controls
 
-## Current batch correctness status
-
-The original single-batch security-recovery defect was traced to the grow-security calculation.
-
-Failing live batch on `sigma-cosmetics`:
-
-```text
-25H / 1W / 298G / 1W
-final money: 100%
-final security: +1.13
-```
-
-The batch planner used:
-
-```text
-ns.growthAnalyzeSecurity(growThreads, target, 1)
-```
-
-Because the host-aware form is capped by the grow work needed from the target's **current** money state, calling it while the prepared target was already at max money effectively predicted no future grow-security increase. W2 therefore fell to its one-thread minimum even though 298 grow threads would run after HACK.
-
-The corrected batch calculation uses:
-
-```text
-ns.growthAnalyzeSecurity(growThreads)
-```
-
-The first corrected live batch used:
-
-```text
-25H / 1W / 298G / 24W
-final money: 100%
-final security: 3.00 / 3.00
-standalone repair weaken: not required
-```
-
-The next correctness step is repeated-cycle validation. Several consecutive automatic batches should recover to the intended money baseline and approximately minimum security without inter-batch correction work before pipelining begins.
-
-See `docs/HANDOFF.md` and `docs/TESTING.md` for the current evidence and acceptance criteria.
-
-## Progression and cloud capacity
-
-`lib/progression.js` evaluates independent progression candidates including:
-
-```text
-HOME_RAM
-PURCHASED_SERVER
-CLOUD_SERVER_UPGRADE
-```
-
-The selected automatic progression goal remains the spending authority. `network/cloud-buy.js` is a cloud-capacity executor:
-
-```text
-PURCHASED_SERVER
-    -> ns.cloud.purchaseServer()
-
-CLOUD_SERVER_UPGRADE
-    -> ns.cloud.upgradeServer()
-```
-
-The spender checks live cash/cost immediately before acting. It also independently reads Port 11; an active manual money goal blocks both purchases and upgrades even if economy state is stale.
-
-### Independent cloud-capacity retry loop
-
-Cloud spending is intentionally decoupled from HACK completion. `hacking/refresh.js` checks the current cached economy goal every 5 seconds. If the selected goal is `PURCHASED_SERVER` or `CLOUD_SERVER_UPGRADE`, no manual money lock is active, and live home cash has reached the cached goal cost, the coordinator retries `network/cloud-buy.js`.
-
-```text
-cached cloud goal
-    + live cash >= goal cost
-        ↓
-cloud-buy.js retry
-        ↓
-capacity changed?
-    no  -> return to lightweight loop
-    yes -> planner -> sync -> economy -> economic target
-```
-
-This means long prep phases and batch execution do not need a raw standalone HACK completion just to execute an already-approved RAM purchase or upgrade.
-
-The expensive planner/economy/target analysis is not run on each 5-second check. It is triggered after the capacity action actually succeeds, or by strategic events such as standalone HACK completion, full batch completion, root expansion, and manual-goal changes.
-
-The spender does not override non-cloud progression priorities. If home RAM or another future goal is selected, cloud spending remains idle and publishes a clear status reason on Port 10.
+- Port 13 carries prep/resume/manual-target/execution-mode commands.
+- Manual target changes apply only at safe idle boundaries.
+- Manual money goal on Port 11 is a hard automatic-spending lock.
+- Prep-and-hold grows to full money, weakens to minimum, then holds.
 
 ## Runtime ports
 
@@ -275,56 +137,20 @@ The spender does not override non-cloud progression priorities. If home RAM or a
 | 11 | manual money goal / spending lock |
 | 12 | synchronized batch state |
 | 13 | controller command queue |
+| 14 | batch landing-timing event queue |
 
-See `docs/RUNTIME_STATE.md` for the detailed state/command contract.
+See `docs/RUNTIME_STATE.md` for the detailed state contract.
 
-## Development stages
+## Current development stage
 
-### Stage 1 — foundation
-- minimal HGW workers
-- shared state contract
-- controller and target lifecycle
+Stage 4 synchronized batching currently includes:
 
-### Stage 2 — network/resources
-- recursive discovery and rooting
-- remote-only execution pool
-- host synchronization
-- progression advisor
-- cloud purchases and upgrades
-- independent affordable cloud-capacity retries
-- manual money-goal spending lock
+- timing-capable workers;
+- full-batch RAM reservation;
+- automatic single-batch controller handoff;
+- strict strategic-review barrier;
+- corrected W2 security compensation;
+- predicted-vs-actual recovery telemetry;
+- **current: actual landing drift/order telemetry**.
 
-### Stage 3 — target/control ergonomics
-- adaptive economic targeting
-- manual runtime target override
-- prep-and-hold mode
-- GUI command channel
-- runtime HGW/BATCH execution selector
-- persistent React dashboard mount and React-local tab navigation
-
-### Stage 4 — synchronized batching
-- timing-capable workers
-- one-shot HWGW runner
-- full-batch RAM reservation
-- batch runtime state
-- controller automatic single-batch handoff
-- strict post-batch review barrier
-- corrected W2 grow-security compensation
-- **current: repeated-cycle recovery validation**
-- predicted-vs-actual batch recovery telemetry
-
-### Stage 5 — pipelined batching
-- landing drift monitoring
-- adaptive landing gaps
-- overlapping batches
-- collision-free RAM reservation
-- batch depth / throughput tuning
-- multi-target scheduling
-
-### Stage 6 — future systems
-- controller/dispatcher RAM split
-- service RAM reservation
-- predicted-versus-actual economic calibration
-- stock runtime state and independent stock GUI
-
-See `docs/ROADMAP.md` for the prioritized roadmap.
+Stage 5 pipelining begins only after repeated timing measurements show understood and adequate landing margin.
