@@ -1,5 +1,12 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
-import { RuntimePort, publishControllerState, readPlannerState, readTacticalPlanState } from "/lib/runtime-state.js";
+import {
+    RuntimePort,
+    publishControllerState,
+    readBatchState,
+    readEconomyTargetState,
+    readPlannerState,
+    readTacticalPlanState,
+} from "/lib/runtime-state.js";
 import { DEFAULT_HOME_RESERVE_GB, WORKER_SCRIPTS, distributeThreads, getExecutionPool, summarizeExecutionPool } from "/lib/execution.js";
 import { isQuiet, positionalArgs, quietArgs } from "/lib/output.js";
 
@@ -45,6 +52,7 @@ export async function main(ns) {
 
     while (true) {
         planner = readPlannerState(ns);
+        updateBatchReviewBarrier(ns, executionMode);
 
         if (consumeControllerRequests(ns, state, prep, targetControl, executionMode)) {
             pendingRequestId = "";
@@ -55,7 +63,11 @@ export async function main(ns) {
         const operationJustFinished = hadActiveJobs && activeJobs.length === 0 && activeOperation;
 
         if (tacticalJob && !ns.isRunning(tacticalJob.pid, tacticalJob.hostname)) tacticalJob = null;
-        if (batchJob && !ns.isRunning(batchJob.pid, batchJob.hostname)) batchJob = null;
+        if (batchJob && !ns.isRunning(batchJob.pid, batchJob.hostname)) {
+            const finishedBatchJob = batchJob;
+            batchJob = null;
+            recordFinishedBatch(ns, executionMode, finishedBatchJob);
+        }
 
         const controllerIdle = activeJobs.length === 0 && !tacticalJob && !batchJob;
 
@@ -112,17 +124,22 @@ export async function main(ns) {
             state.tactical.status = "PREPARED_HOLD";
         } else if (executionMode.mode === "BATCH" && state.action === ActionType.NONE) {
             pendingRequestId = "";
-            state.tactical.status = "BATCH_READY";
-            if (Date.now() - lastBatchAttemptAt >= BATCH_RETRY_MS) {
-                lastBatchAttemptAt = Date.now();
-                const request = launchBatchRunner(ns, planner, state);
-                if (request.pid > 0) {
-                    batchJob = request;
-                    state.tactical.status = "BATCH_RUNNING";
-                    state.reason = `Launched synchronized HWGW batch on ${request.hostname}`;
-                } else {
-                    state.tactical.status = "BATCH_BLOCKED";
-                    state.reason += " | no remote host has enough free RAM to launch the batch coordinator";
+            if (executionMode.awaitingReview) {
+                state.tactical.status = "BATCH_REVIEW";
+                state.reason = `Batch ${executionMode.lastBatchId || "complete"} finished; waiting for post-batch planner/economy review before the next launch`;
+            } else {
+                state.tactical.status = "BATCH_READY";
+                if (Date.now() - lastBatchAttemptAt >= BATCH_RETRY_MS) {
+                    lastBatchAttemptAt = Date.now();
+                    const request = launchBatchRunner(ns, planner, state);
+                    if (request.pid > 0) {
+                        batchJob = request;
+                        state.tactical.status = "BATCH_RUNNING";
+                        state.reason = `Launched synchronized HWGW batch on ${request.hostname}`;
+                    } else {
+                        state.tactical.status = "BATCH_BLOCKED";
+                        state.reason += " | no remote host has enough free RAM to launch the batch coordinator";
+                    }
                 }
             }
         } else {
@@ -220,6 +237,9 @@ function createExecutionMode() {
     return {
         mode: "HGW",
         pending: "",
+        awaitingReview: false,
+        batchCompletedAt: 0,
+        lastBatchId: "",
         lastMessage: "Normal sequential HGW mode",
     };
 }
@@ -297,10 +317,38 @@ function applyExecutionModeCommand(executionMode, prep) {
     executionMode.pending = "";
     if (mode !== "HGW" && mode !== "BATCH") return;
     executionMode.mode = mode;
+    executionMode.awaitingReview = false;
+    executionMode.batchCompletedAt = 0;
     resetPrep(prep);
     executionMode.lastMessage = mode === "BATCH"
         ? "Batched HWGW mode active; controller will prep and launch synchronized batches"
         : "Normal sequential HGW mode active";
+}
+
+function recordFinishedBatch(ns, executionMode, finishedJob) {
+    const batch = readBatchState(ns);
+    const batchId = String(batch?.batchId ?? "");
+    const target = String(batch?.target ?? "");
+    if (batch?.status === "COMPLETE" && batchId && target === finishedJob.target) {
+        executionMode.awaitingReview = true;
+        executionMode.batchCompletedAt = Number(batch?.finishedAt ?? batch?.updatedAt ?? Date.now());
+        executionMode.lastBatchId = batchId;
+        executionMode.lastMessage = `Batch ${batchId} complete; waiting for post-batch strategic review`;
+        return;
+    }
+
+    const status = String(batch?.status ?? "UNKNOWN");
+    executionMode.lastMessage = `Batch runner exited with state ${status}; controller will re-evaluate target readiness`;
+}
+
+function updateBatchReviewBarrier(ns, executionMode) {
+    if (!executionMode.awaitingReview) return;
+    const economic = readEconomyTargetState(ns);
+    const reviewedAt = Number(economic?.updatedAt ?? 0);
+    if (reviewedAt <= executionMode.batchCompletedAt) return;
+
+    executionMode.awaitingReview = false;
+    executionMode.lastMessage = `Post-batch strategic review complete for ${executionMode.lastBatchId}; next batch may launch`;
 }
 
 function applyTargetCommand(planner, currentState, prep, targetControl) {
@@ -372,6 +420,9 @@ function syncExecutionModeState(state, executionMode, batchJob) {
         batchGapMs: DEFAULT_BATCH_GAP_MS,
         batchRunning: Boolean(batchJob),
         batchRunnerHost: String(batchJob?.hostname ?? ""),
+        awaitingReview: executionMode.awaitingReview,
+        batchCompletedAt: executionMode.batchCompletedAt,
+        lastBatchId: executionMode.lastBatchId,
         lastMessage: executionMode.lastMessage,
     };
 }
@@ -667,7 +718,7 @@ function getEstimatedActionTimeMs(state, action) {
 function printControllerState(ns, state) {
     ns.print("=== CONTROLLER STATE ===");
     ns.print(`Target:    ${state.hostname} | ${state.phase} | ${state.action}`);
-    ns.print(`Execution: ${state.executionMode?.mode ?? "HGW"}${state.executionMode?.batchRunning ? " / BATCH RUNNING" : ""}`);
+    ns.print(`Execution: ${state.executionMode?.mode ?? "HGW"}${state.executionMode?.batchRunning ? " / BATCH RUNNING" : state.executionMode?.awaitingReview ? " / REVIEW" : ""}`);
     ns.print(`Targeting: ${state.targetControl?.mode ?? "AUTO"}${state.targetControl?.manualTarget ? ` / ${state.targetControl.manualTarget}` : ""}`);
     ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%) | desired ${(state.money.desiredPercent * 100).toFixed(0)}%`);
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
