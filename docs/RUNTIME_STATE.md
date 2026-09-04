@@ -21,24 +21,15 @@ The project uses Netscript ports as lightweight shared transport between persist
 | 11 | Manual money-goal state | Latest-value snapshot |
 | 12 | Batch state | Latest-value snapshot |
 | 13 | Controller requests | Event queue |
+| 14 | Batch timing events | Event queue |
 
-Snapshot writers replace the prior value. Port 13 is intentionally consumed as a queue.
+Snapshot writers replace the prior value. Ports 13 and 14 are intentionally consumed as queues.
 
 ## Port 1 — controller state
 
 Published by `hacking/controller.js`.
 
-Important top-level concepts include:
-
-- current target hostname;
-- target phase/action;
-- observed money/security;
-- current strategy values;
-- tactical status;
-- execution-pool summary;
-- prep state;
-- manual target state;
-- execution mode state.
+Important top-level concepts include current target hostname, target phase/action, observed money/security, current strategy values, tactical status, execution-pool summary, prep state, manual target state, and execution mode state.
 
 ### `executionMode`
 
@@ -56,58 +47,17 @@ lastBatchId: latest completed batch id
 lastMessage: user-facing controller explanation
 ```
 
-The exact object may evolve; read the current controller code before depending on an individual field.
-
-### `targetControl`
-
-Tracks automatic/manual target selection and pending target commands.
-
-### `prep`
-
-Tracks explicit manual prep/hold mode:
-
-```text
-GROW → WEAKEN → READY/HOLD
-```
-
-Manual prep is separate from automatic batch foundation prep.
-
 ## Port 2 — planner state
 
-Published by the network/target planner and augmented by economic selection.
-
-Important data:
-
-- analyzed/ranked targets;
-- selected target;
-- execution hosts;
-- worker RAM information;
-- network/root capability summary;
-- `economicSelection` with selected desired-money percentage and hack fraction.
-
-Do not assume Port 2 is fresh just because the controller is fresh. Planner refresh is deliberately event-driven.
+Published by the network/target planner and augmented by economic selection. Important data includes analyzed/ranked targets, selected target, execution hosts, worker RAM information, network/root capability summary, and `economicSelection`.
 
 ## Port 3 — tactical plan
 
-Published by `hacking/tactical-planner.js`.
-
-Includes:
-
-- target hostname;
-- controller request id;
-- requested action;
-- calculated threads;
-- timing/security/money analysis;
-- planner host;
-- optional forced tactical mode.
-
-Controller request ids are used to reject stale tactical snapshots.
+Published by `hacking/tactical-planner.js`. Includes target hostname, controller request id, requested action, calculated threads, timing/security/money analysis, planner host, and optional forced tactical mode.
 
 ## Ports 4 and 5 — hack events and income telemetry
 
 Hack workers/telemetry attach batch metadata where applicable.
-
-This distinction is important:
 
 ```text
 standalone HGW HACK completion
@@ -118,207 +68,115 @@ batch-associated HACK completion
     → wait for Port 12 full batch COMPLETE
 ```
 
-## Port 7 — economy/progression state
+## Ports 7–11
 
-Published by `hacking/economy-planner.js`.
-
-Includes player cash, selected progression goal, readiness/remaining cost, and advisor context.
-
-The current progression goal is the authority for automatic cloud spending.
-
-## Port 8 — economic target state
-
-Published by `hacking/economy-targets.js`.
-
-Contains:
-
-- selected target/strategy;
-- ranked alternatives;
-- prep estimates;
-- cash-relative filtering decisions;
-- adaptive money-target alternatives;
-- timestamp used by the batch controller review barrier.
-
-The controller treats a Port 8 update newer than the completed batch timestamp as evidence that post-batch strategic review has finished.
-
-## Port 9 — root/tool state
-
-Published by `network/root.js`.
-
-Contains current port-opening tool availability and newly rooted hosts.
-
-Root expansion can trigger a heavy planner refresh because execution capacity and target access have changed.
-
-## Port 10 — cloud capacity action state
-
-Published by `network/cloud-buy.js`.
-
-Conceptual fields include:
-
-- action (`PURCHASE_SERVER`, `UPGRADE_SERVER`, `NONE`);
-- status;
-- hostname;
-- previous/target RAM;
-- cost;
-- whether capacity actually changed;
-- user-facing reason.
-
-A failed attempt should publish a reason when the spender itself runs. If the spender cannot be launched due to remote RAM starvation, the refresh coordinator may only know launch failed unless more explicit coordinator state is added later.
-
-## Port 11 — manual money-goal state
-
-Manual savings goal / spending lock.
-
-Important invariant:
-
-**When active, automatic cloud purchases/upgrades are blocked.**
-
-The spender checks this state directly instead of trusting only the economy snapshot.
-
-The goal is also persisted to `/data/manual-money-goal.txt` so it survives restart.
+- Port 7: economy/progression state.
+- Port 8: economic target state and post-batch review freshness timestamp.
+- Port 9: root/tool state.
+- Port 10: cloud-capacity action state.
+- Port 11: manual money-goal / spending-lock state.
 
 ## Port 12 — batch state
 
 Published by `hacking/batch-runner.js`.
 
-Typical status lifecycle:
+Typical lifecycle:
 
 ```text
-PLANNING
-  ↓
-BLOCKED             (target/RAM/math not ready)
+PLANNING → BLOCKED
 
 or
 
-READY
-  ↓
-RUNNING
-  ↓
-COMPLETE
+READY → RUNNING → COMPLETE
 ```
 
-Failure state also includes `LAUNCH_FAILED` if a stage cannot launch after reservation/startup; already launched jobs are cancelled.
+`LAUNCH_FAILED` is used if startup fails after reservation; already launched jobs are cancelled.
 
-Current batch-state schema version is `2` with model `SINGLE_HWGW_ADDITIONAL_MSEC_V2`.
+Current batch-state schema version is `3` with model `SINGLE_HWGW_ADDITIONAL_MSEC_V3`.
 
-Core fields include:
-
-- `batchId`;
-- target;
-- status/reason;
-- requested/actual hack fraction;
-- gap;
-- H/W1/G/W2 thread counts;
-- stage allocations;
-- landing timestamps;
-- total batch RAM;
-- final money/security state after all jobs finish.
+Core fields include batch id, target, status/reason, requested/actual hack fraction, gap, H/W1/G/W2 thread counts, stage allocations, planned landing timestamps, total RAM, recovery telemetry, final money/security, and landing telemetry.
 
 ### Recovery-model telemetry
 
-The runner records the state it planned from under `initial`:
+`initial` records the target state used for planning. `predicted` records expected money/security recovery. On completion, `final` contains the observed state and `comparison` contains predicted-vs-actual errors.
+
+### Landing telemetry
+
+On `COMPLETE`, `landing` contains:
 
 ```text
-money
-maxMoney
-moneyPercent
-desiredMoney
-security
-minSecurity
-securityDelta
+expectedOrder
+actualOrder
+orderCorrect
+expectedJobs
+reportedJobs
+missingJobs
+minimumSpacingMs
+maxAbsLandingErrorMs
+adjacentSpacing[]
+stages[]
 ```
 
-The `predicted` object records the expected recovery path using the same batch math that selected the thread counts:
+Each `landing.stages[]` entry contains:
 
 ```text
-afterHackMoney
-finalMoney
-finalMoneyPercent
-hackSecurityIncrease
-growSecurityIncrease
-weakenHackEffect
-weakenGrowEffect
-afterHackSecurityDelta
-afterWeakenHackSecurityDelta
-afterGrowSecurityDelta
-finalSecurityDelta
+name
+plannedLandingAt
+expectedJobs
+reportedJobs
+missingJobs
+firstCompletionAt
+actualLandingAt
+allocationSpreadMs
+landingErrorMs
+complete
 ```
 
-Security prediction applies the minimum-security floor after W1 and W2, matching the intended H → W1 → G → W2 landing sequence.
+A stage may be allocated across several hosts. Its `actualLandingAt` is therefore the latest completion timestamp among all allocations for that stage; `firstCompletionAt` and `allocationSpreadMs` expose how widely split allocations completed.
 
-When status reaches `COMPLETE`, `final` contains the observed money/security state and `comparison` contains:
-
-```text
-moneyPercentError = actual final money percent - predicted final money percent
-securityDeltaError = actual final security delta - predicted final security delta
-```
-
-These errors are the current measurement surface for validating the recovery model before adding per-stage landing-drift telemetry.
-
-Port 12 is currently a latest-value snapshot, not a historical batch log. If multi-batch statistics are needed, a later telemetry layer should retain history separately rather than changing this latest-state contract implicitly.
+Port 12 remains a latest-value snapshot, not a historical batch log.
 
 ## Port 13 — controller command queue
 
-Used by the GUI and other lightweight control surfaces.
-
-Current commands:
-
-### `PREP_TARGET`
-
-Request manual full prep of current target:
+Used by the GUI and other lightweight control surfaces. Current commands are:
 
 ```text
-100% money
-  ↓
-minimum security
-  ↓
-hold
+PREP_TARGET
+RESUME_AUTO
+SET_MANUAL_TARGET
+CLEAR_MANUAL_TARGET
+SET_EXECUTION_MODE HGW|BATCH
 ```
 
-Optional target field is validated against current controller target to avoid applying a stale GUI request after a target switch.
+Mode/target changes wait for safe controller boundaries.
 
-### `RESUME_AUTO`
+## Port 14 — batch timing event queue
 
-Exit manual prep/hold and resume whichever execution mode is active.
+Batch workers write one completion event after a batch-associated HACK/GROW/WEAKEN operation finishes.
 
-### `SET_MANUAL_TARGET`
-
-Queue a runtime manual target override.
-
-Controller validates the requested hostname against current eligible planner rankings and applies the switch only when current tactical/worker/batch work is idle.
-
-### `CLEAR_MANUAL_TARGET`
-
-Return to automatic economic target selection when the controller reaches a safe switch point.
-
-### `SET_EXECUTION_MODE`
-
-Payload mode:
+Conceptual event fields:
 
 ```text
-HGW
-BATCH
+type: BATCH_STAGE_COMPLETE
+batchId
+stage
+jobId
+threads
+plannedLandingAt
+finishedAt
+landingErrorMs
 ```
 
-Mode changes wait until the controller is idle. Switching modes resets explicit manual prep state and clears stale batch-review barrier state.
+The batch runner drains this queue while its worker jobs are active and aggregates per-job events into the Port 12 `landing` object.
+
+Port 14 is deliberately separate from Port 4 so timing events from GROW/WEAKEN cannot interfere with strategic HACK completion handling.
+
+Because batching is currently serialized, the runner clears stale Port 14 events immediately before launching a new batch. This queue-handling rule must change before overlapping/pipelined batches are allowed.
 
 ## Queue design rule
 
-GUI React callbacks should only construct/assign plain-JS request data. The dashboard main loop writes that data to Port 13.
-
-Do not call Netscript APIs directly inside React event callbacks.
+GUI React callbacks should only construct/assign plain-JS request data. The dashboard main loop writes that data to Port 13. Do not call Netscript APIs directly inside React event callbacks.
 
 ## Freshness and strategic events
 
-Not every state is refreshed on a timer.
-
-Heavy analysis is event-driven where possible. Important events currently include:
-
-- startup;
-- standalone HACK completion;
-- full batch completion;
-- root/execution-pool expansion;
-- successful cloud capacity change;
-- manual money-goal change.
-
-Cloud capacity execution is a special case: an already-selected affordable cloud action is retried independently every few seconds without rerunning the full planner on every check.
+Heavy analysis is event-driven where possible. Important events currently include startup, standalone HACK completion, full batch completion, root/execution-pool expansion, successful cloud-capacity change, and manual money-goal change.
