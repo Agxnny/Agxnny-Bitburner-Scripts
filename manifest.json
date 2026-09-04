@@ -26,6 +26,7 @@
     "diagnostics/income.js",
     "diagnostics/progression.js",
     "diagnostics/test.js",
+    "diagnostics/test-launcher.js",
     "gitpull-self-update.js",
     "gitpull.js"
   ]
