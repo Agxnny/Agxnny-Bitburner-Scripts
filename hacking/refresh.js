@@ -1,4 +1,9 @@
-import { readCloudPurchaseState, readPlannerState, readRootState } from "/lib/runtime-state.js";
+import {
+    readCloudPurchaseState,
+    readManualMoneyGoalState,
+    readPlannerState,
+    readRootState,
+} from "/lib/runtime-state.js";
 import { readTelemetryState } from "/lib/telemetry.js";
 import { isQuiet, quietArgs } from "/lib/output.js";
 
@@ -15,10 +20,9 @@ const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
  *
  * Heavy target/RAM analysis is event-driven. The coordinator performs lightweight
  * rooting checks every 30 seconds and runs the full strategic chain after a HACK
- * or execution-pool expansion. When the progression advisor selects an affordable
- * new cloud server, one server may be purchased per strategic refresh. A purchase
- * immediately triggers planner + sync again so the new RAM joins the pool before
- * target selection finishes.
+ * or execution-pool expansion. Manual money-goal changes trigger only the economy
+ * / purchase-lock / target portion, so setting a savings target takes effect
+ * quickly without forcing an unnecessary network planner pass.
  *
  * @param {NS} ns
  */
@@ -27,6 +31,7 @@ export async function main(ns) {
 
     const initialTelemetry = readTelemetryState(ns);
     let lastReviewedHackAt = Number(initialTelemetry?.lastHack?.finishedAt ?? 0);
+    let lastManualGoalUpdatedAt = Number(readManualMoneyGoalState(ns)?.updatedAt ?? 0);
     let lastRootCheckAt = 0;
     let startupEconomyDone = false;
 
@@ -55,6 +60,17 @@ export async function main(ns) {
         const hackCompletedAt = Number(telemetry?.lastHack?.finishedAt ?? 0);
         const hackNeedsReview = hackCompletedAt > lastReviewedHackAt;
 
+        const manualGoalUpdatedAt = Number(readManualMoneyGoalState(ns)?.updatedAt ?? 0);
+        const manualGoalChanged = manualGoalUpdatedAt > lastManualGoalUpdatedAt;
+
+        if (manualGoalChanged && !hackNeedsReview && !rootExpansion) {
+            const result = await runEconomyPurchaseTargetChain(ns);
+            if (result.ok) {
+                lastManualGoalUpdatedAt = manualGoalUpdatedAt;
+                if (!isQuiet(ns)) ns.print("Economy/target review complete after manual money-goal change.");
+            }
+        }
+
         if (hackNeedsReview || rootExpansion) {
             const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT, true);
             if (plannerOk) {
@@ -62,10 +78,12 @@ export async function main(ns) {
                 const result = await runEconomyPurchaseTargetChain(ns);
                 if (result.ok) {
                     if (hackNeedsReview) lastReviewedHackAt = hackCompletedAt;
+                    if (manualGoalChanged) lastManualGoalUpdatedAt = manualGoalUpdatedAt;
                     if (!isQuiet(ns)) {
                         const reasons = [];
                         if (hackNeedsReview) reasons.push("HACK completion");
                         if (rootExpansion) reasons.push("new root access");
+                        if (manualGoalChanged) reasons.push("manual money-goal change");
                         if (result.purchased) reasons.push(`cloud purchase ${result.hostname}`);
                         ns.print(`Target/RAM review complete after ${reasons.join(" + ")}.`);
                     }
@@ -79,8 +97,9 @@ export async function main(ns) {
 
 /**
  * Refresh progression state, optionally buy exactly one advisor-selected cloud
- * server, then publish the final economic target decision. Never loops purchases
- * in one pass, so a large cash balance cannot drain the account in one refresh.
+ * server, then publish the final economic target decision. The cloud buyer has a
+ * direct manual-goal spending lock, so an active manual goal can never authorize
+ * an automatic purchase even if Port 7 contains stale automatic advice.
  */
 async function runEconomyPurchaseTargetChain(ns) {
     const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
