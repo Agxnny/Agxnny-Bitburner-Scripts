@@ -8,15 +8,24 @@ import {
 import { readTelemetryState } from "/lib/telemetry.js";
 import { buildProgressionAdvice, GoalType } from "/lib/progression.js";
 
+const MANUAL_TESTS = Object.freeze([
+    { id: "all", label: "Run smoke tests" },
+    { id: "progression-advisor", label: "Test progression" },
+]);
+
+let manualTestStatus = "Ready";
+
 /**
  * Optional diagnostic dashboard.
  *
- * This remains read-only. Target rankings are consumed from the planner's cached
- * snapshot instead of recomputed here, reducing duplicate analysis work.
+ * This remains read-only except for explicit user-clicked diagnostic test
+ * launches. Target rankings are consumed from the planner's cached snapshot
+ * instead of recomputed here, reducing duplicate analysis work.
  *
  * The dashboard intentionally does not mirror every standalone diagnostic. It
  * only carries compact live checks for subsystems where continuous visibility is
- * useful while developing the automation.
+ * useful while developing the automation, plus a few manual buttons for tests
+ * we may want to rerun on demand without putting them on timers.
  *
  * @param {NS} ns
  */
@@ -25,7 +34,7 @@ export async function main(ns) {
 
     ns.ui.openTail();
     ns.ui.setTailTitle("Bitburner Control - Diagnostics");
-    ns.ui.resizeTail(860, 970);
+    ns.ui.resizeTail(860, 1030);
 
     while (true) {
         render(ns);
@@ -73,6 +82,7 @@ function render(ns) {
         "network/inspect.js",
         "network/root.js",
         "diagnostics/dashboard.js",
+        "diagnostics/test.js",
     ];
 
     const missingFiles = requiredFiles.filter((file) => !ns.fileExists(file, "home"));
@@ -112,6 +122,9 @@ function render(ns) {
 
     ns.print("├──────────────────────── LIVE FUNCTION CHECKS ────────────────────────┤");
     renderLiveChecks(ns, { controller, controllerStale, planner, tactical, telemetry, progression });
+
+    ns.print("├──────────────────────── MANUAL TEST CONTROLS ────────────────────────┤");
+    renderManualTestControls(ns);
 
     ns.print("├─────────────────────────── QUICK CHECKS ──────────────────────────────┤");
     ns.print(`│ Files      ${missingFiles.length === 0 ? "PASS" : "FAIL"}`);
@@ -157,6 +170,52 @@ function renderLiveChecks(ns, state) {
     if (selected) {
         ns.print(`│ Advisor selection  ${selected.title} | value ${Number(selected.valueScore ?? 0).toFixed(2)}`);
     }
+}
+
+/** @param {NS} ns */
+function renderManualTestControls(ns) {
+    const children = MANUAL_TESTS.map((test) => React.createElement(
+        "button",
+        {
+            key: test.id,
+            onClick: () => launchManualTest(ns, test),
+            style: {
+                marginRight: "8px",
+                marginBottom: "4px",
+                padding: "4px 9px",
+                border: "1px solid #666",
+                borderRadius: "4px",
+                background: "#222",
+                color: "#ddd",
+                cursor: "pointer",
+                fontFamily: "monospace",
+            },
+        },
+        test.label,
+    ));
+
+    children.push(React.createElement(
+        "span",
+        {
+            key: "status",
+            style: { marginLeft: "4px", fontFamily: "monospace", opacity: 0.85 },
+        },
+        ` ${manualTestStatus}`,
+    ));
+
+    ns.printRaw(React.createElement(
+        "div",
+        { style: { paddingLeft: "8px", minHeight: "28px" } },
+        ...children,
+    ));
+}
+
+/** @param {NS} ns @param {{id:string,label:string}} test */
+function launchManualTest(ns, test) {
+    const pid = ns.run("/diagnostics/test.js", 1, test.id);
+    manualTestStatus = pid > 0
+        ? `${test.label} launched (pid ${pid})`
+        : `${test.label} could not start - check free home RAM`;
 }
 
 /** @param {NS} ns @param {object|null} controller @param {boolean} stale */
