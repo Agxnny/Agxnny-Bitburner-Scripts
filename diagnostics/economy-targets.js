@@ -22,9 +22,12 @@ export async function main(ns) {
     }
     ns.tprint(`Usable RAM: ${Number(state.usableRam ?? 0).toFixed(2)}GB`);
     if (state.prepPenalty?.model) ns.tprint(`Prep model: ${state.prepPenalty.model}`);
+    if (Array.isArray(state.moneyTargetCandidates)) {
+        ns.tprint(`Money opts: ${state.moneyTargetCandidates.map((value) => `${Math.round(value * 100)}%`).join(", ")}`);
+    }
 
     if (selected) {
-        ns.tprint(`Selected:   ${selected.hostname}`);
+        ns.tprint(`Selected:   ${selected.hostname} @ ${Math.round(Number(selected.moneyTargetPercent ?? 1) * 100)}% money`);
         ns.tprint(`Reason:     ${selected.reason}`);
     }
 
@@ -34,15 +37,33 @@ export async function main(ns) {
         const weighted = target.weightedPrepSeconds ?? target.prepSeconds;
         const multiplier = Number(target.prepPenaltyMultiplier ?? 1);
         const economic = target.economicEtaSeconds ?? target.goalEtaSeconds;
+        const moneyTarget = `${Math.round(Number(target.moneyTargetPercent ?? 1) * 100)}%`;
         ns.tprint(
             `#${target.economicRank} ${String(target.hostname).padEnd(18)}`
-            + ` prep ${formatDuration(target.prepSeconds).padStart(8)}`
+            + ` target ${moneyTarget.padStart(4)}`
+            + ` | prep ${formatDuration(target.prepSeconds).padStart(8)}`
             + ` -> ${formatDuration(weighted).padStart(8)}`
             + ` | x${multiplier.toFixed(1)}`
             + ` | $${ns.format.number(target.steadyIncomePerSecond ?? 0, 2)}/s`
             + ` | economic ${formatDuration(economic)}`
             + ` | baseline #${target.baselineRank}`
         );
+    }
+
+    if (selected?.strategyAlternatives?.length) {
+        ns.tprint("");
+        ns.tprint(`--- ${selected.hostname} MONEY-TARGET ALTERNATIVES ---`);
+        for (const strategy of selected.strategyAlternatives) {
+            ns.tprint(
+                `${String(Math.round(strategy.moneyTargetPercent * 100) + "%").padStart(4)}`
+                + ` | grow ${String(strategy.growThreads ?? 0).padStart(5)}t`
+                + ` / ${String(strategy.growWaves ?? 0).padStart(2)} wave(s)`
+                + ` | prep ${formatDuration(strategy.prepSeconds).padStart(8)}`
+                + ` -> ${formatDuration(strategy.weightedPrepSeconds).padStart(8)}`
+                + ` | $${ns.format.number(strategy.steadyIncomePerSecond ?? 0, 2)}/s`
+                + ` | economic ${formatDuration(strategy.economicEtaSeconds)}`
+            );
+        }
     }
 }
 
