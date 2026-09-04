@@ -56,7 +56,7 @@ Key controls include:
 - **Targets → Manual target override** — set a specific eligible money server as the controller target, or clear the override to return to automatic economic target selection.
 - **Economy → Manual money goal** — set/clear a savings target and spending lock.
 
-React event callbacks only queue plain-JS requests. Netscript port/file work stays in the dashboard main loop so GUI interaction remains stable.
+The dashboard now mounts its React tree once and keeps presentation state alive instead of repeatedly clearing and re-printing the entire UI. Tab selection is React-local and therefore immediate; the asynchronous dashboard loop only refreshes cached runtime snapshots and processes queued commands. React callbacks remain Netscript-free and only mutate plain-JS request/input state.
 
 ## Current architecture
 
@@ -76,9 +76,9 @@ React event callbacks only queue plain-JS requests. Netscript port/file work sta
 
 ## Current batching status
 
-Automatic single-batch production is integrated and the control/review flow is working, but **batch security compensation is the current blocker before pipelining**.
+Automatic single-batch production is integrated and the control/review flow is working. The original W2 under-compensation defect has been corrected.
 
-Latest live automatic batch observation on `sigma-cosmetics`:
+Original failing automatic batch on `sigma-cosmetics`:
 
 ```text
 25H / 1W / 298G / 1W
@@ -86,9 +86,24 @@ money after batch: 100%
 security after batch: +1.13
 ```
 
-The controller safely performed a correction weaken afterward, which confirms the repair path works. However, the intended steady state is for the HWGW batch itself to recover security near minimum without a standalone correction phase.
+Root cause: `growthAnalyzeSecurity(growThreads, target, 1)` was evaluated while the prepared target was already at max money, so host-aware API semantics capped the reported grow-security increase and W2 was reduced to the one-thread minimum.
 
-The next task is to diagnose the batch runner's `hackAnalyzeSecurity`, `growthAnalyzeSecurity`, and `weakenAnalyze` calculations/arguments against the current Bitburner API before implementing overlapping batches.
+The runner now uses the uncapped future-operation calculation:
+
+```text
+ns.growthAnalyzeSecurity(growThreads)
+```
+
+First corrected live batch on the same target:
+
+```text
+25H / 1W / 298G / 24W
+money after batch: 100%
+security after batch: minimum (3.00 / 3.00)
+standalone repair weaken: not required
+```
+
+Repeated automatic-batch validation is still in progress. Several consecutive clean cycles are required before the security issue is treated as fully closed and before overlapping batches are considered.
 
 See `docs/HANDOFF.md` and `docs/TESTING.md` for full context and acceptance criteria.
 
@@ -343,13 +358,12 @@ Home RAM is control-plane capacity, not worker capacity. Persistent home process
 
 Immediate priority:
 
-1. fix single-batch security compensation;
-2. validate repeated automatic batches recover without standalone correction;
-3. add predicted-vs-actual batch recovery and landing telemetry;
-4. measure timing drift and tune/adapt the landing gap;
-5. implement overlapping/pipelined batches with global RAM reservations and collision prevention;
-6. split more dispatch/scheduling work out of the home controller;
-7. optimize the whole remote RAM pool across multiple targets;
-8. flesh out the independent stock subsystem.
+1. validate several consecutive corrected automatic batches recover without standalone correction;
+2. add predicted-vs-actual batch recovery and landing telemetry;
+3. measure timing drift and tune/adapt the landing gap;
+4. implement overlapping/pipelined batches with global RAM reservations and collision prevention;
+5. split more dispatch/scheduling work out of the home controller;
+6. optimize the whole remote RAM pool across multiple targets;
+7. flesh out the independent stock subsystem.
 
 See `docs/ROADMAP.md` for the full staged roadmap.
