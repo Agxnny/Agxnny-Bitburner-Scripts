@@ -23,6 +23,7 @@
     "network/root.js",
     "diagnostics/dashboard.js",
     "diagnostics/income.js",
+    "diagnostics/test.js",
     "gitpull-self-update.js",
     "gitpull.js"
   ]
