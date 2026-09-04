@@ -4,6 +4,8 @@ import {
 } from "/lib/runtime-state.js";
 import { positionalArgs } from "/lib/output.js";
 
+const CONFIG_FILE = "/data/manual-money-goal.txt";
+
 /**
  * Set, inspect, or clear the user-controlled money goal.
  *
@@ -13,8 +15,8 @@ import { positionalArgs } from "/lib/output.js";
  *   run economy/manual-goal.js status
  *   run economy/manual-goal.js clear
  *
- * While active, automated cloud purchasing is locked out and the economic target
- * selector uses the remaining cash to this manual goal as its progression target.
+ * The setting is published immediately on Port 11 and persisted on home so
+ * kickstart can restore the spending lock after script/game restarts.
  *
  * @param {NS} ns
  */
@@ -24,15 +26,16 @@ export async function main(ns) {
     const normalized = command.toLowerCase();
 
     if (["clear", "off", "auto"].includes(normalized)) {
+        const now = Date.now();
         const state = {
             version: 1,
             active: false,
             targetCash: 0,
             title: "",
-            updatedAt: Date.now(),
-            clearedAt: Date.now(),
+            updatedAt: now,
+            clearedAt: now,
         };
-        publishManualMoneyGoalState(ns, state);
+        await persistAndPublish(ns, state);
         ns.tprint("Manual money goal cleared. Automated purchasing is enabled again on the next economy refresh.");
         return;
     }
@@ -52,16 +55,16 @@ export async function main(ns) {
     const title = args.length > 1
         ? args.slice(1).map((value) => String(value)).join(" ")
         : "Manual cash goal";
-
+    const now = Date.now();
     const state = {
         version: 1,
         active: true,
         targetCash,
         title,
-        updatedAt: Date.now(),
-        setAt: Date.now(),
+        updatedAt: now,
+        setAt: now,
     };
-    publishManualMoneyGoalState(ns, state);
+    await persistAndPublish(ns, state);
 
     const cash = Math.max(0, Number(ns.getServerMoneyAvailable("home")) || 0);
     const remaining = Math.max(0, targetCash - cash);
@@ -70,10 +73,16 @@ export async function main(ns) {
     ns.tprint("Clear with: run economy/manual-goal.js clear");
 }
 
+async function persistAndPublish(ns, state) {
+    await ns.write(CONFIG_FILE, JSON.stringify(state), "w");
+    publishManualMoneyGoalState(ns, state);
+}
+
 function printStatus(ns, state) {
     if (!state?.active) {
         ns.tprint("Manual money goal: OFF");
         ns.tprint("Automated purchasing: ENABLED");
+        ns.tprint(`Persistent setting: ${CONFIG_FILE}`);
         return;
     }
 
@@ -84,6 +93,7 @@ function printStatus(ns, state) {
     ns.tprint(`Current cash:      ${formatMoney(cash)}`);
     ns.tprint(`Remaining:         ${formatMoney(remaining)}${remaining <= 0 ? " | GOAL REACHED" : ""}`);
     ns.tprint("Automated purchase: LOCKED");
+    ns.tprint(`Persistent setting: ${CONFIG_FILE}`);
 }
 
 function parseMoney(value) {
