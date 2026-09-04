@@ -17,6 +17,29 @@ run gitpull.js
 run startup.js
 ```
 
+## Documentation / new-chat handoff
+
+For continued development in a fresh chat, start with:
+
+- [`docs/HANDOFF.md`](docs/HANDOFF.md) — current milestone, latest live validation, highest-priority issue, and immediate next work.
+- [`docs/README.md`](docs/README.md) — documentation index and recommended reading order.
+- [`docs/architecture.md`](docs/architecture.md) — architecture and control/data flows.
+- [`docs/SYSTEM_MAP.md`](docs/SYSTEM_MAP.md) — responsibility map by script/module.
+- [`docs/RUNTIME_STATE.md`](docs/RUNTIME_STATE.md) — runtime ports and controller command contract.
+- [`docs/TESTING.md`](docs/TESTING.md) — validation procedures and acceptance criteria.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — prioritized future work.
+
+**GitHub `main` is the source of truth.** Before changing any existing script, fetch/read the current repository file first rather than reconstructing it from an old conversation.
+
+A useful first prompt for a new development chat is:
+
+```text
+Continue my Bitburner automation project from GitHub.
+Read docs/HANDOFF.md first, then inspect the current live files before editing anything.
+The GitHub main branch is the source of truth.
+Work on the highest-priority known issue documented there, and refresh the docs after major changes.
+```
+
 ## Main GUI
 
 ```text
@@ -51,6 +74,24 @@ React event callbacks only queue plain-JS requests. Netscript port/file work sta
 - **Telemetry** records real hack returns and rolling income.
 - **Main GUI** consumes structured state instead of performing expensive analysis itself.
 
+## Current batching status
+
+Automatic single-batch production is integrated and the control/review flow is working, but **batch security compensation is the current blocker before pipelining**.
+
+Latest live automatic batch observation on `sigma-cosmetics`:
+
+```text
+25H / 1W / 298G / 1W
+money after batch: 100%
+security after batch: +1.13
+```
+
+The controller safely performed a correction weaken afterward, which confirms the repair path works. However, the intended steady state is for the HWGW batch itself to recover security near minimum without a standalone correction phase.
+
+The next task is to diagnose the batch runner's `hackAnalyzeSecurity`, `growthAnalyzeSecurity`, and `weakenAnalyze` calculations/arguments against the current Bitburner API before implementing overlapping batches.
+
+See `docs/HANDOFF.md` and `docs/TESTING.md` for full context and acceptance criteria.
+
 ## Execution modes
 
 The controller accepts runtime mode changes through Port 13. The GUI exposes these as two buttons on the Overview tab.
@@ -82,6 +123,8 @@ WEAKEN_GROW
 full batch COMPLETE
         ↓
 planner + economy + target review
+        ↓
+repair target if recovery is imperfect
         ↓
 next batch
 ```
@@ -283,7 +326,13 @@ diagnostics/
   test-launcher.js
 
 docs/
+  README.md
+  HANDOFF.md
   architecture.md
+  SYSTEM_MAP.md
+  RUNTIME_STATE.md
+  TESTING.md
+  ROADMAP.md
 ```
 
 ## RAM philosophy
@@ -292,13 +341,15 @@ Home RAM is control-plane capacity, not worker capacity. Persistent home process
 
 ## Roadmap
 
-1. validate automatic single-batch mode and GUI mode switching on live targets;
-2. measure batch landing drift and recovery accuracy over repeated runs;
-3. add adaptive landing-gap tuning and better batch failure/recovery state;
-4. add overlapping/pipelined batches with RAM reservation and collision prevention;
-5. add target/strategy hysteresis and predicted-versus-actual calibration;
+Immediate priority:
+
+1. fix single-batch security compensation;
+2. validate repeated automatic batches recover without standalone correction;
+3. add predicted-vs-actual batch recovery and landing telemetry;
+4. measure timing drift and tune/adapt the landing gap;
+5. implement overlapping/pipelined batches with global RAM reservations and collision prevention;
 6. split more dispatch/scheduling work out of the home controller;
 7. optimize the whole remote RAM pool across multiple targets;
 8. flesh out the independent stock subsystem.
 
-See `docs/architecture.md` for the architectural direction.
+See `docs/ROADMAP.md` for the full staged roadmap.
