@@ -2,23 +2,24 @@ import { readPlannerState } from "/lib/runtime-state.js";
 import { WORKER_SCRIPTS } from "/lib/execution.js";
 
 const TELEMETRY_SCRIPT = "/hacking/telemetry.js";
+const TEST_LAUNCHER_SCRIPT = "/diagnostics/test-launcher.js";
 
 const SUPPORT_FILES = Object.freeze([
     "/hacking/tactical-planner.js",
     TELEMETRY_SCRIPT,
+    TEST_LAUNCHER_SCRIPT,
+    "/diagnostics/test.js",
     "/lib/threads.js",
     "/lib/runtime-state.js",
     "/lib/telemetry.js",
+    "/lib/progression.js",
     "/lib/state.js",
     "/lib/execution.js",
 ]);
 
 /**
- * Copy execution files from home to every rooted RAM host in the latest planner
- * snapshot. Workers are deployed everywhere, along with tactical-planner and
- * telemetry dependencies so expensive/persistent support work can stay off home.
- *
- * Run after pulling or whenever new execution hosts unlock.
+ * Copy execution/support files from home to every rooted RAM host in the latest
+ * planner snapshot. Persistent support services are then placed off home.
  *
  * @param {NS} ns
  */
@@ -56,9 +57,10 @@ export async function main(ns) {
     }
 
     ns.tprint(`Deployment complete: ${success}/${remoteHosts.length} host(s).`);
-    ns.tprint(`Files per host: ${files.length} (workers + tactical/telemetry support)`);
+    ns.tprint(`Files per host: ${files.length} (workers + tactical/telemetry/diagnostic support)`);
 
-    startTelemetryCollector(ns, remoteHosts);
+    startRemoteService(ns, remoteHosts, TELEMETRY_SCRIPT, "Telemetry collector");
+    startRemoteService(ns, remoteHosts, TEST_LAUNCHER_SCRIPT, "Diagnostic test launcher");
 
     if (String(ns.args[0] ?? "") === "--kickstart") {
         const nextStage = Math.max(0, Math.floor(Number(ns.args[1] ?? 2)));
@@ -67,23 +69,25 @@ export async function main(ns) {
 }
 
 /**
- * Keep one persistent telemetry collector off home. Prefer the smallest remote
- * server with enough free RAM so larger hosts remain available for tactical HGW.
+ * Keep one instance of a persistent support service off home. Prefer the
+ * smallest remote server with enough current free RAM.
  *
  * @param {NS} ns
  * @param {string[]} remoteHosts
+ * @param {string} script
+ * @param {string} label
  */
-function startTelemetryCollector(ns, remoteHosts) {
+function startRemoteService(ns, remoteHosts, script, label) {
     for (const hostname of remoteHosts) {
-        if (ns.isRunning(TELEMETRY_SCRIPT, hostname)) {
-            ns.tprint(`Telemetry collector already running on ${hostname}.`);
+        if (ns.isRunning(script, hostname)) {
+            ns.tprint(`${label} already running on ${hostname}.`);
             return;
         }
     }
 
-    const scriptRam = ns.getScriptRam(TELEMETRY_SCRIPT, "home");
+    const scriptRam = ns.getScriptRam(script, "home");
     if (scriptRam <= 0) {
-        ns.tprint("WARNING: telemetry collector script RAM could not be determined.");
+        ns.tprint(`WARNING: ${label.toLowerCase()} script RAM could not be determined.`);
         return;
     }
 
@@ -96,12 +100,12 @@ function startTelemetryCollector(ns, remoteHosts) {
         .sort((a, b) => a.freeRam - b.freeRam || a.hostname.localeCompare(b.hostname));
 
     for (const host of candidates) {
-        const pid = ns.exec(TELEMETRY_SCRIPT, host.hostname, 1);
+        const pid = ns.exec(script, host.hostname, 1);
         if (pid > 0) {
-            ns.tprint(`Telemetry collector started on ${host.hostname} (${ns.format.ram(scriptRam)}).`);
+            ns.tprint(`${label} started on ${host.hostname} (${ns.format.ram(scriptRam)}).`);
             return;
         }
     }
 
-    ns.tprint("WARNING: no remote host had enough free RAM for the telemetry collector.");
+    ns.tprint(`WARNING: no remote host had enough free RAM for the ${label.toLowerCase()}.`);
 }
