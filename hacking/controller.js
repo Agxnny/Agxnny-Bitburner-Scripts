@@ -1,18 +1,23 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
 import { publishControllerState, readPlannerState, readTacticalPlanState } from "/lib/runtime-state.js";
 import { DEFAULT_HOME_RESERVE_GB, WORKER_SCRIPTS, distributeThreads, getExecutionPool, summarizeExecutionPool } from "/lib/execution.js";
+import { isQuiet, positionalArgs, quietArgs } from "/lib/output.js";
 
 const TACTICAL_PLANNER_SCRIPT = "/hacking/tactical-planner.js";
 const MAX_RECENT_EVENTS = 8;
 
 /** @param {NS} ns */
 export async function main(ns) {
-    const manualTarget = ns.args.length > 0 ? String(ns.args[0]) : null;
+    const args = positionalArgs(ns);
+    const manualTarget = args.length > 0 ? String(args[0]) : null;
+    const quiet = isQuiet(ns);
     let planner = readPlannerState(ns);
     let state = manualTarget ? createManualState(manualTarget) : createStateFromPlanner(planner);
     if (!state) {
-        ns.tprint("ERROR: AUTO mode has no planner snapshot.");
-        ns.tprint("Run: run hacking/planner.js");
+        if (!quiet) {
+            ns.tprint("ERROR: AUTO mode has no planner snapshot.");
+            ns.tprint("Run: run hacking/planner.js");
+        }
         return;
     }
 
@@ -46,8 +51,10 @@ export async function main(ns) {
         if (operationJustFinished) {
             const event = createCompletionEvent(activeOperation, state);
             pushRecentEvent(recentEvents, event);
-            ns.tprint(event.terminalLine);
-            ns.tprint(event.stateLine);
+            if (!quiet) {
+                ns.tprint(event.terminalLine);
+                ns.tprint(event.stateLine);
+            }
             activeOperation = null;
         }
 
@@ -111,9 +118,11 @@ export async function main(ns) {
 
         state.updatedAt = Date.now();
         publishControllerState(ns, state);
-        ns.clearLog();
-        printControllerState(ns, state);
-        printRecentEvents(ns, recentEvents);
+        if (!quiet) {
+            ns.clearLog();
+            printControllerState(ns, state);
+            printRecentEvents(ns, recentEvents);
+        }
         await ns.sleep(1000);
     }
 }
@@ -186,7 +195,7 @@ function launchTacticalPlanner(ns, planner, target, sequence) {
     if (scriptRam <= 0) return { pid: 0, hostname: "", requestId, target };
     for (const host of getExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB)) {
         if (host.usableRam < scriptRam) continue;
-        const pid = ns.exec(TACTICAL_PLANNER_SCRIPT, host.hostname, 1, target, requestId);
+        const pid = ns.exec(TACTICAL_PLANNER_SCRIPT, host.hostname, 1, target, requestId, ...quietArgs(ns));
         if (pid > 0) return { pid, hostname: host.hostname, requestId, target, scriptRam };
     }
     return { pid: 0, hostname: "", requestId, target, scriptRam };
