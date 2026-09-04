@@ -1,6 +1,7 @@
 import {
     isControllerStateStale,
     readControllerState,
+    readEconomyTargetState,
     readPlannerState,
     readTacticalPlanState,
 } from "/lib/runtime-state.js";
@@ -25,7 +26,7 @@ export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
     ns.ui.setTailTitle("Bitburner Control - Diagnostics");
-    ns.ui.resizeTail(860, 960);
+    ns.ui.resizeTail(900, 1080);
 
     while (true) {
         render(ns);
@@ -37,6 +38,7 @@ export async function main(ns) {
 function render(ns) {
     const planner = readPlannerState(ns);
     const tactical = readTacticalPlanState(ns);
+    const economyTargets = readEconomyTargetState(ns);
     const rankedTargets = Array.isArray(planner?.rankings) ? planner.rankings : [];
     const controller = readControllerState(ns);
     const controllerStale = isControllerStateStale(controller);
@@ -58,6 +60,9 @@ function render(ns) {
     ns.print("├──────────────────────────── CONTROLLER ───────────────────────────────┤");
     renderController(ns, controller, controllerStale);
 
+    ns.print("├──────────────────────── TARGET REASONING ─────────────────────────────┤");
+    renderTargetReasoning(ns, controller, planner, economyTargets);
+
     ns.print("├───────────────────────────── NETWORK ─────────────────────────────────┤");
     renderNetwork(ns, network);
 
@@ -74,17 +79,80 @@ function render(ns) {
     renderTargetRanking(ns, rankedTargets, planner);
 
     ns.print("├──────────────────────── LIVE FUNCTION CHECKS ────────────────────────┤");
-    renderLiveChecks(ns, { controller, controllerStale, planner, tactical, telemetry });
+    renderLiveChecks(ns, { controller, controllerStale, planner, tactical, telemetry, economyTargets });
 
     ns.print("├──────────────────────── MANUAL TEST CONTROLS ────────────────────────┤");
     renderManualTestControls(ns);
 
     ns.print("├─────────────────────────── QUICK CHECKS ──────────────────────────────┤");
     ns.print(`│ Planner    ${planner?.selectedTarget ? "PASS" : "WAIT"}`);
+    ns.print(`│ Economy    ${economyTargets?.selectedTarget ? "PASS" : "WAIT"}`);
     ns.print(`│ Network    ${Number(network?.discovered ?? 0) > 0 ? "PASS" : "WAIT"}`);
     ns.print(`│ Workers    ${["/hacking/workers/hack.js", "/hacking/workers/grow.js", "/hacking/workers/weaken.js"].every((path) => Number(workerRam[path] ?? 0) > 0) ? "PASS" : "WAIT"}`);
     ns.print(`│ Controller ${controller && !controllerStale ? "PASS" : "WAIT"}`);
     ns.print("└───────────────────────────────────────────────────────────────────────┘");
+}
+
+function renderTargetReasoning(ns, controller, planner, economyTargets) {
+    if (!economyTargets) {
+        ns.print("│ WAITING - no economic target snapshot yet");
+        if (controller?.reason) ns.print(`│ Controller says: ${String(controller.reason)}`);
+        return;
+    }
+
+    const selected = economyTargets.selectedTarget ?? null;
+    const controllerHost = String(controller?.hostname ?? "");
+    const economicHost = String(selected?.hostname ?? "");
+    const selectionModel = String(planner?.selectionModel ?? "unknown");
+    const ageMs = Math.max(0, Date.now() - Number(economyTargets.updatedAt ?? 0));
+
+    ns.print(`│ Model        ${selectionModel} | snapshot ${formatAge(ageMs)} ago`);
+
+    if (!selected) {
+        ns.print("│ Economic     NO VIABLE TARGET");
+    } else {
+        const targetPercent = Number(selected.moneyTargetPercent ?? 1) * 100;
+        const prepSeconds = Number(selected.prepSeconds ?? 0);
+        const weightedPrep = Number(selected.weightedPrepSeconds ?? prepSeconds);
+        const penalty = Number(selected.prepPenaltyMultiplier ?? 1);
+        const rate = Number(selected.steadyIncomePerSecond ?? 0);
+        const eta = Number(selected.economicEtaSeconds ?? selected.goalEtaSeconds ?? 0);
+        const growThreads = Number(selected.growThreads ?? 0);
+        const growWaves = Number(selected.prepWaves?.grow ?? 0);
+
+        ns.print(`│ Economic     ${economicHost} @ ${targetPercent.toFixed(0)}% money | baseline #${selected.baselineRank ?? "?"}`);
+        ns.print(`│ Prep         ${formatDurationSeconds(prepSeconds)} raw -> ${formatDurationSeconds(weightedPrep)} weighted | x${penalty.toFixed(1)}`);
+        ns.print(`│ Grow load    ${growThreads} thread(s) | ${growWaves} wave(s)`);
+        ns.print(`│ Production   ${formatMoney(rate)}/s | economic ETA ${formatDurationSeconds(eta)}`);
+        ns.print(`│ Why selected ${String(selected.reason ?? "No cached reason")}`);
+    }
+
+    if (controller) {
+        const relation = controllerHost && economicHost
+            ? controllerHost === economicHost ? "MATCH" : "MISMATCH - waiting for idle adoption/review"
+            : "UNKNOWN";
+        ns.print(`│ Controller   ${controllerHost || "unknown"} | ${relation}`);
+        ns.print(`│ Current why  ${String(controller.reason ?? "No controller reason")}`);
+        ns.print(`│ Strategy     desired ${((Number(controller.money?.desiredPercent ?? controller.strategy?.growTargetPercent ?? 1)) * 100).toFixed(0)}% | tactical ${String(controller.tactical?.status ?? "?")}`);
+    }
+
+    const filter = economyTargets.cashValueFilter ?? {};
+    const threshold = Number(filter.ignoreWhenCashPercentAboveServerMax ?? 0);
+    if (threshold > 0) {
+        ns.print(`│ Value rule   ignore server when player cash is >= ${threshold.toFixed(0)}% above its max money`);
+        if (filter.fallbackUsed) ns.print("│ Value rule   FALLBACK ACTIVE - all viable targets were below the value threshold");
+    }
+
+    const rejected = Array.isArray(economyTargets.rejectedTargets) ? economyTargets.rejectedTargets : [];
+    if (rejected.length > 0) {
+        ns.print(`│ Ignored      ${rejected.length} low-value target(s):`);
+        for (const target of rejected.slice(0, 4)) {
+            ns.print(`│   ${String(target.hostname).padEnd(18)} ${String(target.reason ?? "value filter")}`);
+        }
+        if (rejected.length > 4) ns.print(`│   ...and ${rejected.length - 4} more`);
+    } else {
+        ns.print("│ Ignored      none by cash-relative value rule");
+    }
 }
 
 function renderNetwork(ns, network) {
@@ -111,8 +179,13 @@ function renderLiveChecks(ns, state) {
         : Infinity;
     const tacticalHealthy = Boolean(state.tactical) && tacticalAge <= 15000;
 
+    const economyAge = state.economyTargets?.updatedAt
+        ? Math.max(0, Date.now() - Number(state.economyTargets.updatedAt))
+        : Infinity;
+
     ns.print(`│ Controller state   ${state.controller && !state.controllerStale ? "PASS" : "WAIT"}`);
     ns.print(`│ Planner state      ${state.planner?.selectedTarget ? "PASS" : "WAIT"}`);
+    ns.print(`│ Economic target    ${state.economyTargets?.selectedTarget ? `PASS (${formatAge(economyAge)})` : "WAIT"}`);
     ns.print(`│ Tactical state     ${tacticalHealthy ? `PASS (${formatAge(tacticalAge)})` : state.tactical ? `STALE (${formatAge(tacticalAge)})` : "WAIT"}`);
     ns.print(`│ Income telemetry   ${telemetryHealthy ? `PASS (${formatAge(telemetryAge)})` : state.telemetry ? `STALE (${formatAge(telemetryAge)})` : "WAIT"}`);
     ns.print("│ Progression logic  MANUAL - use Test progression button");
@@ -235,6 +308,18 @@ function formatAge(milliseconds) {
     if (!Number.isFinite(milliseconds)) return "unknown";
     if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`;
     return `${(milliseconds / 1000).toFixed(1)}s`;
+}
+
+function formatDurationSeconds(seconds) {
+    const value = Math.max(0, Number(seconds) || 0);
+    if (!Number.isFinite(value) || value >= Number.MAX_SAFE_INTEGER / 2) return "n/a";
+    if (value < 60) return `${value.toFixed(0)}s`;
+    const minutes = Math.floor(value / 60);
+    if (minutes < 60) return `${minutes}m${Math.floor(value % 60)}s`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return `${hours}h${minutes % 60}m`;
+    const days = Math.floor(hours / 24);
+    return `${days}d${hours % 24}h`;
 }
 
 /** @param {NS} ns @param {number} score */
