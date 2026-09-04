@@ -1,5 +1,5 @@
 import { readTelemetryState } from "/lib/telemetry.js";
-import { buildProgressionAdvice } from "/lib/progression.js";
+import { buildProgressionAdvice, GoalType } from "/lib/progression.js";
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -22,6 +22,7 @@ export async function main(ns) {
     ns.tprint(`ETA:         ${formatEta(goal.etaSeconds)}`);
     ns.tprint(`Advice:      ${goal.recommendation}`);
     ns.tprint("");
+    ns.tprint(`Cloud fleet: ${advice.context.cloud.owned}/${advice.context.cloud.serverLimit} servers | max ${advice.context.cloud.ramLimit}GB each`);
     ns.tprint(`Candidates:  ${advice.candidates.length}`);
 
     for (let i = 0; i < advice.candidates.length; i += 1) {
@@ -34,6 +35,10 @@ export async function main(ns) {
         ns.tprint(`- ${candidate.type}: ${candidate.title} ${marker}`.trimEnd());
         ns.tprint(`  Cost $${ns.format.number(candidate.cost, 2)} | +${addedRam.toFixed(0)}GB | value ${value.toFixed(2)} | ${candidate.ready ? "READY" : candidate.mode}`);
         ns.tprint(`  Raw RAM value: ${ramPerMillion.toFixed(2)} GB / $1m | model ${candidate.model?.valueModel ?? "unknown"}`);
+
+        if (candidate.type === GoalType.CLOUD_SERVER_UPGRADE) {
+            ns.tprint(`  Host ${candidate.metadata.hostname} | ${candidate.metadata.currentRam}GB -> ${candidate.metadata.targetRam}GB | compared ${candidate.metadata.eligibleServersCompared} eligible server(s)`);
+        }
     }
 }
 
