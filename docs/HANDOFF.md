@@ -102,38 +102,42 @@ This proves the following pieces are working together:
 
 ## Highest-priority known issue
 
-**Batch security compensation is currently wrong or under-calculated.**
+**Validate the corrected single-batch security compensation over repeated automatic batches.**
 
-The first automatic batch used `25H / 1W / 298G / 1W` and ended at `+1.13` security. Money recovery was correct, but one weaken thread after 298 grow threads is suspicious and the batch should recover much closer to minimum security.
+Root cause of the original `25H / 1W / 298G / 1W` failure was identified on 2026-09-05. `hacking/batch-runner.js` used:
 
-Before implementing overlapping/pipelined batches, diagnose this completely.
+```text
+ns.growthAnalyzeSecurity(growThreads, target, 1)
+```
 
-Primary files to inspect first:
+When a host is supplied, Bitburner caps the reported grow-security increase to the number of grow threads currently needed to reach max money. Batch planning happens while the target is already prepared at max money, so that call reported effectively zero future grow security and W2 was forced to the one-thread minimum.
 
-- `hacking/batch-runner.js`
-- `hacking/workers/hack.js`
-- `hacking/workers/grow.js`
-- `hacking/workers/weaken.js`
-- `lib/threads.js`
-- `lib/execution.js`
+The batch runner now uses the uncapped future-operation form:
 
-Investigate:
+```text
+ns.growthAnalyzeSecurity(growThreads)
+```
 
-- exact `ns.hackAnalyzeSecurity(...)` use;
-- exact `ns.growthAnalyzeSecurity(...)` use and argument semantics for the current Bitburner version;
-- exact `ns.weakenAnalyze(...)` use and core assumptions;
-- whether batch calculations use correct thread counts and server/core parameters;
-- predicted security increase vs measured final security delta;
-- whether any stage allocation or worker argument mismatch changes the actual number of effective threads.
+This makes W2 compensate all grow threads that will execute after HACK rather than the target's pre-hack current state.
 
-Do **not** hide this problem by relying on the post-batch repair weaken. The repair path is a safety net, not the intended steady-state batching model.
+The code fix is committed to `main`, but live repeated-batch validation is still required before treating the issue as closed.
+
+Validate that:
+
+- W2 is now sized proportionally to the grow stage rather than remaining at one thread;
+- several consecutive batches recover security to roughly `+0.00–0.05`;
+- no standalone correction weaken is normally required;
+- money recovery remains correct;
+- one-core assumptions remain valid for the remote worker pool.
+
+Do **not** hide residual problems by relying on the post-batch repair weaken. The repair path is a safety net, not the intended steady-state batching model.
 
 ## Immediate next development sequence
 
 Recommended order:
 
 ```text
-1. Fix single-batch security compensation
+1. Pull/restart and validate corrected single-batch security compensation
 2. Validate repeated automatic batches return to near-minimum security
 3. Add predicted-vs-actual batch recovery telemetry
 4. Measure landing drift / timing error over repeated batches
