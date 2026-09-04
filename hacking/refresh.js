@@ -1,4 +1,5 @@
-import { readControllerState, readPlannerState } from "/lib/runtime-state.js";
+import { readPlannerState } from "/lib/runtime-state.js";
+import { readTelemetryState } from "/lib/telemetry.js";
 import { isQuiet, quietArgs } from "/lib/output.js";
 
 const PLANNER_SCRIPT = "/hacking/planner.js";
@@ -8,23 +9,23 @@ const ECONOMIC_TARGET_SCRIPT = "/hacking/economy-targets.js";
 /**
  * Persistent remote refresh coordinator.
  *
- * The expensive full planner is event-driven rather than timer-driven:
- *  - startup performs only the economy + economic-target pass because kickstart
- *    has already produced the initial planner snapshot,
- *  - after the controller completes a HACK operation, run the full planner,
- *    refresh progression/economy state, and re-rank economic targets,
- *  - do not mark the cycle reviewed until the entire chain succeeds.
+ * The expensive target/RAM planner is event-driven rather than timer-driven.
+ * Kickstart creates the initial planner snapshot; this coordinator then:
+ *   1. performs the initial economy + economic-target pass,
+ *   2. watches Port 5 telemetry for a newly completed HACK,
+ *   3. after each completed HACK, refreshes planner -> economy -> economic target,
+ *   4. leaves the chosen target alone during weaken/grow prep between hacks.
  *
- * This keeps a target stable through its prep/production work and reconsiders it
- * at the natural end of a completed HGW cycle instead of every 30 seconds.
+ * Internal planner launches are always quiet. Running hacking/planner.js manually
+ * still prints its full report.
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     ns.disableLog("ALL");
 
-    const initialController = readControllerState(ns);
-    let lastReviewedHackAt = Number(initialController?.cycle?.lastHackCompletedAt ?? 0);
+    const initialTelemetry = readTelemetryState(ns);
+    let lastReviewedHackAt = Number(initialTelemetry?.lastHack?.finishedAt ?? 0);
     let startupEconomyDone = false;
 
     while (true) {
@@ -36,11 +37,11 @@ export async function main(ns) {
             }
         }
 
-        const controller = readControllerState(ns);
-        const hackCompletedAt = Number(controller?.cycle?.lastHackCompletedAt ?? 0);
+        const telemetry = readTelemetryState(ns);
+        const hackCompletedAt = Number(telemetry?.lastHack?.finishedAt ?? 0);
 
         if (hackCompletedAt > lastReviewedHackAt) {
-            const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT);
+            const plannerOk = await launchAndWait(ns, PLANNER_SCRIPT, true);
             if (plannerOk) {
                 const economyOk = await launchAndWait(ns, ECONOMY_SCRIPT);
                 if (economyOk) {
@@ -48,7 +49,7 @@ export async function main(ns) {
                     if (targetOk) {
                         lastReviewedHackAt = hackCompletedAt;
                         if (!isQuiet(ns)) {
-                            ns.print(`Cycle review complete for hack at ${new Date(hackCompletedAt).toLocaleTimeString()}.`);
+                            ns.print(`Cycle target review complete after HACK at ${new Date(hackCompletedAt).toLocaleTimeString()}.`);
                         }
                     }
                 }
@@ -59,7 +60,7 @@ export async function main(ns) {
     }
 }
 
-async function launchAndWait(ns, script) {
+async function launchAndWait(ns, script, forceQuiet = false) {
     const scriptRam = ns.getScriptRam(script, "home");
     if (!(scriptRam > 0)) {
         if (!isQuiet(ns)) ns.print(`Refresh skipped: could not determine RAM for ${script}`);
@@ -78,8 +79,10 @@ async function launchAndWait(ns, script) {
         .filter((host) => host.freeRam >= scriptRam)
         .sort((a, b) => b.freeRam - a.freeRam || a.hostname.localeCompare(b.hostname));
 
+    const args = forceQuiet ? ["--quiet"] : quietArgs(ns);
+
     for (const host of candidates) {
-        const pid = ns.exec(script, host.hostname, 1, ...quietArgs(ns));
+        const pid = ns.exec(script, host.hostname, 1, ...args);
         if (pid <= 0) continue;
 
         while (ns.isRunning(pid, host.hostname)) await ns.sleep(50);
