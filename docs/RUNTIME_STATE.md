@@ -199,7 +199,9 @@ COMPLETE
 
 Failure state also includes `LAUNCH_FAILED` if a stage cannot launch after reservation/startup; already launched jobs are cancelled.
 
-Useful batch fields include:
+Current batch-state schema version is `2` with model `SINGLE_HWGW_ADDITIONAL_MSEC_V2`.
+
+Core fields include:
 
 - `batchId`;
 - target;
@@ -212,7 +214,48 @@ Useful batch fields include:
 - total batch RAM;
 - final money/security state after all jobs finish.
 
-Port 12 is currently a latest-value snapshot, not a historical batch log.
+### Recovery-model telemetry
+
+The runner records the state it planned from under `initial`:
+
+```text
+money
+maxMoney
+moneyPercent
+desiredMoney
+security
+minSecurity
+securityDelta
+```
+
+The `predicted` object records the expected recovery path using the same batch math that selected the thread counts:
+
+```text
+afterHackMoney
+finalMoney
+finalMoneyPercent
+hackSecurityIncrease
+growSecurityIncrease
+weakenHackEffect
+weakenGrowEffect
+afterHackSecurityDelta
+afterWeakenHackSecurityDelta
+afterGrowSecurityDelta
+finalSecurityDelta
+```
+
+Security prediction applies the minimum-security floor after W1 and W2, matching the intended H → W1 → G → W2 landing sequence.
+
+When status reaches `COMPLETE`, `final` contains the observed money/security state and `comparison` contains:
+
+```text
+moneyPercentError = actual final money percent - predicted final money percent
+securityDeltaError = actual final security delta - predicted final security delta
+```
+
+These errors are the current measurement surface for validating the recovery model before adding per-stage landing-drift telemetry.
+
+Port 12 is currently a latest-value snapshot, not a historical batch log. If multi-batch statistics are needed, a later telemetry layer should retain history separately rather than changing this latest-state contract implicitly.
 
 ## Port 13 — controller command queue
 
