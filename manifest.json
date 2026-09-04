@@ -1,0 +1,13 @@
+{
+  "files": [
+    "hacking/controller.js",
+    "hacking/workers/hack.js",
+    "hacking/workers/grow.js",
+    "hacking/workers/weaken.js",
+    "lib/network.js",
+    "lib/state.js",
+    "network/inspect.js",
+    "network/root.js",
+    "gitpull.js"
+  ]
+}
