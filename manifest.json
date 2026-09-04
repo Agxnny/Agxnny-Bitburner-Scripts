@@ -8,6 +8,7 @@
     "lib/state.js",
     "network/inspect.js",
     "network/root.js",
+    "diagnostics/dashboard.js",
     "gitpull.js"
   ]
 }
