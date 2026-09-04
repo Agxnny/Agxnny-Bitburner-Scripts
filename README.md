@@ -23,9 +23,11 @@ GitHub `main` is the source of truth. For continued development, read `docs/HAND
 run ui/dashboard.js
 ```
 
-Tabs: **Overview, Targets, Economy, Network, Diagnostics**.
+Tabs: **Overview, Targets, Economy, Batch, Network, Diagnostics**.
 
 The dashboard mounts its React tree once. Tab selection is React-local and immediate; Netscript I/O stays in the asynchronous dashboard loop. React callbacks remain Netscript-free.
+
+The dedicated **Batch** tab separates synchronized-HWGW telemetry from the main Overview page. It shows the current batch, the latest completed batch, recovery-model error, timing/order measurements, per-stage landing details, and a planned-vs-actual landing timeline.
 
 ## Architecture summary
 
@@ -50,9 +52,11 @@ standalone repair weaken: not required
 
 Recovery-model telemetry is recorded in Port 12. The current development step is **actual landing-drift measurement**.
 
-Batch workers now receive their planned landing timestamp and emit completion events to **Port 14**. The batch runner aggregates those events into Port 12 schema version 3, including actual stage order, per-stage landing error, within-stage allocation spread, minimum adjacent spacing, missing timing events, and maximum absolute drift.
+Batch workers receive their planned landing timestamp and emit completion events to **Port 14**. The batch runner aggregates those events into Port 12 schema version 3, including actual stage order, per-stage landing error, within-stage allocation spread, minimum adjacent spacing, missing timing events, and maximum absolute drift.
 
 A stage split across several hosts is considered fully landed when its **last allocation** completes.
+
+The most recent `COMPLETE` batch is also copied to **Port 15**, so the GUI can keep showing the previous result even after Port 12 advances to the next running batch.
 
 The configured landing order remains:
 
@@ -83,9 +87,10 @@ Do not implement overlapping batches until repeated timing samples show stable o
 | 9 | rooting/tool state |
 | 10 | cloud-capacity action state |
 | 11 | manual money-goal / spending lock |
-| 12 | synchronized HWGW batch snapshot |
+| 12 | current synchronized HWGW batch snapshot |
 | 13 | controller command queue |
 | 14 | batch worker landing-timing event queue |
+| 15 | latest completed batch snapshot |
 
 Port 14 is currently safe because batching is serialized and the runner clears stale timing events immediately before launch. That behavior must be redesigned before pipelining.
 
@@ -114,7 +119,7 @@ run hacking/batch-runner.js n00dles 0.10 200 1
 
 ## Immediate roadmap
 
-1. collect repeated landing telemetry;
+1. collect repeated landing telemetry in the Batch tab;
 2. measure worst landing error, allocation spread, and minimum stage spacing;
 3. decide whether the 200 ms gap needs tuning/adaptation;
 4. implement overlapping/pipelined batches only after timing is understood;
