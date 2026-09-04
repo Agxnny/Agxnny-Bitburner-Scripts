@@ -38,7 +38,29 @@ Consequences:
 
 ## GUI command architecture
 
-`ui/dashboard.js` uses React only for rendering and plain-JS request assignment inside event callbacks. Netscript APIs are executed by the dashboard's asynchronous main loop.
+`ui/dashboard.js` deliberately separates the React presentation layer from Netscript I/O.
+
+The React tree is mounted once with `ns.printRaw(...)`. It is **not** cleared and remounted on every data refresh. The asynchronous Netscript loop refreshes a plain-JS cached runtime snapshot and increments a version counter; the mounted React root observes that counter and renders the latest cached data.
+
+Presentation-only interaction, especially tab selection, lives in React-local state and therefore does not wait for the Netscript loop. React event callbacks that need controller/file actions only assign plain-JS request state. Netscript APIs are executed later by the dashboard main loop.
+
+```text
+runtime ports/files
+      ↓ Netscript snapshot
+cachedState + stateVersion
+      ↓
+persistent DashboardRoot
+      ↓
+React-local tabs / rendered views
+
+React command click
+      ↓ plain JS request variable
+async dashboard loop
+      ↓ Netscript writePort/write
+controller or service
+```
+
+This avoids the previous repeated `clearLog()` + `printRaw()` remount cycle, which could make tab and mode interactions sluggish or appear hung while a full dashboard tree was being rebuilt.
 
 Port 13 is the controller command queue. Current commands include:
 
@@ -154,11 +176,11 @@ next batch may launch
 
 This prevents a second batch from launching using strategy state calculated before the previous batch finished recovering.
 
-## Current batch correctness issue
+## Current batch correctness status
 
-The automatic batch control path is integrated, but **single-batch security recovery is not yet correct enough for pipelining**.
+The original single-batch security-recovery defect was traced to the grow-security calculation.
 
-Latest live observation on `sigma-cosmetics`:
+Failing live batch on `sigma-cosmetics`:
 
 ```text
 25H / 1W / 298G / 1W
@@ -166,16 +188,30 @@ final money: 100%
 final security: +1.13
 ```
 
-The controller correctly detected the remaining security and launched a standalone weaken correction after strategic review. That repair path is a safety mechanism, not the desired steady-state result.
+The batch planner used:
 
-Before overlapping batches are implemented, investigate the batch runner's security-effect formulas and exact current Bitburner API semantics for:
+```text
+ns.growthAnalyzeSecurity(growThreads, target, 1)
+```
 
-- `hackAnalyzeSecurity`;
-- `growthAnalyzeSecurity`;
-- `weakenAnalyze`;
-- core/thread arguments and worker allocation behavior.
+Because the host-aware form is capped by the grow work needed from the target's **current** money state, calling it while the prepared target was already at max money effectively predicted no future grow-security increase. W2 therefore fell to its one-thread minimum even though 298 grow threads would run after HACK.
 
-The desired single-batch steady state is recovery to the intended money baseline and approximately minimum security without an inter-batch repair phase.
+The corrected batch calculation uses:
+
+```text
+ns.growthAnalyzeSecurity(growThreads)
+```
+
+The first corrected live batch used:
+
+```text
+25H / 1W / 298G / 24W
+final money: 100%
+final security: 3.00 / 3.00
+standalone repair weaken: not required
+```
+
+The next correctness step is repeated-cycle validation. Several consecutive automatic batches should recover to the intended money baseline and approximately minimum security without inter-batch correction work before pipelining begins.
 
 See `docs/HANDOFF.md` and `docs/TESTING.md` for the current evidence and acceptance criteria.
 
@@ -264,6 +300,7 @@ See `docs/RUNTIME_STATE.md` for the detailed state/command contract.
 - prep-and-hold mode
 - GUI command channel
 - runtime HGW/BATCH execution selector
+- persistent React dashboard mount and React-local tab navigation
 
 ### Stage 4 — synchronized batching
 - timing-capable workers
@@ -272,7 +309,8 @@ See `docs/RUNTIME_STATE.md` for the detailed state/command contract.
 - batch runtime state
 - controller automatic single-batch handoff
 - strict post-batch review barrier
-- **current: correct and validate security recovery**
+- corrected W2 grow-security compensation
+- **current: repeated-cycle recovery validation**
 - predicted-vs-actual batch recovery telemetry
 
 ### Stage 5 — pipelined batching
