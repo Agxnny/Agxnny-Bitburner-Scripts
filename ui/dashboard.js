@@ -21,6 +21,8 @@ const TABS = Object.freeze(["Overview", "Targets", "Economy", "Batch", "Network"
 const UI_SYNC_MS = 100;
 const MAIN_TICK_MS = 25;
 const DATA_REFRESH_MS = 1000;
+const WORKER_LATE_RATIO = 0.15;
+const WORKER_LATE_MIN_MS = 5_000;
 
 let requestedTest = null;
 let requestedGoalAction = null;
@@ -164,6 +166,7 @@ function header(s) {
     const locked = Boolean(s.manualGoal?.active);
     const prep = c.prep ?? {};
     const executionMode = c.executionMode?.mode ?? "HGW";
+    const transitioning = Boolean(c.executionMode?.pending);
     const manualTarget = c.targetControl?.mode === "MANUAL";
 
     return el("div", { style: styles.header },
@@ -176,7 +179,7 @@ function header(s) {
         ),
         el("div", { style: styles.badges },
             badge(live ? "CONTROLLER ONLINE" : "CONTROLLER WAITING", live ? "good" : "dim"),
-            badge(executionMode === "BATCH" ? "BATCH HWGW" : "NORMAL HGW", executionMode === "BATCH" ? "accent" : "dim"),
+            transitioning ? badge(`SWITCHING → ${c.executionMode.pending}`, "warn") : badge(executionMode === "BATCH" ? "BATCH HWGW" : "NORMAL HGW", executionMode === "BATCH" ? "accent" : "dim"),
             badge(String(c.phase ?? "BOOTING"), live ? "accent" : "dim"),
             manualTarget ? badge("MANUAL TARGET", "accent") : null,
             prep.active ? badge(`PREP ${prep.stage || "ACTIVE"}`, "warn") : null,
@@ -210,16 +213,21 @@ function overviewView(s) {
     const sec = c.security ?? {};
     const exec = c.execution ?? {};
     const tele = s.telemetry ?? {};
-    const batch = s.batch ?? {};
+    const batch = liveBatchState(s);
     const executionMode = c.executionMode?.mode ?? "HGW";
     const moneyProgress = Number(m.max ?? 0) > 0 ? Number(m.current ?? 0) / Number(m.max ?? 1) : 0;
+    const executionSub = c.executionMode?.pending
+        ? `SWITCHING → ${c.executionMode.pending}`
+        : batch ? `${batch.status} · ${batch.target || "no target"}`
+            : executionMode === "BATCH" ? `${c.tactical?.status ?? "preparing"} · ${c.hostname ?? "target"}`
+                : `${c.tactical?.status ?? "running"} · ${c.hostname ?? "target"}`;
 
     return el("div", null,
         el("div", { style: styles.heroGrid },
             heroMetric("TARGET", c.hostname ?? "waiting", `${c.phase ?? "—"} / ${c.action ?? "—"}`),
             heroMetric("INCOME · 5M", `${moneyFmt(tele.incomePerSecond5m)}/s`, `${Number(tele.hackEvents ?? 0)} hack events`),
             heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} execution hosts`),
-            heroMetric("EXECUTION", executionMode === "BATCH" ? "BATCH HWGW" : "NORMAL HGW", batch.status ? `${batch.status} · ${batch.target || "no target"}` : "no batch state"),
+            heroMetric("EXECUTION", executionMode === "BATCH" ? "BATCH HWGW" : "NORMAL HGW", executionSub),
         ),
         card("Execution mode", executionModeControls(s), true),
         card("Target prep controls", prepControls(s), true),
@@ -231,44 +239,48 @@ function overviewView(s) {
                 kv("Money", `${moneyFmt(m.current)} / ${moneyFmt(m.max)}`),
                 kv("Security", `${num(sec.current)} / ${num(sec.minimum)}`),
                 kv("Tactical", c.tactical?.status ?? "waiting"),
+                kv("Current ETA", actionEtaText(exec.currentAction)),
                 note(c.reason ?? "Waiting for controller state"),
             )),
             card("Execution", executionSummary(s)),
             card("Economy", economySummary(s)),
             card("System health", healthSummary(s)),
         ),
+        card("Active workers", activeWorkersView(s), true),
     );
 }
 
 function executionModeControls(s) {
     const mode = s.controller?.executionMode?.mode ?? "HGW";
     const executionMode = s.controller?.executionMode ?? {};
-    const batch = s.batch ?? {};
-    const batchThreads = batch.threads ?? {};
+    const batch = liveBatchState(s);
+    const batchThreads = batch?.threads ?? {};
+    const transitioning = Boolean(executionMode.pending);
 
     return el("div", null,
         el("div", { style: styles.controlGrid },
             el("div", null,
                 kv("Current mode", mode === "BATCH" ? "SYNCHRONIZED HWGW" : "NORMAL SEQUENTIAL HGW"),
+                transitioning ? kv("Transition", `SWITCHING → ${executionMode.pending}`) : null,
                 kv("Batch gap", `${Number(executionMode.batchGapMs ?? 200)} ms`),
                 kv("Review barrier", executionMode.awaitingReview ? "WAITING FOR STRATEGIC REVIEW" : "READY"),
             ),
             el("div", { style: styles.controlActions },
                 el("button", {
-                    disabled: mode === "HGW",
+                    disabled: transitioning || mode === "HGW",
                     onClick: () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "HGW" }; },
-                    style: { ...styles.clearButton, ...(mode === "HGW" ? styles.disabledButton : {}) },
-                }, "Use normal HGW"),
+                    style: { ...styles.clearButton, ...((transitioning || mode === "HGW") ? styles.disabledButton : {}) },
+                }, transitioning && executionMode.pending === "HGW" ? "Switching to HGW…" : "Use normal HGW"),
                 el("button", {
-                    disabled: mode === "BATCH",
+                    disabled: transitioning || mode === "BATCH",
                     onClick: () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "BATCH" }; },
-                    style: { ...styles.primaryButton, ...(mode === "BATCH" ? styles.disabledButton : {}) },
-                }, "Use batched HWGW"),
+                    style: { ...styles.primaryButton, ...((transitioning || mode === "BATCH") ? styles.disabledButton : {}) },
+                }, transitioning && executionMode.pending === "BATCH" ? "Switching to Batch…" : "Use batched HWGW"),
             ),
         ),
         el("div", { style: styles.goalHint }, "Batch mode prepares the selected strategy target, launches one synchronized HWGW batch, waits for the full batch to recover, then requires a fresh planner/economy review before another batch can start."),
         el("div", { style: styles.goalStatus }, executionMode.lastMessage || controllerActionStatus),
-        batch.status ? el("div", { style: styles.miniGrid },
+        batch ? el("div", { style: styles.miniGrid },
             kv("Batch status", batch.status),
             kv("Batch target", batch.target || "—"),
             kv("Threads", batchThreadsText(batchThreads)),
@@ -312,17 +324,17 @@ function executionSummary(s) {
     const c = s.controller ?? {};
     const exec = c.execution ?? {};
     const mode = c.executionMode ?? {};
-    const batch = s.batch ?? {};
-    const final = batch.final ?? {};
+    const batch = liveBatchState(s);
     return el("div", null,
         kv("Policy", "REMOTE ONLY"),
         kv("Mode", mode.mode ?? "HGW"),
+        mode.pending ? kv("Transition", `→ ${mode.pending}`) : null,
         kv("Active jobs", String(exec.activeJobs ?? 0)),
         kv("Active threads", String(exec.activeThreads ?? 0)),
+        kv("Current ETA", actionEtaText(exec.currentAction)),
         kv("Usable RAM", ramFmt(exec.usableRam)),
-        kv("Batch state", batch.status ?? "idle"),
+        kv("Batch state", batch?.status ?? (mode.batchRunning ? "STARTING" : "idle")),
         mode.awaitingReview ? kv("Review", "WAITING") : null,
-        batch.status === "COMPLETE" ? kv("Recovery", `${pct(final.moneyPercent)} money / +${num(final.securityDelta)} sec`) : null,
         note(mode.lastMessage ?? "Execution controller waiting"),
     );
 }
@@ -458,29 +470,33 @@ function economyView(s) {
 }
 
 function batchView(s) {
-    const current = s.batch ?? {};
+    const current = liveBatchState(s);
     const last = s.lastCompletedBatch ?? null;
-    const currentThreads = current.threads ?? {};
+    const currentThreads = current?.threads ?? {};
     const mode = s.controller?.executionMode ?? {};
+    const currentStatus = current?.status ?? (mode.batchRunning ? "STARTING" : "IDLE");
 
     return el("div", null,
         el("div", { style: styles.heroGrid },
-            heroMetric("CURRENT", current.status ?? "IDLE", current.target || "no active batch"),
-            heroMetric("THREADS", current.status ? batchThreadsText(currentThreads) : "—", current.status ? `${Number(current.launchedJobs ?? 0)} worker allocations` : "waiting"),
-            heroMetric("GAP", `${Number(current.gapMs ?? mode.batchGapMs ?? 200)} ms`, mode.awaitingReview ? "post-batch review waiting" : "review barrier ready"),
+            heroMetric("CURRENT", currentStatus, current?.target || (mode.batchRunning ? s.controller?.hostname || "starting" : "no active batch")),
+            heroMetric("THREADS", current ? batchThreadsText(currentThreads) : "—", current ? `${Number(current.launchedJobs ?? 0)} worker allocations` : "waiting"),
+            heroMetric("W2 ETA", current ? countdownTo(current.timing?.lastLandingAt) : "—", current ? `planned total ${plannedBatchDuration(current)}` : "no active batch"),
             heroMetric("LAST COMPLETE", last ? age(last.finishedAt) : "none", last?.target || "waiting for completed batch"),
         ),
         card("Current batch", el("div", null,
-            kv("Status", current.status ?? "IDLE"),
-            kv("Batch ID", current.batchId ?? "—"),
-            kv("Target", current.target ?? "—"),
-            kv("Threads", current.status ? batchThreadsText(currentThreads) : "—"),
-            kv("Hack fraction", Number.isFinite(Number(current.actualHackFraction)) ? `${(Number(current.actualHackFraction) * 100).toFixed(2)}%` : "—"),
-            kv("Reserved RAM", Number.isFinite(Number(current.totalRam)) ? ramFmt(current.totalRam) : "—"),
-            kv("Landing window", Number.isFinite(Number(current.timing?.landingWindowMs)) ? msFmt(current.timing.landingWindowMs) : "—"),
+            kv("Status", currentStatus),
+            kv("Batch ID", current?.batchId ?? "—"),
+            kv("Target", current?.target ?? (mode.batchRunning ? s.controller?.hostname ?? "—" : "—")),
+            kv("Threads", current ? batchThreadsText(currentThreads) : "—"),
+            kv("Hack fraction", current && Number.isFinite(Number(current.actualHackFraction)) ? `${(Number(current.actualHackFraction) * 100).toFixed(2)}%` : "—"),
+            kv("Reserved RAM", current && Number.isFinite(Number(current.totalRam)) ? ramFmt(current.totalRam) : "—"),
+            kv("Planned total", current ? plannedBatchDuration(current) : "—"),
+            kv("W2 lands", current ? countdownTo(current.timing?.lastLandingAt) : "—"),
+            kv("Landing window", current && Number.isFinite(Number(current.timing?.landingWindowMs)) ? msFmt(current.timing.landingWindowMs) : "—"),
             kv("Review barrier", mode.awaitingReview ? "WAITING" : "READY"),
-            note(current.reason || mode.lastMessage || "Waiting for batch state"),
+            note(current?.reason || mode.lastMessage || "Waiting for batch state"),
         ), true),
+        current ? card("Planned stage schedule", batchPlannedSchedule(current), true) : null,
         last ? card("Planned vs actual landing timeline", batchTimingGraph(last), true) : null,
         last ? grid(
             card("Last completed recovery", batchRecovery(last)),
@@ -488,6 +504,15 @@ function batchView(s) {
         ) : card("Last completed batch", note("No retained completed batch yet. The next completed batch will remain visible here even after another batch begins."), true),
         last ? card("Stage landing detail", batchStageDetails(last), true) : null,
         last ? card("Adjacent landing spacing", batchSpacingDetails(last), true) : null,
+    );
+}
+
+function batchPlannedSchedule(batch) {
+    const stages = Array.isArray(batch.stages) ? batch.stages : [];
+    if (!stages.length) return note("Waiting for planned stage timestamps.");
+    return el("div", null,
+        ...stages.map((stage) => kv(stageShort(stage.name), countdownTo(stage.landingAt))),
+        note("These are planned landing countdowns for the active synchronized batch. Actual completion timing appears in the retained completed-batch graph after W2 finishes."),
     );
 }
 
@@ -582,6 +607,36 @@ function batchSpacingDetails(batch) {
         `${stageShort(entry.from)} → ${stageShort(entry.to)}`,
         msFmt(entry.spacingMs),
     )));
+}
+
+function activeWorkersView(s) {
+    const workers = Array.isArray(s.controller?.execution?.activeWorkers) ? s.controller.execution.activeWorkers : [];
+    if (!workers.length) return note("No standalone H/G/W workers are currently active. Synchronized batch-stage detail is shown on the Batch tab.");
+
+    const shown = workers.slice(0, 14);
+    return el("div", null,
+        el("div", { style: styles.workerHeader },
+            el("span", null, "ACTION / TARGET"),
+            el("span", null, "HOST"),
+            el("span", null, "THREADS"),
+            el("span", null, "ELAPSED"),
+            el("span", null, "ETA / STATUS"),
+        ),
+        ...shown.map((worker) => activeWorkerRow(worker)),
+        workers.length > shown.length ? note(`${workers.length - shown.length} additional active worker allocation(s) not shown.`) : null,
+        note("LATE is an observation only. No automatic worker termination is enabled yet; the late threshold is estimated duration + max(5s, 15%)."),
+    );
+}
+
+function activeWorkerRow(worker) {
+    const timing = workerTiming(worker);
+    return el("div", { key: `${worker.hostname}-${worker.pid}`, style: styles.workerRow },
+        el("span", { style: styles.workerAction }, `${String(worker.action ?? "?")} · ${String(worker.target ?? "?")}`),
+        el("span", { style: styles.workerHost }, String(worker.hostname ?? "?")),
+        el("span", { style: styles.workerMetric }, String(worker.threads ?? 0)),
+        el("span", { style: styles.workerMetric }, compactMs(timing.elapsedMs)),
+        el("span", { style: timing.late ? styles.workerLate : styles.workerHealthy }, timing.label),
+    );
 }
 
 function networkView(s) {
@@ -736,6 +791,68 @@ function command(label, value) {
     );
 }
 
+function liveBatchState(s) {
+    const batch = s.batch ?? null;
+    const mode = s.controller?.executionMode ?? {};
+    if (!batch) return null;
+    if (String(batch.status ?? "") === "COMPLETE") return null;
+    if (!mode.batchRunning && !["PLANNING", "READY", "RUNNING"].includes(String(batch.status ?? ""))) return null;
+    if (batch.target && s.controller?.hostname && batch.target !== s.controller.hostname) return null;
+    return batch;
+}
+
+function actionEtaText(action) {
+    const finishAt = Number(action?.expectedFinishAt ?? 0);
+    if (!(finishAt > 0)) return "—";
+    const remaining = finishAt - Date.now();
+    if (remaining >= 0) return `${String(action?.action ?? "WORK")} · ${compactMs(remaining)} remaining`;
+    const grace = Math.max(WORKER_LATE_MIN_MS, Number(action?.expectedDurationMs ?? 0) * WORKER_LATE_RATIO);
+    const lateBy = -remaining;
+    return lateBy > grace ? `${String(action?.action ?? "WORK")} · LATE ${compactMs(lateBy)}` : `${String(action?.action ?? "WORK")} · finishing`;
+}
+
+function workerTiming(worker) {
+    const now = Date.now();
+    const startedAt = Number(worker?.startedAt ?? 0);
+    const expectedFinishAt = Number(worker?.expectedFinishAt ?? 0);
+    const expectedDurationMs = Number(worker?.expectedDurationMs ?? 0);
+    const elapsedMs = startedAt > 0 ? Math.max(0, now - startedAt) : 0;
+    if (!(expectedFinishAt > 0)) return { elapsedMs, late: false, label: "ETA unknown" };
+    const remainingMs = expectedFinishAt - now;
+    const graceMs = Math.max(WORKER_LATE_MIN_MS, expectedDurationMs * WORKER_LATE_RATIO);
+    if (remainingMs >= 0) return { elapsedMs, late: false, label: `${compactMs(remainingMs)} left` };
+    const lateBy = -remainingMs;
+    if (lateBy <= graceMs) return { elapsedMs, late: false, label: `finishing +${compactMs(lateBy)}` };
+    return { elapsedMs, late: true, label: `LATE +${compactMs(lateBy)}` };
+}
+
+function countdownTo(timestamp) {
+    const n = Number(timestamp ?? 0);
+    if (!(n > 0)) return "—";
+    const remaining = n - Date.now();
+    if (remaining >= 0) return `${compactMs(remaining)} remaining`;
+    return `${compactMs(-remaining)} ago`;
+}
+
+function plannedBatchDuration(batch) {
+    const finish = Number(batch?.timing?.lastLandingAt ?? 0);
+    const start = Number(batch?.launchStartedAt ?? batch?.createdAt ?? 0);
+    if (!(finish > 0) || !(start > 0)) return "—";
+    return compactMs(Math.max(0, finish - start));
+}
+
+function compactMs(value) {
+    const ms = Math.max(0, Number(value ?? 0));
+    if (!Number.isFinite(ms)) return "—";
+    const sec = ms / 1000;
+    if (sec < 60) return `${sec.toFixed(sec < 10 ? 1 : 0)}s`;
+    const min = Math.floor(sec / 60);
+    const rem = Math.floor(sec % 60);
+    if (min < 60) return `${min}m ${rem}s`;
+    const hours = Math.floor(min / 60);
+    return `${hours}h ${min % 60}m`;
+}
+
 function batchThreadsText(threads) {
     return `${Number(threads?.hack ?? 0)}H / ${Number(threads?.weakenHack ?? 0)}W / ${Number(threads?.grow ?? 0)}G / ${Number(threads?.weakenGrow ?? 0)}W`;
 }
@@ -867,6 +984,13 @@ const styles = {
     controlGrid: { display: "grid", gridTemplateColumns: "1fr auto", gap: "16px", alignItems: "center" },
     controlActions: { display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "flex-end" },
     miniGrid: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: "10px", marginTop: "8px" },
+    workerHeader: { display: "grid", gridTemplateColumns: "1.6fr 1.2fr 70px 90px 120px", gap: "10px", padding: "4px 4px 7px", color: "#667789", fontSize: "9px", borderBottom: "1px solid #25313c" },
+    workerRow: { display: "grid", gridTemplateColumns: "1.6fr 1.2fr 70px 90px 120px", gap: "10px", padding: "6px 4px", borderBottom: "1px solid #1a232c", alignItems: "center" },
+    workerAction: { color: "#dce5ed", fontSize: "10px" },
+    workerHost: { color: "#8495a5", fontSize: "10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+    workerMetric: { color: "#9aabba", fontSize: "10px", textAlign: "right" },
+    workerHealthy: { color: "#83d8a9", fontSize: "10px", textAlign: "right" },
+    workerLate: { color: "#ffd479", fontSize: "10px", fontWeight: 700, textAlign: "right" },
     timelineLegend: { display: "flex", alignItems: "center", gap: "16px", marginBottom: "10px", fontSize: "10px", color: "#8090a0" },
     timelineLegendItem: { display: "inline-flex", alignItems: "center", gap: "5px" },
     timelineLegendHint: { marginLeft: "auto", color: "#617181" },
