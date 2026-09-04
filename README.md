@@ -44,7 +44,7 @@ React event callbacks only queue plain-JS requests. Netscript port/file work sta
 - **Prep-and-hold mode** grows to 100%, then weakens to minimum, then stops for batch testing.
 - **Manual target mode** overrides the controller hostname at runtime through Port 13. Target switches wait until current workers/tactical analysis finish.
 - **Progression advisor** compares home RAM, new cloud servers, and cloud-server upgrades.
-- **Cloud capacity automation** can now execute both advisor-selected new-server purchases and existing-server RAM upgrades.
+- **Cloud capacity automation** executes advisor-selected purchases/upgrades and independently retries affordable cloud actions every few seconds, so long prep phases no longer require a HACK completion to trigger spending.
 - **Manual money goal** remains a hard interlock that disables automated cloud spending.
 - **Telemetry** records real hack returns and rolling income.
 - **Main GUI** consumes structured state instead of performing expensive analysis itself.
@@ -95,7 +95,7 @@ PURCHASED_SERVER
 CLOUD_SERVER_UPGRADE
 ```
 
-`network/cloud-buy.js` now handles both actions.
+`network/cloud-buy.js` handles both actions.
 
 New managed servers use deterministic names:
 
@@ -106,9 +106,11 @@ hgw-003
 ...
 ```
 
-When the advisor selects a new cloud server and it is affordable, the automation purchases one server. When it selects a cloud upgrade and that upgrade is affordable, the automation calls `ns.cloud.upgradeServer()` for the selected host/tier. After either capacity change, planner/sync/economy state is refreshed so the new RAM is incorporated into the remote execution pool.
+When the advisor selects a new cloud server or upgrade, `hacking/refresh.js` now performs a lightweight affordability check every 5 seconds using the cached goal cost and live home cash. Once affordable, it retries the cloud spender even if no HACK has completed. This is especially important during long GROW/WEAKEN prep windows and later during batching.
 
-If the advisor currently prefers a non-cloud progression goal such as home RAM, the cloud spender does not override that decision. The Economy tab now shows the selected automatic progression goal and the exact cloud-capacity status/reason.
+The expensive planner/economy/target chain is **not** rerun on every retry. It only runs after a successful capacity change, at which point planner + sync + economy + target selection refresh so the new RAM joins the remote execution pool.
+
+If the advisor currently prefers a non-cloud progression goal such as home RAM, the cloud spender does not override that decision. An active manual money goal blocks both purchases and upgrades.
 
 ## Runtime state and ports
 
@@ -251,7 +253,7 @@ Home RAM is control-plane capacity, not worker capacity. Persistent home process
 
 ## Roadmap
 
-1. validate prep/manual-target GUI controls and cloud purchase/upgrade behavior;
+1. validate prep/manual-target GUI controls and independent cloud purchase/upgrade retries;
 2. expose richer batch timing/health state in the main GUI;
 3. integrate one synchronized batch into automatic production;
 4. move strategic review from raw HACK completion to full batch completion;
