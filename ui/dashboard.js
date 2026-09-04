@@ -16,31 +16,18 @@ const TABS = Object.freeze(["Overview", "Targets", "Economy", "Network", "Diagno
 let activeTab = "Overview";
 let actionStatus = "Ready";
 
-/**
- * Main Bitburner control-plane GUI.
- *
- * This script intentionally consumes cached runtime state only. Expensive game
- * analysis and progression logic stay in the remote planner/services so the UI
- * remains a lightweight home process.
- *
- * @param {NS} ns
- */
+/** @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
     ns.ui.setTailTitle("Agxnny Control Plane");
-    ns.ui.resizeTail(1050, 760);
+    ns.ui.resizeTail(1120, 780);
 
     while (true) {
-        render(ns);
+        ns.clearLog();
+        ns.printRaw(renderApp(ns, snapshot(ns)));
         await ns.sleep(750);
     }
-}
-
-function render(ns) {
-    const state = snapshot(ns);
-    ns.clearLog();
-    ns.printRaw(renderApp(ns, state));
 }
 
 function snapshot(ns) {
@@ -59,225 +46,291 @@ function snapshot(ns) {
 
 function renderApp(ns, s) {
     return el("div", { style: styles.app },
-        renderHeader(s),
-        renderTabs(),
-        el("div", { style: styles.body }, renderActiveTab(ns, s)),
+        header(s),
+        nav(),
+        el("div", { style: styles.content }, activeView(ns, s)),
+        el("div", { style: styles.footer },
+            el("span", null, "CONTROL PLANE"),
+            el("span", null, "HGW workers: remote only"),
+            el("span", null, `Planner ${age(s.planner?.updatedAt)}`),
+        ),
     );
 }
 
-function renderHeader(s) {
-    const controllerLive = s.controller && !isControllerStateStale(s.controller);
-    const selected = s.economic?.selectedTarget ?? null;
-    const lock = Boolean(s.manualGoal?.active);
+function header(s) {
+    const c = s.controller ?? {};
+    const live = Boolean(s.controller) && !isControllerStateStale(s.controller);
+    const target = s.economic?.selectedTarget;
+    const locked = Boolean(s.manualGoal?.active);
     return el("div", { style: styles.header },
         el("div", null,
-            el("div", { style: styles.title }, "AGXNNY // BITBURNER CONTROL PLANE"),
-            el("div", { style: styles.subtle }, `Controller ${controllerLive ? "ONLINE" : "WAITING"}  •  Strategy ${selected ? `${selected.hostname} @ ${pct(selected.moneyTargetPercent)}` : "pending"}`),
+            el("div", { style: styles.eyebrow }, "AGXNNY AUTOMATION"),
+            el("div", { style: styles.title }, "Bitburner Control Plane"),
+            el("div", { style: styles.subtitle }, target
+                ? `${target.hostname} • ${pct(target.moneyTargetPercent)} money strategy`
+                : "Waiting for economic strategy"),
         ),
-        el("div", { style: styles.headerRight },
-            badge(lock ? "SPENDING LOCKED" : "AUTO SPEND", lock ? "warn" : "ok"),
-            badge(String(s.controller?.phase ?? "BOOTING"), controllerLive ? "ok" : "muted"),
+        el("div", { style: styles.badges },
+            badge(live ? "CONTROLLER ONLINE" : "CONTROLLER WAITING", live ? "good" : "dim"),
+            badge(String(c.phase ?? "BOOTING"), live ? "accent" : "dim"),
+            badge(locked ? "SPENDING LOCKED" : "AUTO SPEND", locked ? "warn" : "good"),
         ),
     );
 }
 
-function renderTabs() {
-    return el("div", { style: styles.tabs }, ...TABS.map((tab) => el("button", {
+function nav() {
+    return el("div", { style: styles.nav }, ...TABS.map((tab) => el("button", {
         key: tab,
         onClick: () => { activeTab = tab; },
-        style: { ...styles.tab, ...(activeTab === tab ? styles.tabActive : {}) },
+        style: { ...styles.navButton, ...(activeTab === tab ? styles.navActive : {}) },
     }, tab)));
 }
 
-function renderActiveTab(ns, s) {
-    if (activeTab === "Targets") return renderTargets(s);
-    if (activeTab === "Economy") return renderEconomy(s);
-    if (activeTab === "Network") return renderNetwork(s);
-    if (activeTab === "Diagnostics") return renderDiagnostics(ns, s);
-    return renderOverview(s);
+function activeView(ns, s) {
+    if (activeTab === "Targets") return targetsView(s);
+    if (activeTab === "Economy") return economyView(s);
+    if (activeTab === "Network") return networkView(s);
+    if (activeTab === "Diagnostics") return diagnosticsView(ns, s);
+    return overviewView(s);
 }
 
-function renderOverview(s) {
+function overviewView(s) {
     const c = s.controller ?? {};
-    const money = c.money ?? {};
+    const m = c.money ?? {};
     const sec = c.security ?? {};
     const exec = c.execution ?? {};
     const tele = s.telemetry ?? {};
-    return grid(
-        panel("ACTIVE HGW", rows([
-            ["Target", c.hostname ?? "waiting"],
-            ["Phase", c.phase ?? "waiting"],
-            ["Action", c.action ?? "waiting"],
-            ["Reason", c.reason ?? "No controller state"],
-        ])),
-        panel("TARGET STATE", rows([
-            ["Money", `${moneyFmt(money.current)} / ${moneyFmt(money.max)}`],
-            ["Desired", pct(money.desiredPercent)],
-            ["Security", `${num(sec.current)} / ${num(sec.minimum)} (+${num(Math.max(0, Number(sec.current ?? 0) - Number(sec.minimum ?? 0)))})`],
-            ["Tactical", c.tactical?.status ?? "waiting"],
-        ])),
-        panel("REMOTE EXECUTION", rows([
-            ["Hosts", String(exec.hostCount ?? 0)],
-            ["Usable RAM", ramFmt(exec.usableRam)],
-            ["Active jobs", String(exec.activeJobs ?? 0)],
-            ["Threads", String(exec.activeThreads ?? 0)],
-            ["Policy", "REMOTE ONLY"],
-        ])),
-        panel("INCOME", rows([
-            ["1 minute", `${moneyFmt(tele.incomePerSecond1m)}/s`],
-            ["5 minute", `${moneyFmt(tele.incomePerSecond5m)}/s`],
-            ["Lifetime", `${moneyFmt(tele.incomePerSecond)}/s`],
-            ["Hack events", String(tele.hackEvents ?? 0)],
-        ])),
-        panel("ECONOMY", economySummary(s), true),
-        panel("SYSTEM", systemSummary(s), true),
+    const goal = s.economy?.goal ?? {};
+    const moneyProgress = Number(m.max ?? 0) > 0 ? Number(m.current ?? 0) / Number(m.max ?? 1) : 0;
+
+    return el("div", null,
+        el("div", { style: styles.heroGrid },
+            heroMetric("TARGET", c.hostname ?? "waiting", `${c.phase ?? "—"} / ${c.action ?? "—"}`),
+            heroMetric("INCOME · 5M", `${moneyFmt(tele.incomePerSecond5m)}/s`, `${Number(tele.hackEvents ?? 0)} hack events`),
+            heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} execution hosts`),
+            heroMetric("CASH GOAL", moneyFmt(goal.remaining), goal.title ?? "No active goal"),
+        ),
+        grid(
+            card("Active HGW", el("div", null,
+                kv("Desired money", pct(m.desiredPercent)),
+                progressBar(moneyProgress, `${pct(moneyProgress)} of server max`),
+                kv("Money", `${moneyFmt(m.current)} / ${moneyFmt(m.max)}`),
+                kv("Security", `${num(sec.current)} / ${num(sec.minimum)}`),
+                kv("Tactical", c.tactical?.status ?? "waiting"),
+                note(c.reason ?? "Waiting for controller state"),
+            )),
+            card("Execution", el("div", null,
+                kv("Policy", "REMOTE ONLY"),
+                kv("Active jobs", String(exec.activeJobs ?? 0)),
+                kv("Active threads", String(exec.activeThreads ?? 0)),
+                kv("Usable RAM", ramFmt(exec.usableRam)),
+                kv("Tactical planner", s.tactical?.plannerHost ?? "remote / waiting"),
+            )),
+            card("Economy", economySummary(s)),
+            card("System health", healthSummary(s)),
+        ),
     );
 }
 
-function renderTargets(s) {
-    const selected = s.economic?.selectedTarget ?? null;
+function targetsView(s) {
+    const selected = s.economic?.selectedTarget;
     const rankings = Array.isArray(s.economic?.rankings) ? s.economic.rankings : [];
     const rejected = Array.isArray(s.economic?.rejectedTargets) ? s.economic.rejectedTargets : [];
+
     return el("div", null,
-        panel("TARGET REASONING", selected ? rows([
-            ["Selected", `${selected.hostname} @ ${pct(selected.moneyTargetPercent)}`],
-            ["Prep", `${duration(selected.prepSeconds)} raw → ${duration(selected.weightedPrepSeconds)} weighted`],
-            ["Income", `${moneyFmt(selected.steadyIncomePerSecond)}/s`],
-            ["Economic ETA", duration(selected.economicEtaSeconds)],
-            ["Why", selected.reason ?? "No cached reason"],
-        ]) : text("Waiting for economic target state."), true),
-        panel("ECONOMIC RANKING", el("div", null, ...rankings.slice(0, 8).map((r, i) => targetRow(r, i))), true),
-        panel("IGNORED / FILTERED", rejected.length ? el("div", null, ...rejected.slice(0, 8).map((r) => row(String(r.hostname), String(r.reason ?? "filtered")))) : text("No targets currently filtered."), true),
+        selected ? card("Selected strategy", el("div", null,
+            el("div", { style: styles.strategyTitle }, `${selected.hostname}  ·  ${pct(selected.moneyTargetPercent)} money`),
+            el("div", { style: styles.strategyStats },
+                stat("Prep", duration(selected.prepSeconds)),
+                stat("Weighted", duration(selected.weightedPrepSeconds)),
+                stat("Income", `${moneyFmt(selected.steadyIncomePerSecond)}/s`),
+                stat("Economic ETA", duration(selected.economicEtaSeconds)),
+            ),
+            note(selected.reason ?? "No cached reason"),
+        ), true) : card("Selected strategy", note("Waiting for economic target state."), true),
+        card("Economic ranking", el("div", null, ...rankings.slice(0, 10).map((r, i) => targetRow(r, i))), true),
+        card("Filtered targets", rejected.length
+            ? el("div", null, ...rejected.slice(0, 8).map((r) => kv(String(r.hostname), String(r.reason ?? "filtered"))))
+            : note("No targets currently filtered by the cash-relative value rule."), true),
     );
 }
 
-function renderEconomy(s) {
+function economyView(s) {
     const e = s.economy ?? {};
     const goal = e.goal ?? {};
     const manual = s.manualGoal ?? {};
     const purchase = s.purchase ?? {};
     return grid(
-        panel("ACTIVE MONEY GOAL", rows([
-            ["Mode", e.mode ?? "waiting"],
-            ["Goal", goal.title ?? "No goal"],
-            ["Current cash", moneyFmt(e.cash)],
-            ["Remaining", moneyFmt(goal.remaining)],
-            ["Ready", goal.ready ? "YES" : "NO"],
-        ])),
-        panel("MANUAL SAVINGS LOCK", rows([
-            ["Status", manual.active ? "ACTIVE" : "OFF"],
-            ["Target cash", manual.active ? moneyFmt(manual.targetCash) : "—"],
-            ["Title", manual.title || "—"],
-            ["Auto purchasing", manual.active ? "BLOCKED" : "ENABLED"],
-        ])),
-        panel("CLOUD PURCHASE", rows([
-            ["Status", purchase.status ?? "No purchase state"],
-            ["Last host", purchase.hostname || "—"],
-            ["RAM", purchase.ram ? ramFmt(purchase.ram) : "—"],
-            ["Reason", purchase.reason ?? "—"],
-        ])),
-        panel("COMMANDS", el("div", null,
+        card("Active money goal", el("div", null,
+            kv("Mode", e.mode ?? "waiting"),
+            kv("Goal", goal.title ?? "No goal"),
+            kv("Current cash", moneyFmt(e.cash)),
+            kv("Remaining", moneyFmt(goal.remaining)),
+            kv("Ready", goal.ready ? "YES" : "NO"),
+        )),
+        card("Savings lock", el("div", null,
+            kv("Status", manual.active ? "ACTIVE" : "OFF"),
+            kv("Target", manual.active ? moneyFmt(manual.targetCash) : "—"),
+            kv("Label", manual.title || "—"),
+            kv("Auto purchasing", manual.active ? "BLOCKED" : "ENABLED"),
+        )),
+        card("Cloud purchasing", el("div", null,
+            kv("Status", purchase.status ?? "No state"),
+            kv("Last host", purchase.hostname || "—"),
+            kv("RAM", purchase.ram ? ramFmt(purchase.ram) : "—"),
+            note(purchase.reason ?? "No purchase activity yet"),
+        )),
+        card("Useful commands", el("div", null,
             command("Set savings goal", "run economy/manual-goal.js 50m"),
-            command("Check savings goal", "run economy/manual-goal.js status"),
-            command("Clear savings goal", "run economy/manual-goal.js clear"),
-            command("Economic report", "run diagnostics/economy-targets.js"),
+            command("Check goal", "run economy/manual-goal.js status"),
+            command("Clear goal", "run economy/manual-goal.js clear"),
+            command("Economy report", "run diagnostics/economy-targets.js"),
         )),
     );
 }
 
-function renderNetwork(s) {
+function networkView(s) {
     const n = s.planner?.network ?? {};
     const root = s.root ?? {};
-    const hosts = Array.isArray(s.planner?.executionHosts) ? s.planner.executionHosts.filter((h) => h.hostname !== "home") : [];
+    const hosts = Array.isArray(s.planner?.executionHosts)
+        ? s.planner.executionHosts.filter((h) => h.hostname !== "home")
+        : [];
     return el("div", null,
-        grid(
-            panel("DISCOVERY", rows([
-                ["Discovered", String(n.discovered ?? 0)],
-                ["Rooted", String(n.rooted ?? 0)],
-                ["Rootable now", String(n.rootableNow ?? 0)],
-                ["HGW targets", String(n.hgwTargets ?? 0)],
-            ])),
-            panel("ROOTING", rows([
-                ["Port tools", String(root.portToolCount ?? n.portToolCount ?? 0)],
-                ["Newly rooted", String(root.newlyRooted ?? 0)],
-                ["Last check", age(root.updatedAt)],
-                ["Tools", Array.isArray(root.availableTools) && root.availableTools.length ? root.availableTools.join(", ") : "none"],
-            ])),
+        el("div", { style: styles.heroGrid },
+            heroMetric("DISCOVERED", String(n.discovered ?? 0), "network hosts"),
+            heroMetric("ROOTED", String(n.rooted ?? 0), "available access"),
+            heroMetric("HGW TARGETS", String(n.hgwTargets ?? 0), "money servers"),
+            heroMetric("PORT TOOLS", `${root.portToolCount ?? n.portToolCount ?? 0}/5`, age(root.updatedAt)),
         ),
-        panel("REMOTE RAM POOL", el("div", null, ...hosts.slice(0, 14).map((h) => row(String(h.hostname), `${ramFmt(h.maxRam)} max`))), true),
+        card("Remote execution hosts", el("div", null, ...hosts.slice(0, 18).map((h) => hostRow(h))), true),
+        card("Rooting status", el("div", null,
+            kv("Rootable now", String(n.rootableNow ?? 0)),
+            kv("Newly rooted", String(root.newlyRooted ?? 0)),
+            kv("Last check", age(root.updatedAt)),
+            kv("Tools", Array.isArray(root.availableTools) && root.availableTools.length ? root.availableTools.join(", ") : "none"),
+        ), true),
     );
 }
 
-function renderDiagnostics(ns, s) {
+function diagnosticsView(ns, s) {
     const tacticalAge = s.tactical?.updatedAt ? Date.now() - Number(s.tactical.updatedAt) : Infinity;
     const telemetryAge = s.telemetry?.updatedAt ? Date.now() - Number(s.telemetry.updatedAt) : Infinity;
     return grid(
-        panel("LIVE HEALTH", rows([
-            ["Controller", s.controller && !isControllerStateStale(s.controller) ? "PASS" : "WAIT"],
-            ["Planner", s.planner?.selectedTarget ? "PASS" : "WAIT"],
-            ["Economy", s.economic?.selectedTarget ? "PASS" : "WAIT"],
-            ["Tactical", tacticalAge < 15000 ? "PASS" : "STALE/WAIT"],
-            ["Telemetry", telemetryAge < 5000 ? "PASS" : "STALE/WAIT"],
-        ])),
-        panel("MANUAL TESTS", el("div", null,
-            actionButton(ns, "Smoke tests", "all"),
-            actionButton(ns, "Progression test", "progression-advisor"),
-            el("div", { style: styles.status }, actionStatus),
+        card("Live health", el("div", null,
+            healthRow("Controller", s.controller && !isControllerStateStale(s.controller)),
+            healthRow("Planner", Boolean(s.planner?.selectedTarget)),
+            healthRow("Economy", Boolean(s.economic?.selectedTarget)),
+            healthRow("Tactical", tacticalAge < 15000),
+            healthRow("Telemetry", telemetryAge < 5000),
         )),
-        panel("USEFUL COMMANDS", el("div", null,
+        card("Manual tests", el("div", null,
+            actionButton(ns, "Run smoke tests", "all"),
+            actionButton(ns, "Test progression", "progression-advisor"),
+            el("div", { style: styles.actionStatus }, actionStatus),
+        )),
+        card("State ages", el("div", null,
+            kv("Planner", age(s.planner?.updatedAt)),
+            kv("Economy", age(s.economy?.updatedAt)),
+            kv("Target strategy", age(s.economic?.updatedAt)),
+            kv("Root", age(s.root?.updatedAt)),
+            kv("Cloud purchase", age(s.purchase?.updatedAt)),
+        )),
+        card("Commands", el("div", null,
             command("RAM audit", "run diagnostics/mem-audit.js"),
             command("Income report", "run diagnostics/income.js"),
             command("Network inspect", "run network/inspect.js"),
-            command("Force root check", "run network/root.js"),
+            command("Root check", "run network/root.js"),
         )),
-        panel("STATE AGES", rows([
-            ["Planner", age(s.planner?.updatedAt)],
-            ["Economy", age(s.economy?.updatedAt)],
-            ["Target strategy", age(s.economic?.updatedAt)],
-            ["Root", age(s.root?.updatedAt)],
-            ["Cloud purchase", age(s.purchase?.updatedAt)],
-        ])),
     );
 }
 
 function economySummary(s) {
     const e = s.economy ?? {};
     const goal = e.goal ?? {};
-    return rows([
-        ["Mode", e.mode ?? "waiting"],
-        ["Goal", goal.title ?? "No goal"],
-        ["Cash", moneyFmt(e.cash)],
-        ["Remaining", moneyFmt(goal.remaining)],
-        ["Manual lock", s.manualGoal?.active ? "ACTIVE" : "off"],
-    ]);
+    return el("div", null,
+        kv("Mode", e.mode ?? "waiting"),
+        kv("Goal", goal.title ?? "No goal"),
+        kv("Cash", moneyFmt(e.cash)),
+        kv("Remaining", moneyFmt(goal.remaining)),
+        kv("Manual lock", s.manualGoal?.active ? "ACTIVE" : "off"),
+    );
 }
 
-function systemSummary(s) {
-    const p = s.planner ?? {};
-    const n = p.network ?? {};
-    return rows([
-        ["Hacking level", String(p.hackingLevel ?? "?")],
-        ["Planner age", age(p.updatedAt)],
-        ["Servers discovered", String(n.discovered ?? 0)],
-        ["Port tools", String(n.portToolCount ?? s.root?.portToolCount ?? 0)],
-        ["Root check", age(s.root?.updatedAt)],
-    ]);
+function healthSummary(s) {
+    return el("div", null,
+        healthRow("Controller", Boolean(s.controller) && !isControllerStateStale(s.controller)),
+        healthRow("Planner", Boolean(s.planner?.selectedTarget)),
+        healthRow("Economy", Boolean(s.economic?.selectedTarget)),
+        healthRow("Root service", Boolean(s.root?.updatedAt)),
+        kv("Hacking level", String(s.planner?.hackingLevel ?? "?")),
+    );
 }
 
-function targetRow(r, index) {
-    return el("div", { key: `${r.hostname}-${index}`, style: styles.targetRow },
-        el("span", { style: styles.rank }, `#${r.economicRank ?? index + 1}`),
-        el("span", { style: styles.host }, String(r.hostname)),
-        el("span", { style: styles.metric }, pct(r.moneyTargetPercent)),
-        el("span", { style: styles.metric }, `${moneyFmt(r.steadyIncomePerSecond)}/s`),
-        el("span", { style: styles.metricWide }, duration(r.economicEtaSeconds)),
+function targetRow(r, i) {
+    return el("div", { key: `${r.hostname}-${i}`, style: styles.targetRow },
+        el("span", { style: styles.rank }, `#${r.economicRank ?? i + 1}`),
+        el("span", { style: styles.targetHost }, String(r.hostname)),
+        el("span", { style: styles.targetMetric }, pct(r.moneyTargetPercent)),
+        el("span", { style: styles.targetMetric }, `${moneyFmt(r.steadyIncomePerSecond)}/s`),
+        el("span", { style: styles.targetEta }, duration(r.economicEtaSeconds)),
+    );
+}
+
+function hostRow(h) {
+    return el("div", { key: h.hostname, style: styles.hostRow },
+        el("span", { style: styles.targetHost }, String(h.hostname)),
+        el("span", { style: styles.targetMetric }, `${ramFmt(h.maxRam)} max`),
+        el("span", { style: styles.targetMetric }, `${ramFmt(h.usedRam ?? 0)} used`),
+    );
+}
+
+function heroMetric(label, value, sub) {
+    return el("div", { style: styles.heroCard },
+        el("div", { style: styles.heroLabel }, label),
+        el("div", { style: styles.heroValue }, value),
+        el("div", { style: styles.heroSub }, sub),
+    );
+}
+
+function stat(label, value) {
+    return el("div", { style: styles.stat },
+        el("div", { style: styles.statLabel }, label),
+        el("div", { style: styles.statValue }, String(value)),
+    );
+}
+
+function card(title, content, wide = false) {
+    return el("div", { style: { ...styles.card, ...(wide ? styles.wide : {}) } },
+        el("div", { style: styles.cardTitle }, title),
+        content,
+    );
+}
+
+function grid(...children) { return el("div", { style: styles.grid }, ...children); }
+function kv(k, v) { return el("div", { style: styles.kv }, el("span", { style: styles.key }, k), el("span", { style: styles.value }, String(v))); }
+function note(v) { return el("div", { style: styles.note }, String(v)); }
+function badge(label, tone) { return el("span", { style: { ...styles.badge, ...styles[`badge_${tone}`] } }, label); }
+function el(type, props, ...children) { return React.createElement(type, props, ...children); }
+
+function healthRow(label, ok) {
+    return el("div", { style: styles.kv },
+        el("span", { style: styles.key }, label),
+        el("span", { style: ok ? styles.healthGood : styles.healthWait }, ok ? "ONLINE" : "WAITING"),
+    );
+}
+
+function progressBar(value, label) {
+    const width = `${Math.max(0, Math.min(1, Number(value ?? 0))) * 100}%`;
+    return el("div", { style: styles.progressWrap },
+        el("div", { style: styles.progressTrack }, el("div", { style: { ...styles.progressFill, width } })),
+        el("div", { style: styles.progressLabel }, label),
     );
 }
 
 function actionButton(ns, label, test) {
     return el("button", {
         key: test,
-        style: styles.button,
+        style: styles.actionButton,
         onClick: () => {
             ns.writePort(TEST_REQUEST_PORT, JSON.stringify({ test, requestedAt: Date.now() }));
             actionStatus = `${label} queued`;
@@ -291,20 +344,6 @@ function command(label, value) {
         el("div", { style: styles.code }, value),
     );
 }
-
-function panel(title, content, wide = false) {
-    return el("div", { style: { ...styles.panel, ...(wide ? styles.wide : {}) } },
-        el("div", { style: styles.panelTitle }, title),
-        content,
-    );
-}
-
-function grid(...children) { return el("div", { style: styles.grid }, ...children); }
-function rows(values) { return el("div", null, ...values.map(([k, v]) => row(k, v))); }
-function row(k, v) { return el("div", { style: styles.row }, el("span", { style: styles.key }, k), el("span", { style: styles.value }, String(v))); }
-function text(v) { return el("div", { style: styles.subtle }, v); }
-function badge(label, tone) { return el("span", { style: { ...styles.badge, ...(tone === "ok" ? styles.badgeOk : tone === "warn" ? styles.badgeWarn : {}) } }, label); }
-function el(type, props, ...children) { return React.createElement(type, props, ...children); }
 
 function pct(v) { return `${(Math.max(0, Number(v ?? 0)) * 100).toFixed(0)}%`; }
 function num(v) { return Number(v ?? 0).toFixed(2); }
@@ -322,46 +361,67 @@ function age(ts) {
     if (!n) return "never";
     const sec = Math.max(0, (Date.now() - n) / 1000);
     if (sec < 60) return `${sec.toFixed(0)}s ago`;
-    return `${Math.floor(sec / 60)}m ${Math.floor(sec % 60)}s ago`;
+    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+    return `${Math.floor(sec / 3600)}h ago`;
 }
-function duration(v) {
-    const sec = Math.max(0, Number(v ?? 0));
-    if (!Number.isFinite(sec)) return "∞";
-    if (sec < 60) return `${sec.toFixed(0)}s`;
-    const min = Math.floor(sec / 60);
-    if (min < 60) return `${min}m ${Math.floor(sec % 60)}s`;
-    const hr = Math.floor(min / 60);
-    return `${hr}h ${min % 60}m`;
+function duration(sec) {
+    const n = Math.max(0, Number(sec ?? 0));
+    if (!Number.isFinite(n)) return "∞";
+    if (n < 60) return `${n.toFixed(0)}s`;
+    if (n < 3600) return `${Math.floor(n / 60)}m ${Math.floor(n % 60)}s`;
+    return `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`;
 }
 
 const styles = {
-    app: { fontFamily: "monospace", padding: "10px", minHeight: "700px", background: "#0d1117", color: "#d8dee9" },
-    header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px", padding: "10px 12px", border: "1px solid #30363d", borderRadius: "6px", background: "#111820" },
-    headerRight: { display: "flex", gap: "8px" },
-    title: { fontSize: "16px", fontWeight: 700, letterSpacing: "1px" },
-    subtle: { opacity: 0.72, marginTop: "3px", lineHeight: 1.4 },
-    tabs: { display: "flex", gap: "6px", marginBottom: "10px" },
-    tab: { padding: "6px 12px", border: "1px solid #30363d", borderRadius: "5px", background: "#111820", color: "#aab4c0", cursor: "pointer", fontFamily: "monospace" },
-    tabActive: { background: "#1d2733", color: "#ffffff", border: "1px solid #5a6b7d" },
-    body: { minHeight: "600px" },
-    grid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" },
-    panel: { border: "1px solid #30363d", borderRadius: "6px", padding: "10px 12px", background: "#111820", marginBottom: "10px", overflow: "hidden" },
-    wide: { gridColumn: "1 / -1" },
-    panelTitle: { fontWeight: 700, fontSize: "12px", letterSpacing: "0.8px", marginBottom: "8px", opacity: 0.9 },
-    row: { display: "flex", justifyContent: "space-between", gap: "14px", borderTop: "1px solid #202a35", padding: "5px 0" },
-    key: { opacity: 0.68, flexShrink: 0 },
-    value: { textAlign: "right", overflowWrap: "anywhere" },
-    badge: { padding: "4px 7px", borderRadius: "999px", fontSize: "10px", border: "1px solid #46515e", opacity: 0.8 },
-    badgeOk: { border: "1px solid #3a7254", opacity: 1 },
-    badgeWarn: { border: "1px solid #8b6a35", opacity: 1 },
-    targetRow: { display: "grid", gridTemplateColumns: "45px 1fr 80px 110px 110px", gap: "8px", padding: "6px 0", borderTop: "1px solid #202a35", alignItems: "center" },
-    rank: { opacity: 0.55 },
-    host: { fontWeight: 700 },
-    metric: { textAlign: "right" },
-    metricWide: { textAlign: "right", opacity: 0.8 },
-    button: { marginRight: "8px", marginBottom: "8px", padding: "6px 10px", border: "1px solid #4b5867", borderRadius: "5px", background: "#1b2430", color: "#e5e9f0", cursor: "pointer", fontFamily: "monospace" },
-    status: { marginTop: "6px", opacity: 0.7 },
+    app: { fontFamily: "monospace", color: "#d7e0ea", background: "#0b0f14", minHeight: "100%", padding: "16px", boxSizing: "border-box" },
+    header: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", padding: "8px 4px 18px", borderBottom: "1px solid #26303b" },
+    eyebrow: { fontSize: "11px", letterSpacing: "2px", color: "#6c7f92", marginBottom: "4px" },
+    title: { fontSize: "25px", fontWeight: 700, color: "#f3f7fb" },
+    subtitle: { fontSize: "12px", color: "#8998a8", marginTop: "5px" },
+    badges: { display: "flex", gap: "7px", flexWrap: "wrap", justifyContent: "flex-end" },
+    badge: { padding: "5px 8px", borderRadius: "5px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.5px", border: "1px solid #34404d" },
+    badge_good: { color: "#8be9b4", borderColor: "#24543c", background: "#10241b" },
+    badge_warn: { color: "#ffd479", borderColor: "#5f4821", background: "#281f0e" },
+    badge_accent: { color: "#8ed0ff", borderColor: "#285276", background: "#102235" },
+    badge_dim: { color: "#8593a1", background: "#151a20" },
+    nav: { display: "flex", gap: "4px", padding: "12px 0" },
+    navButton: { fontFamily: "monospace", border: "0", borderBottom: "2px solid transparent", background: "transparent", color: "#728191", padding: "8px 12px", cursor: "pointer", fontSize: "12px" },
+    navActive: { color: "#e9f2fa", borderBottom: "2px solid #4fa3dc", background: "#101821" },
+    content: { paddingTop: "2px" },
+    heroGrid: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "10px", marginBottom: "10px" },
+    heroCard: { background: "#10161d", border: "1px solid #242f3a", borderRadius: "8px", padding: "13px" },
+    heroLabel: { fontSize: "10px", color: "#708090", letterSpacing: "1px" },
+    heroValue: { fontSize: "20px", color: "#f1f5f9", marginTop: "5px", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis" },
+    heroSub: { fontSize: "10px", color: "#7d8b99", marginTop: "4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+    grid: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "10px" },
+    card: { background: "#10161d", border: "1px solid #242f3a", borderRadius: "8px", padding: "14px", minWidth: 0 },
+    wide: { gridColumn: "1 / -1", marginBottom: "10px" },
+    cardTitle: { color: "#91a8bb", fontSize: "11px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase", marginBottom: "10px" },
+    kv: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "12px", padding: "4px 0", borderBottom: "1px solid #18212a" },
+    key: { color: "#758595", fontSize: "11px", flex: "0 0 125px" },
+    value: { color: "#d8e1e9", fontSize: "11px", textAlign: "right", overflowWrap: "anywhere" },
+    note: { color: "#8796a5", fontSize: "10px", lineHeight: 1.5, marginTop: "10px", padding: "8px", background: "#0c1218", borderLeft: "2px solid #35566f" },
+    strategyTitle: { fontSize: "18px", fontWeight: 700, color: "#f0f5fa", marginBottom: "10px" },
+    strategyStats: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: "8px" },
+    stat: { background: "#0c1218", border: "1px solid #1d2730", borderRadius: "6px", padding: "8px" },
+    statLabel: { color: "#69798a", fontSize: "9px", textTransform: "uppercase" },
+    statValue: { color: "#e8eef4", fontSize: "13px", marginTop: "4px" },
+    targetRow: { display: "grid", gridTemplateColumns: "44px 1.5fr 90px 120px 120px", gap: "10px", padding: "7px 4px", borderBottom: "1px solid #1a232c", alignItems: "center" },
+    hostRow: { display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr", gap: "10px", padding: "7px 4px", borderBottom: "1px solid #1a232c" },
+    rank: { color: "#5e88a6", fontSize: "10px" },
+    targetHost: { color: "#e0e8ef", fontSize: "11px" },
+    targetMetric: { color: "#8fa0af", fontSize: "10px", textAlign: "right" },
+    targetEta: { color: "#9dc7e4", fontSize: "10px", textAlign: "right" },
+    progressWrap: { margin: "8px 0 10px" },
+    progressTrack: { height: "6px", borderRadius: "6px", background: "#1a232c", overflow: "hidden" },
+    progressFill: { height: "100%", background: "#438ab8" },
+    progressLabel: { color: "#687888", fontSize: "9px", marginTop: "4px" },
+    healthGood: { color: "#83d8a9", fontSize: "10px", fontWeight: 700 },
+    healthWait: { color: "#d4ae69", fontSize: "10px", fontWeight: 700 },
+    actionButton: { fontFamily: "monospace", marginRight: "8px", marginBottom: "8px", padding: "7px 10px", borderRadius: "5px", border: "1px solid #32536a", background: "#112334", color: "#b8dcf4", cursor: "pointer" },
+    actionStatus: { color: "#7f8e9c", fontSize: "10px", marginTop: "4px" },
     command: { marginBottom: "9px" },
-    commandLabel: { fontSize: "11px", opacity: 0.65, marginBottom: "2px" },
-    code: { padding: "5px 7px", background: "#0b0f14", border: "1px solid #252d37", borderRadius: "4px", overflowWrap: "anywhere" },
+    commandLabel: { color: "#708090", fontSize: "9px", marginBottom: "3px" },
+    code: { color: "#b8d6e8", background: "#0b1117", border: "1px solid #1d2832", borderRadius: "4px", padding: "5px 7px", fontSize: "10px" },
+    footer: { display: "flex", justifyContent: "space-between", gap: "12px", color: "#50606f", fontSize: "9px", padding: "12px 3px 0" },
 };
