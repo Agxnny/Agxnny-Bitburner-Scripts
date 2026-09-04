@@ -1,4 +1,3 @@
-import { analyzeNetwork, getAvailablePortOpeners } from "/lib/network.js";
 import {
     isControllerStateStale,
     readControllerState,
@@ -16,9 +15,9 @@ const MANUAL_TESTS = Object.freeze([
 let manualTestStatus = "Ready";
 
 /**
- * Read-only live dashboard plus explicit user-triggered manual test requests.
- * Expensive progression analysis stays out of this process; the progression
- * advisor is exercised through the manual test button instead.
+ * Lightweight read-only live dashboard plus explicit user-triggered manual test
+ * requests. Expensive network/progression analysis is performed by short-lived
+ * planners/tests and consumed here as cached state.
  *
  * @param {NS} ns
  */
@@ -26,7 +25,7 @@ export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
     ns.ui.setTailTitle("Bitburner Control - Diagnostics");
-    ns.ui.resizeTail(860, 1000);
+    ns.ui.resizeTail(860, 960);
 
     while (true) {
         render(ns);
@@ -36,77 +35,39 @@ export async function main(ns) {
 
 /** @param {NS} ns */
 function render(ns) {
-    const servers = analyzeNetwork(ns);
-    const tools = getAvailablePortOpeners(ns);
     const planner = readPlannerState(ns);
     const tactical = readTacticalPlanState(ns);
     const rankedTargets = Array.isArray(planner?.rankings) ? planner.rankings : [];
     const controller = readControllerState(ns);
     const controllerStale = isControllerStateStale(controller);
     const telemetry = readTelemetryState(ns);
-
-    const rooted = servers.filter((s) => s.hasRoot);
-    const rootable = servers.filter((s) => !s.hasRoot && s.canRootNow);
-    const hackableMoney = servers.filter((s) => s.canHackNow && s.target.hasMoney);
-    const blockedMoney = servers.filter((s) => !s.canBecomeHackableNow && s.target.hasMoney);
+    const network = planner?.network ?? null;
+    const workerRam = planner?.workerRam ?? {};
 
     const homeMaxRam = ns.getServerMaxRam("home");
     const homeUsedRam = ns.getServerUsedRam("home");
     const homeFreeRam = Math.max(0, homeMaxRam - homeUsedRam);
 
-    const requiredFiles = [
-        "gitpull.js",
-        "hacking/controller.js",
-        "hacking/planner.js",
-        "hacking/targets.js",
-        "hacking/workers/hack.js",
-        "hacking/workers/grow.js",
-        "hacking/workers/weaken.js",
-        "lib/execution.js",
-        "lib/network.js",
-        "lib/runtime-state.js",
-        "lib/state.js",
-        "lib/targets.js",
-        "lib/telemetry.js",
-        "network/deploy.js",
-        "network/inspect.js",
-        "network/root.js",
-        "diagnostics/dashboard.js",
-        "diagnostics/test.js",
-        "diagnostics/test-launcher.js",
-    ];
-
-    const missingFiles = requiredFiles.filter((file) => !ns.fileExists(file, "home"));
-    const workerRam = {
-        hack: safeScriptRam(ns, "hacking/workers/hack.js"),
-        grow: safeScriptRam(ns, "hacking/workers/grow.js"),
-        weaken: safeScriptRam(ns, "hacking/workers/weaken.js"),
-    };
-
     ns.clearLog();
     ns.print("┌──────────────────────── BITBURNER DIAGNOSTICS ────────────────────────┐");
-    ns.print(`│ Status       ${missingFiles.length === 0 ? "OK" : "FILES MISSING"}`);
-    ns.print(`│ Hack level   ${String(ns.getHackingLevel()).padEnd(8)} Home RAM ${formatRam(homeUsedRam)} / ${formatRam(homeMaxRam)}`);
-    ns.print(`│ Free RAM     ${formatRam(homeFreeRam).padEnd(10)} Port tools ${tools.length}/5`);
+    ns.print(`│ Planner      ${planner ? `cached ${formatAge(Math.max(0, Date.now() - Number(planner.updatedAt ?? 0)))} ago` : "WAITING"}`);
+    ns.print(`│ Hack level   ${String(planner?.hackingLevel ?? "?").padEnd(8)} Home RAM ${formatRam(homeUsedRam)} / ${formatRam(homeMaxRam)}`);
+    ns.print(`│ Free RAM     ${formatRam(homeFreeRam).padEnd(10)} Port tools ${Number(network?.portToolCount ?? 0)}/5`);
+
     ns.print("├──────────────────────────── CONTROLLER ───────────────────────────────┤");
     renderController(ns, controller, controllerStale);
-    ns.print("├───────────────────────────── NETWORK ─────────────────────────────────┤");
-    ns.print(`│ Discovered   ${servers.length}`);
-    ns.print(`│ Rooted       ${rooted.length}`);
-    ns.print(`│ Rootable now ${rootable.length}`);
-    ns.print(`│ HGW targets  ${hackableMoney.length}`);
-    ns.print(`│ Blocked $$$  ${blockedMoney.length}`);
-    ns.print("├───────────────────────────── WORKERS ─────────────────────────────────┤");
-    ns.print(`│ hack.js      ${formatRam(workerRam.hack)}`);
-    ns.print(`│ grow.js      ${formatRam(workerRam.grow)}`);
-    ns.print(`│ weaken.js    ${formatRam(workerRam.weaken)}`);
-    ns.print("├────────────────────────── AVAILABLE TOOLS ────────────────────────────┤");
-    ns.print(`│ ${tools.length > 0 ? tools.map((tool) => tool.file).join(", ") : "None"}`);
 
-    if (missingFiles.length > 0) {
-        ns.print("├────────────────────────── MISSING FILES ──────────────────────────────┤");
-        for (const file of missingFiles) ns.print(`│ ! ${file}`);
-    }
+    ns.print("├───────────────────────────── NETWORK ─────────────────────────────────┤");
+    renderNetwork(ns, network);
+
+    ns.print("├───────────────────────────── WORKERS ─────────────────────────────────┤");
+    ns.print(`│ hack.js      ${formatRam(workerRam["/hacking/workers/hack.js"] ?? 0)}`);
+    ns.print(`│ grow.js      ${formatRam(workerRam["/hacking/workers/grow.js"] ?? 0)}`);
+    ns.print(`│ weaken.js    ${formatRam(workerRam["/hacking/workers/weaken.js"] ?? 0)}`);
+
+    ns.print("├────────────────────────── AVAILABLE TOOLS ────────────────────────────┤");
+    const tools = Array.isArray(network?.availableTools) ? network.availableTools : [];
+    ns.print(`│ ${tools.length > 0 ? tools.join(", ") : "None / planner data unavailable"}`);
 
     ns.print("├────────────────────────── TARGET RANKING ─────────────────────────────┤");
     renderTargetRanking(ns, rankedTargets, planner);
@@ -118,12 +79,24 @@ function render(ns) {
     renderManualTestControls(ns);
 
     ns.print("├─────────────────────────── QUICK CHECKS ──────────────────────────────┤");
-    ns.print(`│ Files      ${missingFiles.length === 0 ? "PASS" : "FAIL"}`);
-    ns.print(`│ Discovery  ${servers.length > 0 ? "PASS" : "FAIL"}`);
-    ns.print(`│ Workers    ${Object.values(workerRam).every((ram) => ram > 0) ? "PASS" : "FAIL"}`);
     ns.print(`│ Planner    ${planner?.selectedTarget ? "PASS" : "WAIT"}`);
+    ns.print(`│ Network    ${Number(network?.discovered ?? 0) > 0 ? "PASS" : "WAIT"}`);
+    ns.print(`│ Workers    ${["/hacking/workers/hack.js", "/hacking/workers/grow.js", "/hacking/workers/weaken.js"].every((path) => Number(workerRam[path] ?? 0) > 0) ? "PASS" : "WAIT"}`);
     ns.print(`│ Controller ${controller && !controllerStale ? "PASS" : "WAIT"}`);
     ns.print("└───────────────────────────────────────────────────────────────────────┘");
+}
+
+function renderNetwork(ns, network) {
+    if (!network) {
+        ns.print("│ WAITING - refresh hacking/planner.js");
+        return;
+    }
+
+    ns.print(`│ Discovered   ${Number(network.discovered ?? 0)}`);
+    ns.print(`│ Rooted       ${Number(network.rooted ?? 0)}`);
+    ns.print(`│ Rootable now ${Number(network.rootableNow ?? 0)}`);
+    ns.print(`│ HGW targets  ${Number(network.hgwTargets ?? 0)}`);
+    ns.print(`│ Blocked $$$  ${Number(network.blockedMoney ?? 0)}`);
 }
 
 function renderLiveChecks(ns, state) {
@@ -237,12 +210,6 @@ function renderTargetRanking(ns, targets, planner) {
         const prep = `${(target.money.percent * 100).toFixed(0)}% $ / +${target.security.delta.toFixed(2)} sec`;
         ns.print(`│ ${rank}${host} score ${score} | ${chance} | ${time} | ${prep}`);
     }
-}
-
-/** @param {NS} ns @param {string} file */
-function safeScriptRam(ns, file) {
-    if (!ns.fileExists(file, "home")) return 0;
-    return ns.getScriptRam(file, "home");
 }
 
 function formatRam(gb) {
