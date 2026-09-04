@@ -93,30 +93,59 @@ Recovery-model telemetry is already present in Port 12. Timing instrumentation i
 - earliest completion and within-stage spread are retained;
 - Port 12 schema version 3 publishes aggregated landing telemetry.
 
-Port 12 is the current batch slot, so a new batch can overwrite the just-completed result. To keep completed measurements visible, every `COMPLETE` payload is now also copied to **Port 15**, the latest-completed batch snapshot.
+Port 12 is the current batch slot, so a new batch can overwrite the just-completed result. To keep completed measurements visible, every `COMPLETE` payload is also copied to **Port 15**, the latest-completed batch snapshot.
 
-The main GUI now has a dedicated **Batch** tab that reads both states:
+The main GUI has a dedicated **Batch** tab that reads both states:
 
 ```text
 Port 12 → current batch
 Port 15 → latest completed batch
 ```
 
-The Batch tab shows current batch status, last completed recovery, actual stage order, minimum spacing, maximum drift, missing events, per-stage error/spread, and a **planned-vs-actual landing timeline**. Each H/W1/G/W2 row plots planned and actual completion markers on the same horizontal axis so systematic early/late landing is visible immediately.
+The Batch tab shows current batch status, planned H/W1/G/W2 landing countdowns, planned total duration, W2 ETA, last completed recovery, actual stage order, minimum spacing, maximum drift, missing events, per-stage error/spread, and a **planned-vs-actual landing timeline**.
+
+## New observability layer
+
+The controller now publishes timing estimates for standalone H/G/W allocations under `execution.activeWorkers` and an aggregate `execution.currentAction` summary.
+
+Each active worker includes:
+
+```text
+pid
+hostname
+threads
+action
+target
+startedAt
+expectedDurationMs
+expectedFinishAt
+```
+
+The Overview GUI now includes:
+
+- current action ETA;
+- an Active Workers panel with action, target, host, threads, elapsed time, ETA/status;
+- read-only `LATE` highlighting after expected duration + `max(5s, 15%)`;
+- no automatic termination yet;
+- stale historical Port 12 `COMPLETE` state is no longer shown as the current batch;
+- execution-mode transition buttons are disabled while `SWITCHING → HGW/BATCH` is pending.
+
+This observability work is intentionally non-destructive. **Do not add automatic worker killing yet.** After batching timing is understood, add a watchdog as a separate reliability milestone using measured runtime variation and a safe recovery path for partial operations.
 
 ## Immediate next development sequence
 
 Recommended order:
 
 ```text
-1. Pull/restart and verify HGW → BATCH GUI switching completes at a safe boundary
-2. Allow at least one new batch to complete
+1. Pull/restart and verify the new ETA/worker UI does not disrupt controller operation
+2. Allow at least one new synchronized batch to complete
 3. Inspect the Batch tab retained completed result
 4. Confirm H → W1 → G → W2 actual order remains correct
 5. Collect several samples of max landing error, minimum spacing, and allocation spread
 6. Decide whether the fixed 200 ms gap has sufficient safety margin
 7. Tune/adapt the gap only if measurements justify it
 8. Only then implement overlapping/pipelined batches
+9. After batch timing is stable, design watchdog kill/recovery behavior from observed runtimes
 ```
 
 Before pipelining, several consecutive automatic batches should recover money/security correctly, require no standalone correction work, report all worker timing events, and preserve the intended landing order with understood timing margin.
@@ -141,8 +170,6 @@ Do not jump directly to overlapping batches. The existing system deliberately se
 - an already-running synchronized batch is allowed to finish naturally;
 - the controller publishes the pending transition through `executionMode.pending` / `transitioning` until the safe boundary is reached;
 - only then is the new execution mode applied.
-
-This prevents a mode button from appearing ignored because the controller keeps creating new work while waiting to become idle.
 
 ### Full-batch review boundary
 
@@ -170,6 +197,10 @@ Port 4 remains the HACK event queue used by income/strategic refresh logic. Port
 
 Port 15 retains one completed batch for GUI inspection. It is not yet a rolling history/statistics store. If timing trends across many batches are needed later, add a separate history layer rather than changing Port 15 semantics implicitly.
 
+### Worker lateness is diagnostic only
+
+The current GUI can label a standalone worker `LATE`, but the controller does not kill it. A future watchdog must distinguish harmless scheduler drift from genuinely stuck work and must force target recovery after any killed partial operation.
+
 ## Important user-facing controls
 
 Main GUI: `ui/dashboard.js`
@@ -183,7 +214,7 @@ Tabs:
 - Network
 - Diagnostics
 
-The Batch tab is now the primary synchronized-HWGW observability surface.
+The Batch tab is the primary synchronized-HWGW observability surface. Overview now also exposes active standalone worker timing and ETA.
 
 ## Useful commands
 
