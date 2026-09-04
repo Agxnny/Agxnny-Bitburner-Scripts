@@ -1,5 +1,5 @@
 import { WORKER_SCRIPTS, getExecutionPool } from "/lib/execution.js";
-import { publishBatchState, readPlannerState } from "/lib/runtime-state.js";
+import { RuntimePort, publishBatchState, readPlannerState } from "/lib/runtime-state.js";
 import { isQuiet, positionalArgs } from "/lib/output.js";
 
 const DEFAULT_HACK_FRACTION = 0.10;
@@ -8,6 +8,7 @@ const DEFAULT_MONEY_TARGET_PERCENT = 1;
 const SECURITY_TOLERANCE = 0.05;
 const MONEY_TOLERANCE = 0.995;
 const START_LEAD_MS = 150;
+const EXPECTED_STAGE_ORDER = Object.freeze(["HACK", "WEAKEN_HACK", "GROW", "WEAKEN_GROW"]);
 
 /**
  * Execute one synchronized HWGW batch on a prepared target.
@@ -44,7 +45,12 @@ export async function main(ns) {
         return;
     }
 
+    // Single-batch mode guarantees there is only one active batch coordinator.
+    // Clear stale timing events left by an interrupted prior run before launch.
+    ns.getPortHandle(RuntimePort.BATCH_TIMING_EVENTS).clear();
+
     const launched = [];
+    const timingEvents = [];
     const launchStartedAt = Date.now();
 
     for (const stage of plan.stages) {
@@ -61,6 +67,7 @@ export async function main(ns) {
                 additionalMsec,
                 batchId,
                 stage.name,
+                stage.landingAt,
             );
 
             if (pid <= 0) {
@@ -81,6 +88,7 @@ export async function main(ns) {
                 hostname: allocation.hostname,
                 threads: allocation.threads,
                 stage: stage.name,
+                jobId,
             });
         }
     }
@@ -94,8 +102,10 @@ export async function main(ns) {
     });
 
     while (launched.some((job) => ns.isRunning(job.pid, job.hostname))) {
+        drainTimingEvents(ns, batchId, timingEvents);
         await ns.sleep(25);
     }
+    drainTimingEvents(ns, batchId, timingEvents);
 
     const finishedAt = Date.now();
     const money = ns.getServerMoneyAvailable(target);
@@ -107,9 +117,12 @@ export async function main(ns) {
     const predicted = plan.state.predicted ?? {};
     const predictedMoneyPercent = Number(predicted.finalMoneyPercent ?? 0);
     const predictedSecurityDelta = Number(predicted.finalSecurityDelta ?? 0);
+    const landing = summarizeLanding(plan.state.stages ?? [], timingEvents);
 
     const complete = {
         ...plan.state,
+        version: 3,
+        model: "SINGLE_HWGW_ADDITIONAL_MSEC_V3",
         status: "COMPLETE",
         launchedJobs: launched.length,
         launchStartedAt,
@@ -127,6 +140,7 @@ export async function main(ns) {
             moneyPercentError: moneyPercent - predictedMoneyPercent,
             securityDeltaError: securityDelta - predictedSecurityDelta,
         },
+        landing,
         updatedAt: finishedAt,
     };
     publishBatchState(ns, complete);
@@ -136,6 +150,7 @@ export async function main(ns) {
         ns.tprint(`[BATCH] Predicted money ${(predictedMoneyPercent * 100).toFixed(2)}% | security +${predictedSecurityDelta.toFixed(3)}`);
         ns.tprint(`[BATCH] Actual    money ${(moneyPercent * 100).toFixed(2)}% | security +${securityDelta.toFixed(3)}`);
         ns.tprint(`[BATCH] Error     money ${(complete.comparison.moneyPercentError * 100).toFixed(3)}pp | security ${signed(complete.comparison.securityDeltaError, 3)}`);
+        ns.tprint(`[BATCH] Landing   ${landing.orderCorrect ? "ORDER OK" : "ORDER ERROR"} | min spacing ${fmtMs(landing.minimumSpacingMs)} | max drift ${fmtMs(landing.maxAbsLandingErrorMs)}`);
     }
 }
 
@@ -148,8 +163,8 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
     const securityDelta = Math.max(0, security - minSecurity);
 
     const baseState = {
-        version: 2,
-        model: "SINGLE_HWGW_ADDITIONAL_MSEC_V2",
+        version: 3,
+        model: "SINGLE_HWGW_ADDITIONAL_MSEC_V3",
         batchId,
         target,
         plannerUpdatedAt: Number(planner?.updatedAt ?? 0),
@@ -187,20 +202,12 @@ function buildBatchPlan(ns, target, planner, batchId, requestedHackFraction, gap
     if (!(weakenPerThread > 0)) return fail(baseState, "weakenAnalyze returned zero");
 
     const hackSecurity = Math.max(0, ns.hackAnalyzeSecurity(hackThreads, target));
-    // Do not pass target here. growthAnalyzeSecurity(threads, host, cores) caps
-    // the result to the grow threads needed from the target's CURRENT money.
-    // Batch planning happens while the target is prepared at max money, but the
-    // GROW stage runs only after HACK has removed money. We therefore need the
-    // uncapped per-thread security increase for every planned grow thread.
     const growSecurity = Math.max(0, ns.growthAnalyzeSecurity(growThreads));
     const weakenHackThreads = Math.max(1, Math.ceil(hackSecurity / weakenPerThread));
     const weakenGrowThreads = Math.max(1, Math.ceil(growSecurity / weakenPerThread));
     const weakenHackEffect = weakenHackThreads * weakenPerThread;
     const weakenGrowEffect = weakenGrowThreads * weakenPerThread;
 
-    // Recovery prediction follows the planned landing order and applies the
-    // minimum-security floor after each weaken. This gives later telemetry a
-    // stable expected baseline without requiring the GUI to duplicate batch math.
     const predictedAfterHackMoney = Math.max(0, money * (1 - actualHackFraction));
     const predictedFinalMoney = Math.min(maxMoney, predictedAfterHackMoney * recoveryMultiplier);
     const predictedAfterHackSecurityDelta = securityDelta + hackSecurity;
@@ -292,8 +299,6 @@ function allocateBatch(ns, planner, specs) {
     });
     if (work.some((stage) => !(stage.scriptRam > 0))) return { ok: false, reason: "Could not determine worker RAM", stages: [] };
 
-    // Allocate largest RAM stages first so fragmentation is less likely to make a
-    // theoretically fitting batch fail.
     const allocationOrder = [...work].sort((a, b) => b.ram - a.ram);
     for (const stage of allocationOrder) {
         let remainingThreads = stage.threads;
@@ -315,6 +320,86 @@ function allocateBatch(ns, planner, specs) {
     return { ok: true, stages: specs.map((spec) => work.find((stage) => stage.name === spec.name)), reason: "" };
 }
 
+function drainTimingEvents(ns, batchId, sink) {
+    const port = ns.getPortHandle(RuntimePort.BATCH_TIMING_EVENTS);
+    while (!port.empty()) {
+        const raw = port.read();
+        try {
+            const event = JSON.parse(String(raw));
+            if (event?.type === "BATCH_STAGE_COMPLETE" && String(event.batchId ?? "") === batchId) {
+                sink.push(event);
+            }
+        } catch {
+            // Ignore malformed timing events; missing-job telemetry will expose it.
+        }
+    }
+}
+
+function summarizeLanding(stages, events) {
+    const stageResults = stages.map((stage) => {
+        const matching = events
+            .filter((event) => String(event.stage ?? "") === stage.name)
+            .sort((a, b) => Number(a.finishedAt ?? 0) - Number(b.finishedAt ?? 0));
+        const expectedJobs = Array.isArray(stage.allocations) ? stage.allocations.length : 0;
+        const firstCompletionAt = matching.length ? Number(matching[0].finishedAt ?? 0) : 0;
+        const actualLandingAt = matching.length ? Number(matching[matching.length - 1].finishedAt ?? 0) : 0;
+        const plannedLandingAt = Number(stage.landingAt ?? 0);
+        return {
+            name: stage.name,
+            plannedLandingAt,
+            expectedJobs,
+            reportedJobs: matching.length,
+            missingJobs: Math.max(0, expectedJobs - matching.length),
+            firstCompletionAt,
+            actualLandingAt,
+            allocationSpreadMs: matching.length > 1 ? actualLandingAt - firstCompletionAt : 0,
+            landingErrorMs: actualLandingAt > 0 ? actualLandingAt - plannedLandingAt : null,
+            complete: matching.length === expectedJobs && expectedJobs > 0,
+        };
+    });
+
+    const completeStages = stageResults.filter((stage) => stage.actualLandingAt > 0);
+    const actualOrder = [...completeStages]
+        .sort((a, b) => a.actualLandingAt - b.actualLandingAt)
+        .map((stage) => stage.name);
+    const allReported = stageResults.every((stage) => stage.complete);
+    const orderCorrect = allReported
+        && EXPECTED_STAGE_ORDER.every((name, index) => actualOrder[index] === name);
+
+    const adjacentSpacing = [];
+    for (let i = 1; i < stageResults.length; i += 1) {
+        const previous = stageResults[i - 1];
+        const current = stageResults[i];
+        adjacentSpacing.push({
+            from: previous.name,
+            to: current.name,
+            spacingMs: previous.actualLandingAt > 0 && current.actualLandingAt > 0
+                ? current.actualLandingAt - previous.actualLandingAt
+                : null,
+        });
+    }
+
+    const validSpacing = adjacentSpacing
+        .map((entry) => entry.spacingMs)
+        .filter((value) => Number.isFinite(value));
+    const validErrors = stageResults
+        .map((stage) => stage.landingErrorMs)
+        .filter((value) => Number.isFinite(value));
+
+    return {
+        expectedOrder: [...EXPECTED_STAGE_ORDER],
+        actualOrder,
+        orderCorrect,
+        expectedJobs: stageResults.reduce((sum, stage) => sum + stage.expectedJobs, 0),
+        reportedJobs: events.length,
+        missingJobs: stageResults.reduce((sum, stage) => sum + stage.missingJobs, 0),
+        minimumSpacingMs: validSpacing.length ? Math.min(...validSpacing) : null,
+        maxAbsLandingErrorMs: validErrors.length ? Math.max(...validErrors.map((value) => Math.abs(value))) : null,
+        adjacentSpacing,
+        stages: stageResults,
+    };
+}
+
 function fail(baseState, reason, extra = {}) {
     return {
         ok: false,
@@ -331,6 +416,10 @@ function finiteCeil(value) {
 function signed(value, digits = 3) {
     const n = Number(value ?? 0);
     return `${n >= 0 ? "+" : ""}${n.toFixed(digits)}`;
+}
+
+function fmtMs(value) {
+    return Number.isFinite(value) ? `${Number(value).toFixed(0)}ms` : "n/a";
 }
 
 function clamp(value, minimum, maximum) {
