@@ -6,6 +6,7 @@ export async function main(ns) {
     const telemetry = readTelemetryState(ns);
     const advice = buildProgressionAdvice(ns, telemetry);
     const goal = advice.selected;
+    const homeCore = advice.context.homeCore;
 
     ns.tprint("=== PROGRESSION ADVISOR ===");
     ns.tprint(`Mode:        ${advice.mode}`);
@@ -22,6 +23,8 @@ export async function main(ns) {
     ns.tprint(`ETA:         ${formatEta(goal.etaSeconds)}`);
     ns.tprint(`Advice:      ${goal.recommendation}`);
     ns.tprint("");
+    ns.tprint(`Home core:   ${advice.context.homeRam}GB / ${homeCore.thresholdRam}GB threshold | ${homeCore.belowThreshold ? "BOOSTED" : "normal"}`);
+    ns.tprint(`Core need:   ${homeCore.scriptRam.toFixed(2)}GB scripts + ${homeCore.reserveRam.toFixed(2)}GB reserve = ${homeCore.requiredRam.toFixed(2)}GB`);
     ns.tprint(`Cloud fleet: ${advice.context.cloud.owned}/${advice.context.cloud.serverLimit} servers | max ${advice.context.cloud.ramLimit}GB each`);
     ns.tprint(`Candidates:  ${advice.candidates.length}`);
 
@@ -30,10 +33,11 @@ export async function main(ns) {
         const value = Number(candidate.valueScore ?? 0);
         const addedRam = Number(candidate.valueMetrics?.addedRam ?? 0);
         const ramPerMillion = Number(candidate.valueMetrics?.ramPerMillionDollars ?? 0);
+        const weight = Number(candidate.valueMetrics?.roleWeight ?? 0);
         const marker = i === 0 ? "<-- SELECTED" : "";
 
         ns.tprint(`- ${candidate.type}: ${candidate.title} ${marker}`.trimEnd());
-        ns.tprint(`  Cost $${ns.format.number(candidate.cost, 2)} | +${addedRam.toFixed(0)}GB | value ${value.toFixed(2)} | ${candidate.ready ? "READY" : candidate.mode}`);
+        ns.tprint(`  Cost $${ns.format.number(candidate.cost, 2)} | +${addedRam.toFixed(0)}GB | value ${value.toFixed(2)} | weight ${weight.toFixed(2)}x | ${candidate.ready ? "READY" : candidate.mode}`);
         ns.tprint(`  Raw RAM value: ${ramPerMillion.toFixed(2)} GB / $1m | model ${candidate.model?.valueModel ?? "unknown"}`);
 
         if (candidate.type === GoalType.CLOUD_SERVER_UPGRADE) {
