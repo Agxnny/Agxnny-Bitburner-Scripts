@@ -1,21 +1,29 @@
 import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
-import { publishControllerState, readPlannerState } from "/lib/runtime-state.js";
+import {
+    publishControllerState,
+    readPlannerState,
+    readTacticalPlanState,
+} from "/lib/runtime-state.js";
 import {
     DEFAULT_HOME_RESERVE_GB,
     WORKER_SCRIPTS,
     distributeThreads,
+    getExecutionPool,
     summarizeExecutionPool,
 } from "/lib/execution.js";
+
+const TACTICAL_PLANNER_SCRIPT = "/hacking/tactical-planner.js";
 
 /**
  * Lightweight persistent HGW controller.
  *
- * AUTO mode consumes cached planner state instead of performing network-wide
- * analysis itself. The controller monitors one target and currently dispatches
- * one HGW thread at a time across the rooted execution pool. This conservative
- * foundation proves distributed execution without overcommitting RAM; the next
- * thread-calculator layer will replace the single-thread request with calculated
- * thread counts while reusing the same allocator.
+ * Expensive HGW thread analysis is delegated to a short-lived tactical planner
+ * that normally runs on a rooted remote RAM host. The controller requests one
+ * tactical calculation, executes that plan across the distributed RAM pool,
+ * waits for the launched workers to finish, then requests a fresh calculation.
+ *
+ * This keeps live phase/thread decisions current without carrying the expensive
+ * analysis APIs in the persistent controller.
  *
  * Supplying a hostname forces MANUAL target mode. The latest planner snapshot is
  * still used as the execution-host inventory when available.
@@ -39,39 +47,98 @@ export async function main(ns) {
     ns.disableLog("sleep");
 
     let activeJobs = [];
+    let tacticalJob = null;
+    let pendingRequestId = "";
+    let requestSequence = 0;
     let jobSequence = 0;
 
     while (true) {
         planner = readPlannerState(ns);
         activeJobs = activeJobs.filter((job) => ns.isRunning(job.pid, job.hostname));
 
-        // Do not switch targets while a worker from the previous target is still
-        // running. Adopt fresh planner choices between jobs instead.
-        if (!manualTarget && activeJobs.length === 0) {
+        if (tacticalJob && !ns.isRunning(tacticalJob.pid, tacticalJob.hostname)) {
+            tacticalJob = null;
+        }
+
+        // Adopt a different AUTO target only between both worker and tactical jobs.
+        if (!manualTarget && activeJobs.length === 0 && !tacticalJob) {
+            const previousTarget = state.hostname;
             state = adoptLatestPlannerTarget(planner, state);
+            if (state.hostname !== previousTarget) {
+                pendingRequestId = "";
+            }
         }
 
         updateObservedState(ns, state);
         chooseFoundationAction(state);
         updateExecutionState(ns, state, planner, activeJobs);
 
-        if (activeJobs.length === 0) {
-            const dispatch = dispatchFoundationAction(ns, planner, state, ++jobSequence);
-            state.execution.lastDispatch = dispatch;
-            activeJobs = dispatch.allocations.map((allocation) => ({
-                hostname: allocation.hostname,
-                pid: allocation.pid,
-                threads: allocation.threads,
-                action: state.action,
-                target: state.hostname,
-            }));
+        if (activeJobs.length > 0) {
+            state.tactical.status = "WAITING_WORKERS";
+            state.reason += ` | waiting for ${activeJobs.length} worker job(s)`;
+        } else {
+            const tacticalPlan = readTacticalPlanState(ns);
 
-            if (dispatch.launched > 0) {
-                state.execution.activeJobs = activeJobs.length;
-                state.execution.activeThreads = dispatch.launched;
-                state.reason += ` | dispatched ${dispatch.launched} thread(s)`;
+            if (isRequestedPlan(tacticalPlan, state.hostname, pendingRequestId)) {
+                applyTacticalPlan(state, tacticalPlan);
+
+                const dispatch = dispatchTacticalAction(
+                    ns,
+                    planner,
+                    state,
+                    tacticalPlan,
+                    ++jobSequence,
+                );
+
+                state.execution.lastDispatch = dispatch;
+                state.threads.launched = dispatch.launched;
+                state.threads.remaining = dispatch.remaining;
+
+                activeJobs = dispatch.allocations.map((allocation) => ({
+                    hostname: allocation.hostname,
+                    pid: allocation.pid,
+                    threads: allocation.threads,
+                    action: state.action,
+                    target: state.hostname,
+                }));
+
+                if (dispatch.launched > 0) {
+                    // Any launched work changes target state, so this plan must
+                    // never be reused after the workers complete.
+                    pendingRequestId = "";
+                    state.tactical.status = "EXECUTING";
+                    state.execution.activeJobs = activeJobs.length;
+                    state.execution.activeThreads = dispatch.launched;
+                    state.reason += ` | dispatched ${dispatch.launched}/${dispatch.requested} thread(s)`;
+                } else {
+                    state.tactical.status = "READY";
+                    state.reason += " | calculated plan ready, waiting for deployable RAM";
+                }
+            } else if (!tacticalJob) {
+                const request = launchTacticalPlanner(
+                    ns,
+                    planner,
+                    state.hostname,
+                    ++requestSequence,
+                );
+
+                if (request.pid > 0) {
+                    tacticalJob = request;
+                    pendingRequestId = request.requestId;
+                    state.tactical.status = "CALCULATING";
+                    state.tactical.requestId = request.requestId;
+                    state.tactical.plannerHost = request.hostname;
+                    state.reason += ` | tactical calculation running on ${request.hostname}`;
+                } else {
+                    pendingRequestId = "";
+                    state.tactical.status = "BLOCKED";
+                    state.reason += " | no execution host has enough free RAM for tactical analysis";
+                }
             } else {
-                state.reason += " | waiting for deployable RAM";
+                state.tactical.status = "CALCULATING";
+                state.tactical.requestId = tacticalJob.requestId;
+                state.tactical.plannerHost = tacticalJob.hostname;
+                state.reason += ` | tactical calculation running on ${tacticalJob.hostname}`;
             }
         }
 
@@ -179,37 +246,127 @@ function updateExecutionState(ns, state, planner, activeJobs) {
 }
 
 /**
- * Conservative first dispatcher: one thread per completed action. The allocator
- * can already split larger requests across hosts; calculated requests come next.
+ * Start one expensive tactical calculation on the first execution host that has
+ * enough currently-usable RAM. exec() failures fall through to the next host,
+ * which also makes a missing remote deployment fail safely.
+ *
+ * @param {NS} ns
+ * @param {object|null} planner
+ * @param {string} target
+ * @param {number} sequence
+ */
+function launchTacticalPlanner(ns, planner, target, sequence) {
+    const scriptRam = ns.getScriptRam(TACTICAL_PLANNER_SCRIPT, "home");
+    const requestId = `tactical-${Date.now()}-${sequence}`;
+
+    if (scriptRam <= 0) {
+        return { pid: 0, hostname: "", requestId, target };
+    }
+
+    for (const host of getExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB)) {
+        if (host.usableRam < scriptRam) continue;
+
+        const pid = ns.exec(TACTICAL_PLANNER_SCRIPT, host.hostname, 1, target, requestId);
+        if (pid > 0) {
+            return {
+                pid,
+                hostname: host.hostname,
+                requestId,
+                target,
+                scriptRam,
+            };
+        }
+    }
+
+    return { pid: 0, hostname: "", requestId, target, scriptRam };
+}
+
+/**
+ * @param {object|null} plan
+ * @param {string} target
+ * @param {string} requestId
+ */
+function isRequestedPlan(plan, target, requestId) {
+    if (!plan || !requestId) return false;
+    return plan.hostname === target && plan.requestId === requestId;
+}
+
+/**
+ * @param {ReturnType<createTargetState>} state
+ * @param {object} plan
+ */
+function applyTacticalPlan(state, plan) {
+    state.phase = String(plan.next?.phase ?? state.phase);
+    state.action = String(plan.next?.action ?? ActionType.NONE);
+    state.reason = String(plan.next?.reason ?? "Tactical plan ready");
+
+    state.strategy.hackPercent = Number(plan.options?.hackFraction ?? 0);
+    state.strategy.growTargetPercent = Number(plan.options?.moneyTargetPercent ?? 1);
+    state.money.desiredPercent = state.strategy.growTargetPercent;
+
+    state.threads.hack = Number(plan.threads?.hack ?? 0);
+    state.threads.grow = Number(plan.threads?.grow ?? 0);
+    state.threads.weaken = tacticalWeakenThreads(plan);
+    state.threads.requested = Number(plan.next?.requestedThreads ?? 0);
+    state.threads.launched = 0;
+    state.threads.remaining = state.threads.requested;
+
+    state.tactical.status = "READY";
+    state.tactical.requestId = String(plan.requestId ?? "");
+    state.tactical.plannerHost = String(plan.plannerHost ?? "");
+    state.tactical.calculatedAt = Number(plan.calculatedAt ?? plan.updatedAt ?? 0);
+}
+
+function tacticalWeakenThreads(plan) {
+    const action = String(plan.next?.action ?? "");
+    if (action === ActionType.WEAKEN) {
+        return Number(plan.threads?.securityPrepWeaken ?? 0);
+    }
+    if (action === ActionType.GROW) {
+        return Number(plan.threads?.growWeaken ?? 0);
+    }
+    if (action === ActionType.HACK) {
+        return Number(plan.threads?.hackWeaken ?? 0);
+    }
+    return 0;
+}
+
+/**
+ * Dispatch as much of the tactical plan as the current pool can afford. If only
+ * a subset fits, target state is recalculated after that subset completes rather
+ * than blindly launching the stale remainder.
  *
  * @param {NS} ns
  * @param {object|null} planner
  * @param {ReturnType<createTargetState>} state
+ * @param {object} tacticalPlan
  * @param {number} sequence
  */
-function dispatchFoundationAction(ns, planner, state, sequence) {
+function dispatchTacticalAction(ns, planner, state, tacticalPlan, sequence) {
     const script = WORKER_SCRIPTS[state.action];
-    if (!script) {
-        return emptyDispatch(state.hostname);
+    const requestedThreads = Math.max(0, Math.floor(Number(tacticalPlan.next?.requestedThreads ?? 0)));
+
+    if (!script || requestedThreads < 1) {
+        return emptyDispatch(state.hostname, requestedThreads);
     }
 
-    const jobId = `foundation-${Date.now()}-${sequence}`;
+    const jobId = `${tacticalPlan.requestId}-job-${sequence}`;
     return distributeThreads(
         ns,
         planner,
         script,
         state.hostname,
-        1,
+        requestedThreads,
         jobId,
         DEFAULT_HOME_RESERVE_GB,
     );
 }
 
-function emptyDispatch(target) {
+function emptyDispatch(target, requested = 0) {
     return {
-        requested: 0,
+        requested,
         launched: 0,
-        remaining: 0,
+        remaining: requested,
         script: "",
         scriptRam: 0,
         target,
@@ -218,8 +375,8 @@ function emptyDispatch(target) {
 }
 
 /**
- * Temporary phase classification only.
- * These thresholds are placeholders, not the future tuning algorithm.
+ * Cheap phase classification used only while waiting for a tactical calculation.
+ * Tactical planner output replaces these placeholder decisions before dispatch.
  *
  * @param {ReturnType<createTargetState>} state
  */
@@ -243,7 +400,7 @@ function chooseFoundationAction(state) {
 
     state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.HACK;
-    state.reason = "Target is prepared; running conservative production hack";
+    state.reason = "Target is prepared; awaiting tactical production calculation";
 }
 
 function formatNumber(value) {
