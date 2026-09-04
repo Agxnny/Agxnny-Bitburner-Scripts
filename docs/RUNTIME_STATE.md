@@ -23,6 +23,7 @@ The project uses Netscript ports as lightweight shared transport between persist
 | 13 | Controller requests | Event queue |
 | 14 | Batch timing events | Event queue |
 | 15 | Latest completed batch | Latest-value snapshot |
+| 16 | Batch scheduler analysis | Latest-value snapshot |
 
 Snapshot writers replace the prior value. Ports 13 and 14 are intentionally consumed as queues.
 
@@ -218,6 +219,47 @@ Whenever a synchronized batch reaches `COMPLETE`, `hacking/batch-runner.js` copi
 Port 15 is not a historical log. It retains exactly one completed batch so the GUI can continue displaying recovery and landing measurements after Port 12 advances to the next planning/running batch.
 
 The dedicated Batch tab reads Port 12 for **current batch** status and Port 15 for **last completed batch** telemetry. The same `landing.stages[]` data is used for the planned-vs-actual visual timeline.
+
+## Port 16 — batch scheduler analysis
+
+Published by `hacking/batch-scheduler.js`.
+
+Current schema:
+
+```text
+version: 1
+model: PIPELINE_DRY_RUN_V1
+dryRun: true
+status: PLANNING | READY | BLOCKED
+target
+requestedHackFraction
+requestedStageGapMs
+actualHackFraction
+threads
+timing
+ram
+stageTemplate
+calendarPreview
+notes
+```
+
+Important timing fields include:
+
+```text
+timing.requestedStageGapMs
+timing.tunedStageGapMs
+timing.tunedBatchIntervalMs
+timing.firstLandingDelayMs
+timing.batchLandingWindowMs
+timing.tuningMode
+timing.telemetry
+```
+
+The scheduler intentionally distinguishes **stage gap** from **batch interval**. The first controls H→W1→G→W2 spacing inside one batch; the second controls H(N)→H(N+1) spacing across successive batches.
+
+Current RAM fields include current aggregate remote usable RAM, modeled single-batch RAM, simulated pipeline depths, peak RAM per depth, and `safeDepth`.
+
+Port 16 is advisory only. No controller or batch runner currently consumes it to launch overlapping work.
 
 ## Queue design rule
 
