@@ -3,7 +3,7 @@
  *
  * Clean-pull behavior is intentionally destructive for repo-managed automation:
  *   1. stop every other running script on every discovered host,
- *   2. remove deployed execution/tactical files from remote hosts,
+ *   2. remove deployed execution/tactical/telemetry files from remote hosts,
  *   3. remove stale repo-managed files on home,
  *   4. freshly download every manifest file,
  *   5. hand off to a helper so gitpull.js itself can be replaced.
@@ -42,8 +42,10 @@ export async function main(ns) {
         "/hacking/workers/grow.js",
         "/hacking/workers/weaken.js",
         "/hacking/tactical-planner.js",
+        "/hacking/telemetry.js",
         "/lib/threads.js",
         "/lib/runtime-state.js",
+        "/lib/telemetry.js",
         "/lib/state.js",
         "/lib/execution.js",
     ];
@@ -263,7 +265,7 @@ function printHelp(ns) {
     ns.tprint("gitpull.js - full clean-update Bitburner automation from GitHub");
     ns.tprint("Usage: run gitpull.js [--branch main]");
     ns.tprint("WARNING: stops every other active script on discovered hosts.");
-    ns.tprint("Remote workers/tactical files are removed and must be redeployed after the pull.");
+    ns.tprint("Remote workers/tactical/telemetry files are removed and must be redeployed after the pull.");
     ns.tprint("Stale files under hacking/, lib/, network/, and diagnostics/ are removed.");
     ns.tprint("gitpull.js itself is replaced by a handoff helper after the updater exits.");
 }
