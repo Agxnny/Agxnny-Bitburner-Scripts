@@ -83,9 +83,6 @@ export async function main(ns) {
             pipelineReadySince = 0;
         }
 
-        // Mode changes are scheduling barriers. Tactical analysis has no target
-        // side effect and may be cancelled. Target-side workers and admitted batch
-        // or pipeline work drain naturally before the new mode applies.
         if (executionMode.pending && tacticalJob) {
             ns.kill(tacticalJob.pid, tacticalJob.hostname);
             tacticalJob = null;
@@ -195,11 +192,11 @@ export async function main(ns) {
                 if (request.pid > 0) {
                     pipelineJob = request;
                     state.tactical.status = "PIPELINE_RUNNING";
-                    state.reason = `Launched continuous depth-2 HWGW pipeline on ${request.hostname}`;
+                    state.reason = `Launched continuous depth-2 HWGW pipeline coordinator on ${request.hostname}`;
                     executionMode.lastMessage = `Continuous depth-2 pipeline active on ${state.hostname}`;
                 } else {
                     state.tactical.status = "PIPELINE_BLOCKED";
-                    state.reason += " | no remote host has enough free RAM for the pipeline coordinator";
+                    state.reason += request.reason ? ` | ${request.reason}` : " | could not launch pipeline coordinator";
                 }
             }
         } else if (executionMode.mode === "BATCH" && state.action === ActionType.NONE) {
@@ -777,24 +774,35 @@ function launchBatchRunner(ns, planner, state) {
 
 function launchPipelineRunner(ns, planner, state) {
     const scriptRam = ns.getScriptRam(PIPELINE_RUNNER_SCRIPT, "home");
-    if (!(scriptRam > 0)) return { pid: 0, hostname: "", scriptRam, target: state.hostname };
-    const hackFraction = clamp(Number(state.strategy.hackPercent ?? 0.10), 0.001, 0.90);
+    if (!(scriptRam > 0)) return { pid: 0, hostname: "home", scriptRam, target: state.hostname, reason: "pipeline-runner.js RAM could not be determined" };
 
-    for (const host of getExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB)) {
-        if (host.usableRam < scriptRam) continue;
-        const pid = ns.exec(
-            PIPELINE_RUNNER_SCRIPT,
-            host.hostname,
-            1,
-            state.hostname,
-            hackFraction,
-            DEFAULT_BATCH_GAP_MS,
-            "continuous",
-            ...quietArgs(ns),
-        );
-        if (pid > 0) return { pid, hostname: host.hostname, scriptRam, target: state.hostname };
+    // The pipeline runner is a coordinator/control-plane service, not an H/G/W worker.
+    // Keep it on home so a 10+ GB coordinator does not depend on any one remote host
+    // having a large contiguous free block. The runner itself still reserves and
+    // launches all target-side H/G/W work exclusively on remote execution hosts.
+    const homeFreeRam = Math.max(0, ns.getServerMaxRam("home") - ns.getServerUsedRam("home"));
+    if (homeFreeRam < scriptRam) {
+        return {
+            pid: 0,
+            hostname: "home",
+            scriptRam,
+            target: state.hostname,
+            reason: `home needs ${scriptRam.toFixed(2)} GB for pipeline coordinator but only ${homeFreeRam.toFixed(2)} GB is free`,
+        };
     }
-    return { pid: 0, hostname: "", scriptRam, target: state.hostname };
+
+    const hackFraction = clamp(Number(state.strategy.hackPercent ?? 0.10), 0.001, 0.90);
+    const pid = ns.run(
+        PIPELINE_RUNNER_SCRIPT,
+        1,
+        state.hostname,
+        hackFraction,
+        DEFAULT_BATCH_GAP_MS,
+        "continuous",
+        ...quietArgs(ns),
+    );
+    if (pid > 0) return { pid, hostname: "home", scriptRam, target: state.hostname };
+    return { pid: 0, hostname: "home", scriptRam, target: state.hostname, reason: "ns.run failed to start pipeline coordinator on home" };
 }
 
 function launchTacticalPlanner(ns, planner, state, prep, sequence) {
