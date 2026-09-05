@@ -9,13 +9,14 @@ const ECONOMIC_TARGET_WAIT_MS = 30_000;
 const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
 const PREPPER_SCRIPT = "/hacking/prepper.js";
 const BATCH_HISTORY_SCRIPT = "/hacking/batch-history.js";
+const STOCK_HISTORY_SCRIPT = "/stocks/history-keeper.js";
 
 /**
  * Prepare the automation stack after a clean pull or before a test run.
  *
  * Stage 0 restores the persisted manual money-goal lock. Stage 2 starts the
- * dedicated background prepper and rolling real batch-history collector before
- * handing off to the controller.
+ * dedicated background prepper, rolling real batch-history collector, and
+ * observation-only stock price recorder before handing off to the controller.
  *
  * @param {NS} ns
  */
@@ -70,6 +71,12 @@ export async function main(ns) {
             const historyPid = ns.run(BATCH_HISTORY_SCRIPT, 1, ...inheritedQuiet);
             if (historyPid > 0) tprint(ns, "Rolling real batch-history collector started on Port 19.");
             else tprint(ns, "WARNING: Could not start batch-history collector; conservative multi-target safety learning will remain unproven.");
+        }
+
+        if (!ns.isRunning(STOCK_HISTORY_SCRIPT, "home")) {
+            const stockHistoryPid = ns.run(STOCK_HISTORY_SCRIPT, 1, ...inheritedQuiet);
+            if (stockHistoryPid > 0) tprint(ns, "Stock history recorder started; observation-only price baseline will persist on home.");
+            else tprint(ns, "WARNING: Could not start stock history recorder; stock baseline collection is offline.");
         }
 
         const selected = readPlannerState(ns)?.selectedTarget?.hostname ?? "unknown";
