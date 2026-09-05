@@ -24,6 +24,7 @@
 | 16 | Single-target pipeline planner/simulation/executor | Latest-value snapshot |
 | 17 | Global multi-target planner/simulator | Latest-value snapshot |
 | 18 | Dedicated prepper / reserved-host state | Latest-value snapshot |
+| 19 | Rolling real batch safety history | Latest-value snapshot |
 
 ## Port 1 — controller state
 
@@ -51,11 +52,11 @@ Mode changes wait for a safe boundary. For PIPELINE, later wave admission stops 
 
 Workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error. Serialized BATCH and real PIPELINE remain mutually exclusive. The real pipeline coordinator owns and routes Port 14 by `batchId` while active.
 
-Neither multi-target planning script nor the prepper consumes Port 14.
+Neither multi-target planning script, the prepper, nor the batch-history collector consumes Port 14.
 
 ## Port 15 — latest completed batch
 
-Port 15 accepts compatible serialized and pipeline completion payloads. It remains latest-only, not rolling history.
+Port 15 accepts compatible serialized and pipeline completion payloads. It remains latest-only. `hacking/batch-history.js` watches this snapshot and folds each new completed batch into Port 19.
 
 ## Port 16 — single-target pipeline state
 
@@ -85,39 +86,7 @@ MULTI_TARGET_ADMISSION_SIM_V2_PERSISTENT
 
 Both launch no workers. The one-shot allocator produces a static global reservation snapshot. The persistent simulator continuously expires virtual reservations, refreshes target readiness and live remote capacity, and re-admits new virtual work.
 
-Persistent-state fields include:
-
-```text
-persistent: true
-dryRun: true
-launchesWorkers: false
-consumesBatchTimingPort: false
-profile
-status
-reason
-runtimeMs
-capacity.hostCount
-capacity.availableRam
-capacity.maxInFlight
-capacity.inFlight
-capacity.totalAdmitted
-capacity.totalCompleted
-capacity.blockedTicks
-capacity.poolResets
-objective
-prepper
-targets[]
-inFlight[]
-recentCompletions[]
-hostPeak[]
-updatedAt
-```
-
-Each persistent `targets[]` entry includes current preparation state, `schedulerState` (`WAITING_PREP`, `READY`, or `RUNNING`), current virtual depth, recent 60-second completion count, lifetime admission/completion counters, objective score, batch template, and next first-landing time.
-
 Only targets at >=99.5% money and <=+0.05 security receive persistent production admissions. Other candidates remain `WAITING_PREP` while the Port 18 prepper works independently.
-
-Running the one-shot allocator while the persistent simulator is active will replace the latest Port 17 snapshot, and the persistent simulator will overwrite it again on its next loop. This is expected latest-value behavior, not a queue.
 
 ## Port 18 — dedicated prepper / reserved-host state
 
@@ -127,26 +96,47 @@ Published by `hacking/prepper.js` with model:
 DEDICATED_TARGET_PREPPER_V1
 ```
 
-Important fields:
+`lib/execution.js` treats a Port 18 reservation as active only while the heartbeat is fresh (currently 5 seconds). A fresh `reservedHost` is excluded from the normal remote execution pool. If the prepper stops and Port 18 becomes stale, the host automatically returns to production capacity.
+
+## Port 19 — rolling real batch safety history
+
+Published by `hacking/batch-history.js` with model:
 
 ```text
-enabled
-reservedHost
-status
-reason
-targetCount
-preparedCount
-completedWaves
-currentTarget
-currentAction
-requestedThreads
-launchedThreads
-pid
-startedAt
-updatedAt
+ROLLING_BATCH_HISTORY_V1
 ```
 
-`lib/execution.js` treats a Port 18 reservation as active only while the heartbeat is fresh (currently 5 seconds). A fresh `reservedHost` is excluded from the normal remote execution pool. If the prepper stops and Port 18 becomes stale, the host automatically returns to production capacity.
+The collector watches Port 15 for new `COMPLETE` batch IDs and keeps up to 16 real samples per target. Each sample records order correctness, missing timing jobs, final money/security recovery, maximum landing drift, minimum spacing, allocation spread, gap, and batch interval.
+
+Per-target summary fields include:
+
+```text
+sampleCount
+cleanSamples
+consecutiveClean
+recommendedDepth
+confidence
+latestHealthy
+lastFinishedAt
+maxAbsLandingErrorMs
+minSpacingMs
+maxRecoveryMoneyError
+maxSecurityDelta
+samples[]
+```
+
+A clean sample currently requires correct stage order, zero missing timing jobs, >=99.5% money recovery, <=+0.05 security, <=150 ms maximum absolute landing error, and >=75 ms minimum observed spacing.
+
+The conservative depth recommendation is intentionally evidence-gated:
+
+```text
+0-1 consecutive clean samples -> depth 1 / UNPROVEN
+2-3 consecutive clean samples -> depth 2 / LOW
+4-7 consecutive clean samples -> depth 4 / MEDIUM
+8+ consecutive clean samples  -> depth 8 / HIGH
+```
+
+This is advisory only for now. The persistent simulator has not yet been wired to enforce the recommendation; that is the next safety step before real multi-target execution.
 
 ## GUI rule
 
