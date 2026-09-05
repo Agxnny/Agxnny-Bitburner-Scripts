@@ -29,13 +29,13 @@ run diagnostics/multi-overlap-validate.js [target|auto] [waves] [hackFraction] [
 ```
 Controller must be fully STANDBY. Validator owns Port 14, schedules two same-target HWGW batches, validates timing/order/spacing/drift/recovery, and records evidence.
 
-Validation UI is integrated in the main dashboard under `ui/views/validation.js`. It supports MIXED VALIDATE2, ALL PREPARED including DEPTH1, and explicit targets. Dashboard launches are quiet. Runtime truth now comes from actual validator process state plus file telemetry, so stale state is shown as `VALID STALE` rather than pretending work is still healthy.
+Validation UI is integrated in the main dashboard under `ui/views/validation.js`. It supports MIXED VALIDATE2, ALL PREPARED including DEPTH1, and explicit targets. Dashboard launches are quiet. Runtime truth comes from actual validator process state plus file telemetry, so stale state is shown as `VALID STALE` rather than pretending work is still healthy.
 
 Latest runtime evidence from the user: joesguns validated cleanly; screenshot later showed phantasy, sigma-cosmetics, and joesguns already `PROVEN2` while a mixed pass continued through silver-helix and remaining candidates.
 
 Real `hacking/multi-target-runner.js` is still per-target depth 1. Do not remove its uniqueness guard until the current multi-target overlap evidence pass is reviewed.
 
-## Stock research baseline — NEW
+## Stock research baseline
 The user is currently saving toward the $25b 4S forecasting API and requested observation/history first, no autonomous trading yet.
 
 ### Persistent compact history
@@ -46,7 +46,7 @@ model STOCK_HISTORY_V1_COMPACT
 ```
 History stores one shared timestamp array plus a compact price array per symbol. Default cadence is 6 seconds, max 1,800 samples, roughly a 3-hour rolling window. This avoids a large object-per-symbol-per-tick file while still giving enough baseline data for pre-4S volatility research.
 
-The helper also exposes `stockSeries()` and `stockSeriesStats()`. Current volatility proxy is standard deviation of recorded tick-to-tick returns. This is intentionally descriptive only; no forecast/trading signal is produced yet.
+The helper exposes `stockSeries()` and `stockSeriesStats()`. Current volatility proxy is standard deviation of recorded tick-to-tick returns. This is descriptive only; no forecast/trading signal is produced yet.
 
 ### Stock history keeper
 ```text
@@ -61,7 +61,7 @@ The snapshot includes TIX/4S access flags, cash, symbol prices, long/short holdi
 
 If TIX API access is unavailable, the keeper publishes WAITING state and parks until access becomes available rather than crashing.
 
-`kickstart.js` now starts `stocks/history-keeper.js` quietly alongside prepper and batch-history collection. The dedicated stock dashboard also starts the keeper quietly if it is not already running, so collection begins immediately when the dashboard is opened.
+`kickstart.js` starts `stocks/history-keeper.js` quietly alongside prepper and batch-history collection. The dedicated stock dashboard also starts the keeper quietly if it is not already running.
 
 ### Separate React Market Lab dashboard
 ```text
@@ -69,7 +69,7 @@ stocks/dashboard.js
 stocks/styles.js
 run stocks/dashboard.js
 ```
-This is intentionally separate from the main hacking control plane. One React tree is mounted; the async Netscript loop refreshes plain JS cache. React callbacks only change local selected-symbol state.
+This is separate from the main hacking control plane. One React tree is mounted; the async Netscript loop refreshes plain JS cache. React callbacks only change local selected-symbol state.
 
 Current dashboard sections:
 ```text
@@ -79,9 +79,17 @@ Price history: selectable symbol, SVG stock-style line chart, sample count, wind
 Portfolio: current LONG/SHORT positions, shares, value, unrealized P&L, exposure summary
 Market watch: every stock with price, rolling-window change, volatility, samples; clicking a row changes the chart
 ```
-Trading is explicitly OFF. The old `stocks/terminal.js` placeholder remains but `stocks/dashboard.js` is now the preferred stock research surface.
+Trading is explicitly OFF. The old `stocks/terminal.js` placeholder remains but `stocks/dashboard.js` is the preferred stock research surface.
 
 Long and short portfolio accounting are already separate in the snapshot/dashboard so future execution logic can support both directions without changing the data model.
+
+### Startup behavior
+`startup.js` now launches both dashboards on home before spawning the quiet kickstart chain:
+```text
+/ui/dashboard.js
+/stocks/dashboard.js
+```
+Each is guarded with `ns.isRunning()`, so running `startup.js` again does not create duplicate dashboard processes. If either dashboard cannot start, startup continues and prints only a warning for that dashboard.
 
 ### Stock next steps
 Do not build autonomous orders yet. First collect a meaningful pre-4S baseline and inspect runtime behavior/file growth. After 4S becomes available, signal source can switch to native forecast + volatility while preserving the same history/portfolio/dashboard layers.
@@ -105,10 +113,9 @@ Economy/manual-goal cash reservation must remain authoritative over future stock
 After pulling:
 ```text
 run gitpull.js
-run stocks/history-keeper.js --quiet
-run stocks/dashboard.js
+run startup.js
 ```
-The dashboard itself will start the keeper if needed, so manually starting the keeper is optional. Let it collect for at least several minutes before judging volatility; longer collection makes the baseline more useful.
+This will start the main control-plane dashboard, the stock Market Lab dashboard, and the normal quiet kickstart chain. The stock history keeper will come up through kickstart/dashboard guard logic.
 
 ## Priority
 ```text
