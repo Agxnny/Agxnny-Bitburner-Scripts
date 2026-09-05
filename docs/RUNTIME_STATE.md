@@ -17,11 +17,11 @@ The project uses Netscript ports as lightweight shared transport between persist
 | 9 | Root/tool state | Latest-value snapshot |
 | 10 | Cloud capacity action state | Latest-value snapshot |
 | 11 | Manual money-goal state | Latest-value snapshot |
-| 12 | Current batch state | Latest-value snapshot |
+| 12 | Current serialized batch state | Latest-value snapshot |
 | 13 | Controller requests | Event queue |
 | 14 | Batch timing events | Event queue |
 | 15 | Latest completed batch | Latest-value snapshot |
-| 16 | Pipeline scheduler/admission state | Latest-value snapshot |
+| 16 | Pipeline planner/simulation/executor | Latest-value snapshot |
 
 Snapshot writers replace the prior value. Ports 13 and 14 are queues.
 
@@ -124,64 +124,64 @@ SET_EXECUTION_MODE HGW|BATCH
 
 Batch H/G/W workers publish `BATCH_STAGE_COMPLETE` events containing batch/stage/job identity, threads, planned landing, and actual finish timing.
 
-The current serialized runner drains this queue and clears it before each real batch. That clearing rule is **not compatible with overlapping batches** and must be removed before live pipelining.
+### Serialized ownership
+
+`hacking/batch-runner.js` clears stale Port 14 data immediately before a serialized batch, then drains matching events for its one batch id.
+
+### Real depth-2 ownership
+
+`hacking/pipeline-runner.js` may only start while the controller is parked in PREPARED HOLD and serialized batching is idle. It clears stale Port 14 data once at test startup, then becomes the sole consumer for the whole real depth-2 test.
+
+It routes every event by `batchId` into the matching in-flight batch and does not clear the queue between the two overlapping batches.
+
+The serialized runner and pipeline runner must not run concurrently. Permanent controller-integrated pipelining still requires one shared queue owner.
 
 ## Port 15 — latest completed batch
 
-Every serialized `COMPLETE` payload is copied here so the GUI and scheduler can inspect the most recent recovery/timing result after Port 12 advances.
+Port 15 now accepts either:
 
-Port 15 is a one-item snapshot, not a rolling history.
+```text
+serialized complete → SINGLE_HWGW_ADDITIONAL_MSEC_V3
+pipeline complete   → PIPELINE_HWGW_DEPTH2_V1
+```
 
-## Port 16 — pipeline scheduler / admission simulation
+Both expose compatible final/recovery and landing telemetry so the Batch GUI can reuse the same timing graph and diagnostics.
 
-Published by `hacking/batch-scheduler.js`.
+Pipeline completion additionally includes concepts such as:
+
+```text
+pipeline: true
+maxDepth: 2
+batchIntervalMs
+gapMs
+```
+
+Port 15 remains a one-item snapshot, not a rolling history.
+
+## Port 16 — pipeline planner / simulation / executor
 
 ### Snapshot planning mode
 
-One-shot planning currently uses model `PIPELINE_DRY_RUN_V2_HOST_WINDOWS` and includes:
+Published by `hacking/batch-scheduler.js` with model:
 
 ```text
-dryRun: true
-status: PLANNING | READY | BLOCKED
-target
-requestedHackFraction
-requestedStageGapMs
-actualHackFraction
-threads
-timing
-ram
-stageTemplate
-calendarPreview
-notes
+PIPELINE_DRY_RUN_V2_HOST_WINDOWS
 ```
 
-Key timing fields:
+Important fields include target, thread sizing, requested/tuned stage gap, timing-only and sustainable batch interval, host count/RAM, burst depth, steady-state simulation, stage template, and calendar preview.
 
-```text
-timing.requestedStageGapMs
-timing.tunedStageGapMs
-timing.requestedBatchIntervalMs
-timing.tunedBatchIntervalMs
-timing.firstLandingDelayMs
-timing.batchLandingWindowMs
-timing.tuningMode
-timing.telemetry
-timing.steadyState
-```
+### Persistent admission simulation
 
-Key RAM fields include currently free remote RAM, host count, single-batch RAM, burst depth, depth-search status, and per-depth simulations.
-
-### Persistent admission simulation mode
-
-When run with the fourth argument `admission`, Port 16 uses model:
+Published by `hacking/batch-scheduler.js ... admission` with model:
 
 ```text
 PIPELINE_ADMISSION_SIM_V3_DEPTH2
 ```
 
-Additional fields:
+Important fields:
 
 ```text
+dryRun: true
 simulation: true
 admission.enabled: true
 admission.launchesWorkers: false
@@ -196,24 +196,50 @@ admission.batches[]
 admission.events[]
 ```
 
-`admission.decision.status` may include:
+### Real depth-2 execution
+
+Published by `hacking/pipeline-runner.js` with model:
 
 ```text
-WAITING
-BLOCKED
-WAITING_PREP
-INTERVAL_WAIT
-ADMITTED
-DEPTH_CAP
-RAM_BLOCKED
-SAFETY_STOP
+PIPELINE_EXECUTOR_DEPTH2_V1
 ```
 
-Each virtual batch records its first/final landing time and planned H/W1/G/W2 stage windows. No PID or live worker is created.
+Top-level fields include:
 
-New matching Port 15 completed-batch telemetry can trigger `SAFETY_STOP` when order, timing-event completeness, or recovery is outside the simulator tolerances. A stop blocks further virtual admissions but leaves existing virtual batches to drain.
+```text
+version: 4
+dryRun: false
+simulation: false
+execution: true
+maxDepth: 2
+target
+status
+reason
+requestedBatches
+completedBatches
+stageGapMs
+batchIntervalMs
+inFlight[]
+completedRecent[]
+events[]
+safetyStopped
+safetyReason
+updatedAt
+```
 
-Port 16 remains advisory/non-executing. No controller currently consumes it to launch overlapping work.
+`status` may include:
+
+```text
+BLOCKED
+RUNNING
+DRAINING_AFTER_STOP
+SAFETY_STOP
+COMPLETE
+```
+
+Each `inFlight[]` entry includes its batch id, first/final landing timestamps, and per-stage start/landing/launched/job-count information. `completedRecent[]` retains a small in-process display history for the Port 16 snapshot only; Port 15 still retains only the latest completed batch globally.
+
+The compact Batch GUI detects whether Port 16 represents planner, virtual admission, or real execution and renders the appropriate summary.
 
 ## Queue design rule
 
