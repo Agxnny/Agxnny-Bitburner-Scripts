@@ -24,6 +24,7 @@ const SECURITY_TOLERANCE = 0.05;
 const MIN_TIMING_MARGIN_MS = 25;
 const MAX_STEADY_BATCHES = 256;
 const MAX_EVENTS = 14;
+const BATCH_RUNNER_SCRIPT = "/hacking/batch-runner.js";
 const EXPECTED_STAGE_ORDER = Object.freeze(["HACK", "WEAKEN_HACK", "GROW", "WEAKEN_GROW"]);
 
 /**
@@ -74,6 +75,8 @@ export async function main(ns) {
         return;
     }
 
+    if (!quiet && preflight.note) ns.tprint(`[PIPELINE-REAL] PREFLIGHT: ${preflight.note}`);
+
     // This runner is the only real batch coordinator allowed by preflight.
     // Clear the old serialized queue once, then own/reroute every new event by batchId.
     ns.getPortHandle(RuntimePort.BATCH_TIMING_EVENTS).clear();
@@ -86,6 +89,7 @@ export async function main(ns) {
     let safetyReason = "";
 
     pushEvent(events, "START", `Real pipeline test started on ${target}; depth cap ${MAX_DEPTH}, requested ${requestedBatches} batch(es)`);
+    if (preflight.note) pushEvent(events, "PREFLIGHT", preflight.note);
     if (!quiet) ns.tprint(`[PIPELINE-REAL] START ${target} | hard depth ${MAX_DEPTH} | ${requestedBatches} batch(es)`);
 
     while (completedBatches < requestedBatches && !safetyStopped) {
@@ -206,14 +210,50 @@ export async function main(ns) {
 function preflightCheck(ns, target) {
     const controller = readControllerState(ns);
     const batch = readBatchState(ns);
-    if (!controller) return { ok: false, reason: "Controller state unavailable" };
-    if (String(controller.hostname ?? "") !== target) return { ok: false, reason: `Controller target is ${String(controller.hostname ?? "none")}, not ${target}` };
-    if (!controller.prep?.hold) return { ok: false, reason: "Controller is not in PREPARED HOLD" };
-    if (Number(controller.execution?.activeJobs ?? 0) > 0) return { ok: false, reason: "Controller still has active standalone workers" };
-    if (controller.executionMode?.batchRunning) return { ok: false, reason: "Serialized batch runner is active" };
-    if (batch && ["PLANNING", "READY", "RUNNING"].includes(String(batch.status ?? ""))) return { ok: false, reason: `Port 12 still reports active batch state ${batch.status}` };
-    if (!targetPrepared(ns, target)) return { ok: false, reason: "Target is not at prepared money/security baseline" };
-    return { ok: true, reason: "" };
+    if (!controller) return { ok: false, reason: "Controller state unavailable", note: "" };
+    if (String(controller.hostname ?? "") !== target) return { ok: false, reason: `Controller target is ${String(controller.hostname ?? "none")}, not ${target}`, note: "" };
+    if (!controller.prep?.hold) return { ok: false, reason: "Controller is not in PREPARED HOLD", note: "" };
+    if (Number(controller.execution?.activeJobs ?? 0) > 0) return { ok: false, reason: "Controller still has active standalone workers", note: "" };
+    if (controller.executionMode?.batchRunning) return { ok: false, reason: "Serialized batch runner is active", note: "" };
+
+    const liveSerializedHosts = runningSerializedBatchHosts(ns, batch);
+    if (liveSerializedHosts.length) {
+        return { ok: false, reason: `Serialized batch-runner.js is still executing on ${liveSerializedHosts.join(", ")}`, note: "" };
+    }
+
+    const staleBatchStatus = batch && ["PLANNING", "READY", "RUNNING"].includes(String(batch.status ?? ""))
+        ? String(batch.status)
+        : "";
+    if (!targetPrepared(ns, target)) return { ok: false, reason: "Target is not at prepared money/security baseline", note: "" };
+
+    return {
+        ok: true,
+        reason: "",
+        note: staleBatchStatus
+            ? `Ignoring stale Port 12 ${staleBatchStatus} snapshot because controller is parked and no serialized batch-runner process exists`
+            : "",
+    };
+}
+
+function runningSerializedBatchHosts(ns, batch) {
+    const planner = readPlannerState(ns);
+    const hosts = new Set(["home"]);
+    const runnerHost = String(batch?.runnerHost ?? "").trim();
+    if (runnerHost) hosts.add(runnerHost);
+    for (const host of Array.isArray(planner?.executionHosts) ? planner.executionHosts : []) {
+        const hostname = String(host?.hostname ?? "").trim();
+        if (hostname) hosts.add(hostname);
+    }
+
+    const running = [];
+    for (const hostname of hosts) {
+        try {
+            if (ns.scriptRunning(BATCH_RUNNER_SCRIPT, hostname)) running.push(hostname);
+        } catch {
+            // A disappearing/stale planner host should not make a PREPARED HOLD unsafe.
+        }
+    }
+    return running;
 }
 
 function buildWavePlan(ns, target, hackFraction, requestedGapMs, depth, wave) {
@@ -337,14 +377,15 @@ function makeBatches(template, depth, firstLandingAt, intervalMs, target, wave) 
 function reserveHostWindows(pool, batches) {
     const hosts = pool.map((host) => ({ hostname: host.hostname, usableRam: Math.max(0, Number(host.usableRam ?? 0)), reservations: [] }));
     const allocations = {};
-    const stages = batches.flatMap((batch) => batch.stages).sort((a, b) => a.startAt - b.startAt || b.ram - a.ram || a.landingAt - b.landingAt);
+    const stages = batches.flatMap((batch) => batch.stages).sort((a, b) => reservationStartAt(a) - reservationStartAt(b) || b.ram - a.ram || a.landingAt - b.landingAt);
 
     for (const stage of stages) {
         let remainingThreads = stage.threads;
         const key = `${stage.batch}:${stage.name}`;
         allocations[key] = [];
+        const reserveStart = reservationStartAt(stage);
         const candidates = hosts.map((host) => {
-            const occupied = maxReservedRam(host.reservations, stage.startAt, stage.landingAt);
+            const occupied = maxReservedRam(host.reservations, reserveStart, stage.landingAt);
             const freeRam = Math.max(0, host.usableRam - occupied);
             return { host, freeRam, capacity: Math.floor(freeRam / stage.scriptRam) };
         }).sort((a, b) => b.capacity - a.capacity || b.freeRam - a.freeRam || a.host.hostname.localeCompare(b.host.hostname));
@@ -354,13 +395,17 @@ function reserveHostWindows(pool, batches) {
             const threads = Math.min(remainingThreads, candidate.capacity);
             if (threads < 1) continue;
             const ram = threads * stage.scriptRam;
-            candidate.host.reservations.push({ startAt: stage.startAt, endAt: stage.landingAt, ram, batch: stage.batch, stage: stage.name, threads });
+            candidate.host.reservations.push({ startAt: reserveStart, endAt: stage.landingAt, ram, batch: stage.batch, stage: stage.name, threads });
             allocations[key].push({ hostname: candidate.host.hostname, threads, ram });
             remainingThreads -= threads;
         }
         if (remainingThreads > 0) return { ok: false, blockedBatch: stage.batch, blockedStage: stage.name, missingThreads: remainingThreads, allocations };
     }
     return { ok: true, blockedBatch: 0, blockedStage: "", missingThreads: 0, allocations };
+}
+
+function reservationStartAt(stage) {
+    return Number(stage.startAt ?? 0) - DISPATCH_LEAD_MS;
 }
 
 function attachAllocations(batches, allocations) {
@@ -373,8 +418,8 @@ function findSteadyInterval(pool, stageTemplate, minimumIntervalMs, stageGapMs) 
     const maxDurationMs = Math.max(...stageTemplate.map((stage) => stage.durationMs));
     const landingWindowMs = 3 * stageGapMs;
     const test = (intervalMs) => {
-        const depth = Math.min(MAX_STEADY_BATCHES, Math.max(3, Math.ceil((maxDurationMs + landingWindowMs) / intervalMs) + 3));
-        const fake = makeBatches(stageTemplate, depth, Date.now() + maxDurationMs + 500, intervalMs, "steady", 0);
+        const depth = Math.min(MAX_STEADY_BATCHES, Math.max(3, Math.ceil((maxDurationMs + landingWindowMs + DISPATCH_LEAD_MS) / intervalMs) + 3));
+        const fake = makeBatches(stageTemplate, depth, Date.now() + maxDurationMs + DISPATCH_LEAD_MS + 500, intervalMs, "steady", 0);
         const result = reserveHostWindows(pool, fake);
         return { ok: result.ok && depth < MAX_STEADY_BATCHES, intervalMs, depth };
     };
@@ -384,7 +429,7 @@ function findSteadyInterval(pool, stageTemplate, minimumIntervalMs, stageGapMs) 
     if (minResult.ok) return minResult;
 
     let low = minimum;
-    let high = Math.ceil(maxDurationMs + landingWindowMs + stageGapMs);
+    let high = Math.ceil(maxDurationMs + landingWindowMs + stageGapMs + DISPATCH_LEAD_MS);
     const highResult = test(high);
     if (!highResult.ok) return { ok: false, intervalMs: high, reason: "reservation still blocked at upper interval bound" };
 
@@ -514,7 +559,7 @@ function finalizeBatch(ns, target, batch, plan) {
         })),
         landing,
         createdAt: batch.createdAt,
-        launchStartedAt: Math.min(...batch.stages.flatMap((stage) => stage.jobs.map(() => stage.startAt))),
+        launchStartedAt: Math.min(...batch.stages.flatMap((stage) => stage.jobs.map(() => reservationStartAt(stage)))),
         finishedAt,
         durationMs: Math.max(0, finishedAt - batch.createdAt),
         updatedAt: finishedAt,
@@ -608,7 +653,7 @@ function publicBatch(batch) {
         id: batch.id,
         firstLandingAt: batch.firstLandingAt,
         finalLandingAt: batch.finalLandingAt,
-        stages: batch.stages.map((stage) => ({ name: stage.name, startAt: stage.startAt, landingAt: stage.landingAt, launched: stage.launched, jobs: stage.jobs.length })),
+        stages: batch.stages.map((stage) => ({ name: stage.name, startAt: reservationStartAt(stage), landingAt: stage.landingAt, launched: stage.launched, jobs: stage.jobs.length })),
     };
 }
 
