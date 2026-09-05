@@ -20,6 +20,8 @@ import { readTelemetryState } from "/lib/telemetry.js";
 
 const OVERLAP_VALIDATOR = "/diagnostics/multi-overlap-validate.js";
 const OVERLAP_MIXED = "/diagnostics/multi-overlap-mixed.js";
+const DEPTH_VALIDATOR = "/diagnostics/multi-depth-validate.js";
+const FULL_DEPTH_TEST = "/diagnostics/multi-full-depth-test.js";
 
 let cachedState = null;
 let stateVersion = 0;
@@ -57,5 +59,7 @@ export function refreshSnapshot(ns) {
 function validationRuntime(ns) {
     const validator = ns.scriptRunning(OVERLAP_VALIDATOR, "home");
     const mixed = ns.scriptRunning(OVERLAP_MIXED, "home");
-    return { active: validator || mixed, validator, mixed };
+    const depthValidator = ns.scriptRunning(DEPTH_VALIDATOR, "home");
+    const fullDepth = ns.scriptRunning(FULL_DEPTH_TEST, "home");
+    return { active: validator || mixed || depthValidator || fullDepth, validator, mixed, depthValidator, fullDepth };
 }
