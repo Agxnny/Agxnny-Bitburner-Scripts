@@ -10,6 +10,8 @@ import { refreshSnapshot, touchState } from "/ui/state.js";
 const TEST_REQUEST_PORT = 6;
 const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
 const MULTI_TARGET_RUNNER = "/hacking/multi-target-runner.js";
+const OVERLAP_VALIDATOR = "/diagnostics/multi-overlap-validate.js";
+const OVERLAP_MIXED = "/diagnostics/multi-overlap-mixed.js";
 
 const model = {
     pendingTest: null,
@@ -17,11 +19,13 @@ const model = {
     pendingGoal: null,
     pendingController: null,
     pendingMultiRun: null,
+    pendingValidationRun: null,
     diagnosticActivity: { state: "IDLE", label: "", script: "", pid: 0, startedAt: 0, finishedAt: 0 },
     actionStatus: "Ready",
     goalStatus: "Ready",
     controllerStatus: "Ready",
     multiStatus: "Ready · finite tests require STANDBY",
+    validationStatus: "Ready · overlap validation requires STANDBY",
     fields: {
         goal: "",
         goalLabel: "",
@@ -31,6 +35,10 @@ const model = {
         multiDepth: "3",
         multiHackPercent: "10",
         multiStageGap: "200",
+        validationTarget: "mixed",
+        validationWaves: "2",
+        validationHackPercent: "10",
+        validationStageGap: "200",
     },
 };
 
@@ -52,6 +60,7 @@ export function queueDiagnostic(script, args = [], label = "Diagnostic") {
 export function queueGoal(action) { model.pendingGoal = action; touchState(); }
 export function queueController(action) { model.pendingController = action; touchState(); }
 export function queueMultiRun() { model.pendingMultiRun = currentMultiRequest(); touchState(); }
+export function queueValidationRun() { model.pendingValidationRun = currentValidationRequest(); touchState(); }
 export function currentMultiRequest() {
     return {
         profile: field("multiProfile"),
@@ -59,6 +68,14 @@ export function currentMultiRequest() {
         globalDepth: field("multiDepth"),
         hackPercent: field("multiHackPercent"),
         stageGapMs: field("multiStageGap"),
+    };
+}
+export function currentValidationRequest() {
+    return {
+        target: field("validationTarget"),
+        waves: field("validationWaves"),
+        hackPercent: field("validationHackPercent"),
+        stageGapMs: field("validationStageGap"),
     };
 }
 
@@ -105,6 +122,14 @@ export async function processPendingActions(ns, now) {
         refresh = true;
     }
 
+    if (model.pendingValidationRun) {
+        const request = model.pendingValidationRun;
+        model.pendingValidationRun = null;
+        model.validationStatus = launchValidationRun(ns, request).message;
+        touchState();
+        refresh = true;
+    }
+
     if (model.pendingGoal) {
         const action = model.pendingGoal;
         model.pendingGoal = null;
@@ -122,6 +147,38 @@ function updateDiagnosticActivity(ns, now) {
     model.diagnosticActivity = { ...activity, state: "COMPLETE", finishedAt: now };
     model.actionStatus = `${activity.label} complete`;
     touchState();
+}
+
+function launchValidationRun(ns, request) {
+    const controller = readControllerState(ns);
+    const mode = String(controller?.executionMode?.mode ?? "STANDBY").toUpperCase();
+    const pending = String(controller?.executionMode?.pending ?? "").trim();
+    if (!controller || isControllerStateStale(controller)) return fail("controller state unavailable/stale");
+    if (mode !== "STANDBY" || pending) return fail(`validation requires STANDBY (${pending ? `${mode} → ${pending}` : mode})`);
+    if (Number(controller.execution?.activeJobs ?? 0) > 0) return fail("controller workers are still draining");
+    if (ns.scriptRunning(OVERLAP_VALIDATOR, "home") || ns.scriptRunning(OVERLAP_MIXED, "home")) return fail("overlap validation is already running");
+
+    const parsed = validateValidationRequest(request);
+    if (!parsed.ok) return fail(parsed.reason);
+    const v = parsed.value;
+    const mixed = v.target === "mixed";
+    const pid = mixed
+        ? ns.run(OVERLAP_MIXED, 1, v.waves, v.hackPercent / 100, v.stageGapMs)
+        : ns.run(OVERLAP_VALIDATOR, 1, v.target, v.waves, v.hackPercent / 100, v.stageGapMs);
+    if (pid <= 0) return { ok: false, message: "Launch failed · not enough home RAM or validator unavailable" };
+    return { ok: true, message: `${mixed ? "Mixed" : v.target} overlap validation started · ${v.waves} wave(s) · PID ${pid}` };
+}
+
+function validateValidationRequest(request) {
+    const target = String(request.target ?? "mixed").trim();
+    const waves = Math.floor(Number(request.waves));
+    const hackPercent = Number(request.hackPercent);
+    const stageGapMs = Math.floor(Number(request.stageGapMs));
+    if (!target) return { ok: false, reason: "select a validation target" };
+    if (!Number.isInteger(waves) || waves < 1 || waves > 6) return { ok: false, reason: "waves must be 1–6" };
+    if (!Number.isFinite(hackPercent) || hackPercent < 0.1 || hackPercent > 50) return { ok: false, reason: "hack % must be 0.1–50" };
+    if (!Number.isInteger(stageGapMs) || stageGapMs < 75 || stageGapMs > 1000) return { ok: false, reason: "stage gap must be 75–1000 ms" };
+    return { ok: true, value: { target, waves, hackPercent, stageGapMs } };
 }
 
 function launchMultiTargetRun(ns, request) {
