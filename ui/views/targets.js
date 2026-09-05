@@ -56,7 +56,16 @@ function prepProgress(prepper) {
             kv("Active prep", Number(prepper.activeCount ?? 0)),
             kv("Prep reserve", `${ramFmt(prepper.reservedRamGb)} · ${(prepper.reservedHosts ?? []).length} hosts`),
         ),
-        belowMax.length ? el("div", { style: styles.pipelineRows }, ...belowMax.map(prepRow)) : note("All currently tracked prep targets are at max money."),
+        belowMax.length ? el("div", { style: styles.pipelineRows },
+            el("div", { style: styles.prepRow },
+                el("span", { style: styles.dimText }, "SERVER"),
+                el("span", { style: styles.right }, "MONEY"),
+                el("span", { style: styles.dimText }, "STATE"),
+                el("span", { style: styles.right }, "ETA 100%"),
+                el("span", { style: styles.dimText }, "HOST / SEC"),
+            ),
+            ...belowMax.map(prepRow),
+        ) : note("All currently tracked prep targets are at max money."),
         note("ETA 100% is an estimate from current grow/weaken timings, queue position, and reserved prep-host capacity."),
     );
 }
