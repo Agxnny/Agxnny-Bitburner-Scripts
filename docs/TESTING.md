@@ -1,43 +1,32 @@
 # Testing and Validation Guide
 
-This project changes live automation behavior, so each major subsystem should be validated incrementally rather than assuming a successful launch means the math is correct.
+This project changes live automation behavior, so validate incrementally rather than assuming a successful launch means the math is correct.
 
-## General test philosophy
-
-Prefer this progression:
+## General progression
 
 ```text
 syntax/load check
   ↓
-manual one-shot test
+one-shot dry run
   ↓
-automatic single-cycle test
+persistent non-executing simulation
+  ↓
+automatic single-cycle live test
   ↓
 repeated-cycle stability
   ↓
 throughput optimization
 ```
 
-Do not introduce overlapping/pipelined HWGW until the single-batch path is mathematically and operationally stable.
+Do not enable overlapping live HWGW until the serialized path and depth-2 simulation are understood.
 
 ## After pulling code
 
 ```text
 run gitpull.js
 run startup.js
-```
-
-This matters because workers/support scripts execute remotely and stale copies can otherwise survive on execution hosts.
-
-## RAM audit
-
-After significant changes to persistent or frequently launched scripts:
-
-```text
 run diagnostics/mem-audit.js
 ```
-
-Pay particular attention to controller/dashboard RAM after observability changes and worker RAM after timing instrumentation.
 
 ## Core smoke checks
 
@@ -49,164 +38,140 @@ run network/inspect.js
 run network/root.js
 ```
 
-## Active worker ETA validation
+## Active-worker ETA validation
 
-During a normal HGW or batch-prep GROW/WEAKEN action, Overview should show:
+During normal/prep H/G/W work, Overview should show active jobs/threads, current ETA, and worker rows with host, threads, elapsed time, and remaining estimate.
 
-- non-zero Active jobs/threads;
-- `Current ETA` for the active action;
-- one Active Workers row per controller allocation, up to the display limit;
-- action/target, host, threads, elapsed time, and remaining estimate.
-
-`execution.activeWorkers` is observational only. The GUI currently marks a worker `LATE` only after:
-
-```text
-expectedFinishAt + max(5 seconds, expectedDuration × 15%)
-```
-
-A `LATE` label must **not** kill the worker or trigger recovery. Automatic watchdog behavior remains deferred until batching timing is stable.
-
-When the standalone operation completes, the Active Workers list and `execution.currentAction` should clear naturally on the next controller state update.
+`LATE` is diagnostic only and must not kill workers.
 
 ## Execution-mode transition validation
 
-Switch HGW → BATCH and BATCH → HGW while workers are active.
+Switch HGW ↔ BATCH while workers are active. Expected behavior:
 
-Expected behavior:
-
-- both mode buttons disable while the transition is pending;
+- both mode buttons disable during transition;
 - GUI shows `SWITCHING → <mode>`;
-- no new tactical/batch work is scheduled;
-- active target-side H/G/W work finishes naturally;
-- tactical analysis may be cancelled;
+- no new target-side work is scheduled;
+- existing H/G/W/batch work finishes naturally;
 - the requested mode applies at the safe boundary.
 
-## Batch security compensation validation
+## Serialized batch correctness
 
-The original live failure on `sigma-cosmetics` used:
+A healthy completed batch should satisfy:
 
-```text
-25H / 1W / 298G / 1W
-final money: 100%
-final security: +1.13
-```
+- correct H → W1 → G → W2 order;
+- `landing.missingJobs === 0`;
+- money returns to intended baseline;
+- security returns to approximately +0.00–0.05;
+- no standalone correction work is normally required;
+- predicted-vs-actual recovery error remains small/understood.
 
-The corrected calculation uses:
+The Batch tab should expose planned/actual stage timing, minimum spacing, maximum drift, allocation spread, and recovery comparison.
 
-```text
-ns.growthAnalyzeSecurity(growThreads)
-```
+Do not reduce the 200 ms stage gap from one sample.
 
-Corrected live cycles used `25H / 1W / 298G / 24W` and later `25H / 1W / 299G / 24W`, returning to the expected money/security baseline without standalone correction weaken.
+## Pipeline scheduler one-shot validation
 
-## Recovery-model telemetry
-
-Port 12 retains `initial`, `predicted`, `final`, and `comparison` data while a completed batch remains current. On every `COMPLETE`, the same payload is copied to **Port 15**, which remains available after the next batch begins.
-
-## Current highest-priority batch test: landing drift
-
-After pulling/restarting, let at least one new automatic batch complete, then open the **Batch** tab.
-
-The tab combines:
+Run:
 
 ```text
-Port 12 → current batch
-Port 15 → latest completed batch
+run hacking/batch-scheduler.js phantasy 0.10 200
 ```
 
-While a batch is active, verify:
+Verify:
 
-- planned H/W1/G/W2 countdowns are visible;
-- W2 ETA counts down toward `timing.lastLandingAt`;
-- planned total duration is plausible;
-- stale `COMPLETE` state from an older target is not shown as the active batch on Overview.
+- no workers are launched;
+- Port 16/state reports `PIPELINE_DRY_RUN_V2_HOST_WINDOWS`;
+- requested timing-only interval and RAM-sustainable interval are distinct when capacity requires it;
+- burst depth stops at the first host-window reservation failure;
+- blocked output names the batch/stage when possible;
+- current live serialized work lowers reported available RAM rather than being assumed free later.
 
-The retained completed result should show:
+A previous `phantasy` sample found roughly 800 ms timing-only versus 6280 ms sustainable, with burst depth 16 and batch 17 blocked at HACK. Treat this as a point-in-time reference only.
+
+## Depth-2 admission simulation validation
+
+Run alongside serialized production:
 
 ```text
-landing.orderCorrect
-landing.actualOrder
-landing.missingJobs
-landing.minimumSpacingMs
-landing.maxAbsLandingErrorMs
+run hacking/batch-scheduler.js phantasy 0.10 200 admission
 ```
 
-Each stage should also show:
+This must remain non-executing. Confirm the log/state explicitly says dry run and `launchesWorkers: false`.
+
+Expected state progression when the initial target is prepared and RAM permits:
 
 ```text
-plannedLandingAt
-actualLandingAt
-allocationSpreadMs
-landingErrorMs
-reportedJobs / expectedJobs
+ADMITTED (virtual batch 1)
+  ↓
+INTERVAL_WAIT
+  ↓
+ADMITTED (virtual batch 2)
+  ↓
+DEPTH_CAP
+  ↓
+DRAIN (oldest reaches planned W2)
+  ↓
+next virtual admission may occur
 ```
 
-The planned-vs-actual timeline plots one row each for H, W1, G, and W2. Planned and actual markers should remain close. Actual to the right of planned means the stage landed late; actual to the left means early.
+Acceptance checks:
 
-Interpretation:
+- `admission.maxDepth === 2` always;
+- `admission.inFlight` never exceeds 2;
+- no H/G/W PID is created by the simulator;
+- initial admission waits at `WAITING_PREP` if money/security are not prepared;
+- after the virtual pipeline opens, temporary raw target money/security changes do not incorrectly gate every new batch;
+- current remote RAM is rechecked before each virtual admission;
+- insufficient host-window capacity produces `RAM_BLOCKED` instead of admission;
+- the second virtual admission respects the tuned sustainable interval;
+- virtual batches leave the in-flight set only at planned final W2 landing.
 
-- `orderCorrect` should be true.
-- `missingJobs` should be zero.
-- `actualOrder` should remain `HACK → WEAKEN_HACK → GROW → WEAKEN_GROW`.
-- `minimumSpacingMs` should remain comfortably positive relative to the configured 200 ms gap.
-- `maxAbsLandingErrorMs` shows the worst stage drift.
-- `allocationSpreadMs` shows how widely a stage split across hosts completed.
+## Admission safety-stop validation
 
-Do not tune the 200 ms gap from a single sample. Collect several cycles and compare the worst observed drift, spread, and minimum spacing.
+Admission mode watches new matching Port 15 completed batches. A healthy new completed batch should not stop admissions.
 
-## Batch correctness acceptance criteria
+A safety stop is expected if a newly observed matching completion has any of:
 
-Before starting pipelined/overlapping batches, aim for several consecutive automatic batches satisfying all of these:
+- bad landing order;
+- missing timing events;
+- money recovery error > 0.5 percentage points;
+- security recovery error > 0.05;
+- final money < 99.5%;
+- final security > +0.05.
 
-- target starts at intended money baseline;
-- security starts near minimum;
-- H/W1/G/W2 all land in correct order;
-- all expected worker timing events are reported;
-- money returns to intended baseline after W2;
-- security returns to approximately `+0.00–0.05`;
-- no standalone correction weaken/grow is required between normal batches;
-- predicted-vs-actual recovery error is understood and consistently small;
-- measured minimum stage spacing leaves a reasonable margin against observed drift/spread;
-- post-batch strategic review completes once per full batch;
-- batch-associated HACK does not independently trigger strategic review;
-- no partial batch is left alive after launch failure.
-
-## Timing validation before pipelining
-
-The current fixed gap is 200 ms. Compare over repeated retained completed batches:
+When stopped:
 
 ```text
-configured gap
-minimum observed adjacent spacing
-maximum absolute landing error
-maximum within-stage allocation spread
+admission.safetyStopped === true
+admission.decision.status === SAFETY_STOP
 ```
 
-If order remains correct and the worst measured timing variation leaves substantial positive spacing, keep the gap unchanged. If spacing becomes narrow or negative, investigate launch overhead, host split, and scheduler drift before adapting the gap.
+No new virtual batch may be admitted, while already-admitted virtual batches continue to drain. Restart the simulator to clear the stop; automatic recovery/reset is intentionally not implemented yet.
 
-## Pipelining readiness test
+## Before live depth-2 execution
 
-Only proceed after single-batch correctness and timing are stable. A pipelined scheduler will need additional validation for global RAM reservation, stage collision prevention, target-state assumptions, safe batch depth, batch-id telemetry, cancellation/recovery, and strategic-review cadence.
+Do not launch overlapping real batches until all of the following are complete:
 
-Important: Port 14 is currently cleared before each serialized batch. That behavior is safe only while one batch is in flight and must be redesigned before overlapping batches.
+- repeated serialized timing/recovery samples are stable;
+- rolling timing history exists;
+- Port 14 clearing is removed and one multi-batch-safe consumer routes events by `batchId`;
+- host-window reservations are reused as actual launch allocations;
+- partial launch rollback is atomic;
+- strategic review becomes pipeline-aware;
+- depth-2 admission/safety behavior has been exercised in simulation.
 
-## Regression checklist after major changes
+## Regression checklist
 
 At minimum verify:
 
-- `run startup.js` starts GUI + stack;
-- all six tabs switch responsively, including the Batch tab;
-- normal HGW mode still works;
-- GUI can switch to BATCH and back to HGW;
-- transition buttons disable and show the pending target mode;
-- Active Workers rows appear and disappear with standalone/prep worker allocations;
-- current action ETA is plausible and counts down between controller refreshes;
-- no automatic worker kill occurs from a `LATE` label;
-- manual target override still works;
-- manual prep/hold still works;
-- manual money goal still blocks automated spending;
-- cloud purchase and cloud upgrade automation still execute;
-- batch-associated HACK does not trigger premature planner review;
-- Port 14 timing events do not affect Port 4 strategic HACK telemetry;
-- Port 15 retains the latest complete result while Port 12 moves to the next batch;
-- README/docs reflect the current architecture.
+- startup launches GUI + stack;
+- all six GUI tabs remain responsive;
+- normal HGW and serialized BATCH modes still work;
+- mode transitions remain safe;
+- Active Workers/ETA state appears and clears correctly;
+- manual target/prep/money-goal controls still work;
+- Port 14 does not interfere with Port 4 strategic HACK telemetry;
+- Port 15 retains latest completed batch;
+- Port 16 reflects scheduler snapshot or admission simulation state;
+- admission simulation creates no real worker processes;
+- docs reflect the current architecture.
