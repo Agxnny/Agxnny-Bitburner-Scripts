@@ -16,6 +16,7 @@ const TABS = Object.freeze(["Overview", "Targets", "Economy", "Batch", "Validati
 const UI_SYNC_MS = 100;
 const MAIN_TICK_MS = 25;
 const DATA_REFRESH_MS = 1000;
+const VALIDATION_STALE_MS = 2500;
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -70,7 +71,7 @@ function header(s) {
     const pending = c.executionMode?.pending;
     const pipeline = freshPipelineState(s);
     const multi = isFreshMultiExecution(s.multiScheduler) ? s.multiScheduler : null;
-    const validation = freshValidationState(s.overlapValidation);
+    const validation = validationBadgeState(s);
     return el("div", { style: styles.header },
         el("div", null,
             el("div", { style: styles.eyebrow }, "AGXNNY AUTOMATION"),
@@ -82,7 +83,7 @@ function header(s) {
             badge(pending ? `SWITCH → ${pending}` : modeBadge(mode), pending ? "warn" : mode === "STANDBY" ? "dim" : "accent"),
             pipeline ? badge(`PIPE ${pipeline.status ?? "RUN"}`, pipeline.safetyStopped ? "warn" : "good") : null,
             multi ? badge(`MULTI ${multi.status ?? "RUN"}`, multi.status === "SAFETY_STOP" || multi.status === "BLOCKED" ? "warn" : "good") : null,
-            validation ? badge(`VALID ${validation.status}`, validation.status === "FAILED" || validation.status === "ABORTED" ? "warn" : "accent") : null,
+            validation ? badge(validation.label, validation.tone) : null,
             c.prep?.hold ? badge("PREP HOLD", "good") : null,
             c.executionMode?.pipelineSafetyStopped ? badge("PIPE STOP", "warn") : null,
             c.executionMode?.multiSafetyStopped ? badge("MULTI STOP", "warn") : null,
@@ -125,7 +126,13 @@ function isFreshMultiExecution(state) {
     return Boolean(state?.model?.startsWith("MULTI_TARGET_EXECUTOR")) && Date.now() - Number(state?.updatedAt ?? 0) < 5000;
 }
 
-function freshValidationState(state) {
-    if (!state || Date.now() - Number(state.updatedAt ?? 0) >= 5000) return null;
-    return ["STARTING", "RUNNING", "BETWEEN_WAVES", "MIXED_NEXT"].includes(String(state.status ?? "")) ? state : null;
+function validationBadgeState(s) {
+    const runtime = s.validationRuntime ?? {};
+    if (!runtime.active) return null;
+    const state = s.overlapValidation ?? {};
+    const fresh = Date.now() - Number(state.updatedAt ?? 0) <= VALIDATION_STALE_MS;
+    if (!fresh) return { label: "VALID STALE", tone: "warn" };
+    const status = String(state.status ?? "RUNNING");
+    if (status === "FAILED" || status === "ABORTED") return { label: `VALID ${status}`, tone: "warn" };
+    return { label: `VALID ${status}`, tone: "accent" };
 }
