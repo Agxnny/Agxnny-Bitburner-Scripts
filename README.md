@@ -8,7 +8,7 @@ A modular Bitburner v3.x automation project built around a control-only home nod
 run startup.js
 ```
 
-Startup now brings the control plane up in **STANDBY**. Planner/economy/controller/UI state remains available, but the controller does not launch target-side H/G/W workers, serialized batches, or a pipeline coordinator until an execution mode is selected in the GUI.
+Startup brings the control plane up in **STANDBY**. Planner/economy/controller/UI state remains available, but the controller does not launch target-side H/G/W workers, serialized batches, or a pipeline coordinator until an execution mode is selected in the GUI.
 
 For updates:
 
@@ -21,8 +21,6 @@ GitHub `main` is the source of truth. Read `docs/HANDOFF.md` first before contin
 
 ## GUI execution controls
 
-Overview provides four execution choices:
-
 ```text
 STANDBY   no target-side execution
 HGW       normal sequential automation
@@ -32,46 +30,43 @@ PIPELINE  continuous controller-managed depth-2 HWGW
 
 `Prep + hold` remains available for manual testing/recovery, and `Resume` releases a prepared hold or clears a reviewed pipeline safety stop.
 
-The Batch tab shows serialized state, Port 16 pipeline state, in-flight depth, cadence, completed count, safety status, latest recovery, landing order, drift/spread, and collapsible stage diagnostics.
-
 ## Integrated depth-2 pipeline
 
-Four consecutive real overlapping `phantasy` batches were validated across two depth-2 runs with:
+Four consecutive real overlapping `phantasy` batches were validated with 100.00% money recovery, +0.000 security, correct H → W1 → G → W2 order, and no safety stops. The then-current sustainable cadence was about 6262 ms.
+
+The controller-integrated `PIPELINE` mode keeps the live depth cap at 2 while integration is validated. The coordinator runs on home, H/G/W workers remain remote, Port 14 events are routed centrally by `batchId`, Port 15 keeps the latest completion, and Port 16 exposes the current single-target pipeline state.
+
+The 200 ms stage gap remains unchanged until rolling timing history exists.
+
+## Multi-target resource allocator — dry run
+
+The first global multi-target planning scaffold is now available:
 
 ```text
-money recovery: 100.00%
-security:       +0.000
-landing order:  H → W1 → G → W2
-safety stops:   none
-cadence:        ~6262 ms in that capacity state
+run hacking/multi-target-scheduler.js money 4 0.10 200 64
+run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
+run hacking/multi-target-scheduler.js xp 4 0.10 200 64
 ```
 
-The controller now has a proper `PIPELINE` execution mode. When selected it prepares the target, launches `hacking/pipeline-runner.js` in continuous mode, and keeps the hard live depth cap at **2**.
+It launches **no workers**. Instead of assigning a fixed depth to every target, it repeatedly scores and reserves complete virtual HWGW batches against one shared host/time calendar. Better targets can receive more depth, while a diminishing-returns fairness penalty leaves room for secondary viable targets when capacity permits.
 
-The executor:
+Profiles:
 
-- reserves RAM host-by-host over future execution windows;
-- includes dispatch lead in reservations;
-- launches stages just in time;
-- owns Port 14 while pipeline execution is active and routes events by `batchId`;
-- publishes live executor state to Port 16;
-- publishes completed batches to Port 15;
-- stops new admissions on launch/timing/recovery failure;
-- drains already-admitted HWGW work before a controller execution-mode change.
+```text
+MONEY     expected cash per reserved RAM-time
+BALANCED  70% normalized money efficiency + 30% XP proxy
+XP        action-thread/difficulty XP proxy per reserved RAM-time
+```
 
-A pipeline safety stop does not silently continue. The controller prepares/holds the target for inspection and requires `Resume` before the pipeline can restart.
+The XP score is intentionally a proxy at this stage, not an exact hacking-experience formula. Full allocation state is published to **Port 17**, leaving Port 16 free for the live single-target pipeline.
 
-The 200 ms stage gap remains unchanged until more rolling timing history exists.
-
-## Manual pipeline test
-
-The finite test harness still works when the controller is parked at PREPARED HOLD:
+## Manual finite pipeline test
 
 ```text
 run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
 
-Normal operation should now use the GUI `Pipeline` mode instead of repeatedly starting this command manually.
+Normal single-target operation should use GUI `Pipeline` mode rather than repeatedly starting this manually.
 
 ## Runtime ports
 
@@ -92,27 +87,28 @@ Normal operation should now use the GUI `Pipeline` mode instead of repeatedly st
 | 13 | controller command queue |
 | 14 | batch worker landing-timing event queue |
 | 15 | latest completed serialized/pipeline batch |
-| 16 | pipeline planner / simulation / executor snapshot |
+| 16 | single-target pipeline planner / simulation / executor |
+| 17 | global multi-target allocation planner |
 
 ## Useful commands
 
 ```text
 run startup.js
 run diagnostics/mem-audit.js
-run diagnostics/economy-targets.js
-run diagnostics/income.js
-run diagnostics/progression.js
-run network/inspect.js
-run network/root.js
 run hacking/batch-scheduler.js phantasy 0.10 200
+run hacking/multi-target-scheduler.js money 4 0.10 200 64
+run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
+run hacking/multi-target-scheduler.js xp 4 0.10 200 64
 run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
 
 ## Next priorities
 
-1. validate controller-managed PIPELINE startup, prep, continuous depth-2 execution, and safe drain on mode switch;
-2. collect rolling landing/recovery history across integrated pipeline batches;
-3. make adaptive timing decisions from history rather than one Port 15 sample;
-4. further unify serialized/pipeline Port 14 ownership;
-5. only raise live depth above 2 after repeated integrated validation;
-6. keep automatic worker watchdog termination deferred until pipeline timing is stable.
+1. finish continuous PIPELINE startup/drain/restart validation;
+2. inspect MONEY/BALANCED/XP multi-target dry-run allocations and tune fairness/global landing spacing;
+3. add rolling per-target landing/recovery history;
+4. extract shared batch-planning/reservation logic;
+5. build persistent multi-target admission simulation;
+6. first real multi-target test with global depth 2 / per-target depth 1;
+7. then replace fixed depth with dynamic safe per-target depth under one global RAM/time calendar;
+8. keep automatic watchdog termination deferred until timing is stable.
