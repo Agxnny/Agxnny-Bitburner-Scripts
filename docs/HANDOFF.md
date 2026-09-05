@@ -10,12 +10,7 @@ The **current GitHub `main` branch is the source of truth**. Before changing any
 
 The project targets **Bitburner v3.x** and is currently being developed/tested on **v3.0.1**.
 
-After a major architectural change, refresh the documentation set before considering the change complete:
-
-- `README.md`
-- `docs/HANDOFF.md`
-- `docs/architecture.md`
-- any directly affected reference docs in `docs/`
+After a major architectural change, refresh `README.md`, this handoff, `docs/architecture.md`, and any directly affected reference docs.
 
 ## Project objective
 
@@ -23,238 +18,188 @@ Build a modular, low-RAM Bitburner automation system that evolves from simple di
 
 Core design goals:
 
-- Home is primarily the **control/UI plane**.
-- Rooted and purchased/cloud servers form the **remote execution plane**.
+- Home is primarily the control/UI plane.
+- Rooted and purchased/cloud servers form the remote execution plane.
 - H/G/W workers remain minimal and dumb.
 - Important decisions are published as structured runtime state.
 - The GUI consumes state and sends commands; it does not own hacking logic.
 - RAM efficiency is a first-class constraint.
 
-## Current major milestone
+## Current live execution milestone
 
-The system supports two runtime-selectable controller modes:
+The controller supports two runtime-selectable modes:
 
-1. **Normal HGW** — sequential tactical weaken/grow/hack automation.
-2. **Batched HWGW** — automatic, synchronized **one-batch-at-a-time** HWGW.
+1. **Normal HGW** — sequential tactical weaken/grow/hack.
+2. **Batched HWGW** — automatic synchronized **one-batch-at-a-time** HWGW.
 
-The mode can be changed from the main GUI without restarting the stack.
+The live production path is still serialized. Do not treat the pipeline scheduler as permission to launch overlapping real batches yet.
 
-Current automatic batch lifecycle:
+Current live batch lifecycle:
 
 ```text
 select target + strategy
         ↓
-prepare target to strategy baseline
+prepare target
         ↓
 launch synchronized H / W1 / G / W2
         ↓
-wait for full batch completion
+wait for full completion
         ↓
 post-batch strategic review barrier
         ↓
-planner + sync + economy + target review
-        ↓
-repair target if recovery was imperfect
+repair/review if needed
         ↓
 next batch
 ```
 
 ## Latest live validation
 
-On 2026-09-05, the original automatic batch-mode production cycle on `sigma-cosmetics` exposed the W2 security-compensation defect:
+The original W2 grow-security under-compensation bug is fixed. Corrected `sigma-cosmetics` batches used approximately:
 
 ```text
-threads: 25H / 1W / 298G / 1W
-money recovery: 100%
-security recovery: +1.13 above minimum
-```
-
-After correcting the grow-security calculation, corrected batches used approximately:
-
-```text
-threads: 25H / 1W / 298–299G / 24W
+25H / 1W / 298–299G / 24W
 money recovery: 100%
 security recovery: minimum
-standalone correction weaken: not required
+standalone repair weaken: not required
 ```
 
-The W2 sizing defect is considered validated enough to proceed with timing instrumentation.
+More recent `phantasy` timing telemetry showed a representative healthy sample with correct H → W1 → G → W2 order, approximately 193 ms minimum spacing from a 200 ms plan, maximum drift around 10 ms, and all timing events reported. Continue collecting samples before reducing the stage gap.
 
-## Highest-priority known issue
+## Current highest-priority work
 
-**Measure actual H/W1/G/W2 landing drift and stage ordering over repeated batches.**
+**Build and validate the pipeline scheduler without enabling live overlapping execution yet.**
 
-Recovery-model telemetry is already present in Port 12. Timing instrumentation is also implemented:
-
-- workers receive their planned landing timestamp as a batch-only argument;
-- each completed batch worker writes a timing event to **Port 14**;
-- the batch runner drains Port 14 while the batch is active;
-- if a stage is split across hosts, the stage's actual landing is the completion timestamp of its **last allocation**;
-- earliest completion and within-stage spread are retained;
-- Port 12 schema version 3 publishes aggregated landing telemetry.
-
-Port 12 is the current batch slot, so a new batch can overwrite the just-completed result. To keep completed measurements visible, every `COMPLETE` payload is also copied to **Port 15**, the latest-completed batch snapshot.
-
-The main GUI has a dedicated **Batch** tab that reads both states:
+`hacking/batch-scheduler.js` now has two non-executing modes:
 
 ```text
-Port 12 → current batch
-Port 15 → latest completed batch
+snapshot   → host-window capacity/cadence analysis
+admission  → persistent live depth-2 admission simulation
 ```
 
-The Batch tab shows current batch status, planned H/W1/G/W2 landing countdowns, planned total duration, W2 ETA, last completed recovery, actual stage order, minimum spacing, maximum drift, missing events, per-stage error/spread, and a **planned-vs-actual landing timeline**.
+Both publish to **Port 16**.
 
-## Pipeline scheduler work has started
+### Scheduler timing model
 
-`hacking/batch-scheduler.js` now exists as a **dry-run-only pipeline planner**. It does not launch workers and does not replace the serialized batch runner yet.
-
-The scheduler deliberately separates two timing controls:
+Two independent controls are modeled:
 
 ```text
-stage gap      = H → W1 → G → W2 spacing inside one batch
-batch interval = H(N) → H(N+1) spacing between successive batches
+stage gap      = H → W1 → G → W2 spacing inside a batch
+batch interval = H(N) → H(N+1) spacing across batches
 ```
 
-The dry-run scheduler:
+The scheduler must protect both. A safe stage gap does not imply a safe cross-batch cadence.
 
-- calculates H/W1/G/W2 sizing for a target;
-- reads retained Port 15 timing telemetry when it matches the same target;
-- conservatively recommends an intra-batch stage gap using observed drift/spread;
-- independently recommends an inter-batch interval;
-- creates a global landing calendar;
-- models stage RAM occupancy from planned start to planned landing;
-- sweeps that calendar to estimate peak aggregate RAM at pipeline depths 1–12;
-- publishes the latest dry-run result to **Port 16**.
+### V2 host-window model
 
-Current tuning remains conservative because Port 15 holds only one completed sample. Do not aggressively reduce timing gaps from one observation. A rolling timing-history layer is required before genuinely adaptive gap reduction.
+The scheduler calculates stage durations/RAM, creates a global landing calendar, and reserves RAM host-by-host over each future stage execution window. It reports:
 
-See `docs/BATCH_SCHEDULER.md` for the current design, limitations, and milestones.
+- timing-only requested interval;
+- RAM-sustainable interval;
+- burst depth;
+- steady-state concurrent window;
+- host/stage that blocks a candidate when reservation fails.
 
-## New observability layer
-
-The controller publishes timing estimates for standalone H/G/W allocations under `execution.activeWorkers` and an aggregate `execution.currentAction` summary.
-
-Each active worker includes:
+A first `phantasy` capacity run reported roughly:
 
 ```text
-pid
-hostname
-threads
-action
-target
-startedAt
-expectedDurationMs
-expectedFinishAt
+stage gap:             200 ms
+requested interval:    800 ms
+sustainable interval:  6280 ms
+remote RAM:             4196 GB / 59 hosts
+burst depth:            16
+batch 17:               blocked at HACK
 ```
 
-The Overview GUI includes:
+Treat these as a point-in-time capacity result, not a permanent configuration.
 
-- current action ETA;
-- an Active Workers panel with action, target, host, threads, elapsed time, ETA/status;
-- read-only `LATE` highlighting after expected duration + `max(5s, 15%)`;
-- no automatic termination yet;
-- stale historical Port 12 `COMPLETE` state is no longer shown as the current batch;
-- execution-mode transition buttons are disabled while `SWITCHING → HGW/BATCH` is pending.
+### V3 depth-2 admission simulator
 
-This observability work is intentionally non-destructive. **Do not add automatic worker killing yet.** After batching timing is understood, add a watchdog as a separate reliability milestone using measured runtime variation and a safe recovery path for partial operations.
+Run:
+
+```text
+run hacking/batch-scheduler.js phantasy 0.10 200 admission
+```
+
+This mode **does not launch workers**. It keeps a virtual in-flight set and applies the admission rules intended for the first executable pipeline:
+
+- hard maximum depth = 2;
+- first virtual admission requires prepared money/security;
+- second admission waits for the sustainable interval;
+- current live remote RAM is rechecked host-by-host;
+- depth 2 blocks further admissions until the oldest virtual batch reaches planned W2;
+- new matching Port 15 completed-batch telemetry is watched for safety failures;
+- bad order, missing timing events, or material recovery errors trigger `SAFETY_STOP` and block further virtual admissions;
+- existing virtual work is allowed to drain.
+
+The simulator deliberately does not auto-reset a safety stop. Restart it after investigating.
+
+See `docs/BATCH_SCHEDULER.md` for detailed rules.
+
+## Runtime telemetry relevant to batching
+
+- Port 12: current serialized batch snapshot.
+- Port 14: batch worker timing event queue.
+- Port 15: latest completed batch snapshot.
+- Port 16: latest pipeline scheduler/admission-simulation snapshot.
+
+Port 14 is still cleared by the serialized batch runner before launch. This is safe only while one real batch is in flight and **must change before live pipelining**.
+
+## GUI observability
+
+The main GUI has a dedicated **Batch** tab showing current/last completed batch state, planned H/W1/G/W2 countdowns, recovery error, actual order, drift/spread, and planned-vs-actual timing graph.
+
+Overview also publishes standalone/prep worker ETA and an Active Workers panel. Worker `LATE` status is diagnostic only; no automatic termination is enabled yet.
 
 ## Immediate next development sequence
 
-Recommended order:
-
 ```text
-1. Continue collecting serialized batch timing/recovery samples
-2. Confirm H → W1 → G → W2 actual order remains correct
-3. Compare measured max drift, minimum spacing, and allocation spread
-4. Run the dry-run scheduler against the same target and compare its timing/RAM model with reality
-5. Add rolling timing history so tuning is based on several batches, not only Port 15
-6. Add host-by-host time-window RAM reservation to the scheduler
-7. Redesign Port 14 consumption so one scheduler can route events for several live batch IDs without clearing the queue
-8. First live pipeline test must be capped at depth 2 with immediate admission stop on timing/recovery error
-9. Raise depth only after repeated depth-2 validation
-10. After batch timing is stable, design watchdog kill/recovery behavior from observed runtimes
+1. Pull and run the new depth-2 admission simulation alongside serialized production
+2. Confirm it never launches workers and remains capped at 2 virtual batches
+3. Observe ADMITTED → DEPTH_CAP → DRAIN behavior
+4. Confirm live RAM changes can produce RAM_BLOCKED instead of unsafe admission
+5. Observe new matching Port 15 completions and validate safety-stop evaluation
+6. Continue collecting repeated single-batch timing/recovery samples
+7. Add rolling timing history instead of relying on one Port 15 sample
+8. Redesign Port 14 as one multi-batch-safe event stream owned/routed by the future scheduler
+9. Reuse host-window reservations as the actual allocation plan
+10. Add atomic real depth-2 launch/rollback
+11. Replace the per-batch strategic-review barrier with pipeline-aware review behavior
+12. Only then perform the first executable depth-2 pipeline test
 ```
-
-Before live pipelining, several consecutive automatic batches should recover money/security correctly, require no standalone correction work, report all worker timing events, and preserve the intended landing order with understood timing margin.
 
 ## Important architectural constraints
 
 ### Remote-only worker execution
 
-H/G/W worker jobs do not use home as fallback capacity. Home is preserved for controller/UI work.
+H/G/W workers do not use home as fallback capacity.
 
-### One live batch at a time for now
+### One real batch at a time for now
 
-The existing execution path deliberately serializes synchronized batches while correctness and timing are being validated. The new batch scheduler is dry-run only and must not be mistaken for permission to launch overlapping batches yet.
-
-### Pipeline timing has two independent margins
-
-Future pipelining must protect both:
-
-- stage-to-stage spacing within a batch; and
-- batch-to-batch spacing across the global landing calendar.
-
-A safe stage gap does not guarantee a safe batch interval.
+The production batch runner remains serialized. The scheduler's depth-2 mode is simulation only.
 
 ### Execution-mode changes are scheduling barriers
 
-`SET_EXECUTION_MODE` is not allowed to compete with fresh tactical work. When HGW/BATCH switching is pending:
+When HGW/BATCH switching is pending, no new target-side work is scheduled. Tactical analysis may be cancelled; already-running H/G/W or batch work finishes naturally before the mode changes.
 
-- no new tactical or batch work is scheduled;
-- an in-flight tactical-analysis process may be cancelled immediately because it has no target-side effect;
-- already-running H/G/W workers are allowed to finish naturally;
-- an already-running synchronized batch is allowed to finish naturally;
-- the controller publishes the pending transition through `executionMode.pending` / `transitioning` until the safe boundary is reached;
-- only then is the new execution mode applied.
+### Full-batch strategic boundary
 
-### Full-batch review boundary
+Batch-associated HACK telemetry must not trigger standalone strategic review. The current serialized controller waits for the full batch completion. This review model must be redesigned before a steady pipeline can admit continuously.
 
-Standalone HGW hacks may trigger strategy review after completion. Batch-associated hacks must be ignored until the **full batch** reaches `COMPLETE`.
+### GUI React callbacks remain Netscript-free
 
-The current per-batch review barrier is intentionally incompatible with a steady pipeline and must be redesigned before live overlapping batches are enabled.
+React callbacks may update plain-JS UI/request state only. Netscript I/O stays in the async dashboard loop.
 
-### Manual money goal is a hard spending lock
+### Batch timing queue is not pipeline-safe yet
 
-A manual cash goal blocks automatic cloud-server purchases and upgrades independently of possibly stale economy state.
+Port 14 cannot be cleared per batch once several real batch IDs overlap. One future scheduler must consume and route the shared event stream by `batchId`.
 
-### GUI React callbacks must stay Netscript-free
+### Latest-completed state is not timing history
 
-React event callbacks must not call Netscript APIs. They may only update React-local presentation state or assign plain JS request/input state. Netscript port/file operations remain in the asynchronous dashboard loop.
+Port 15 retains one completed result. Adaptive timing reduction requires a separate rolling history.
 
-### GUI React tree is persistent
+### Worker watchdog remains deferred
 
-`ui/dashboard.js` mounts its React tree once. The main loop refreshes a cached runtime snapshot and increments a plain-JS version counter; the mounted React root observes that version and re-renders without `clearLog()` / `printRaw()` remount churn.
-
-Tab selection is React-local and therefore immediate. Controller commands still cross the Netscript boundary through queued plain-JS requests processed by the main loop.
-
-### Batch timing events stay separate from strategic telemetry
-
-Port 4 remains the HACK event queue used by income/strategic refresh logic. Port 14 is dedicated to batch worker completion timing so GROW/WEAKEN timing events cannot accidentally trigger strategic review.
-
-Port 14 is currently cleared by the serialized runner before a batch. That must be removed before pipelining; one future scheduler should consume the shared queue and route events by `batchId`.
-
-### Latest-completed batch is a snapshot, not history
-
-Port 15 retains one completed batch for GUI inspection. It is not a rolling history/statistics store. Adaptive scheduler tuning needs a separate rolling history layer rather than changing Port 15 semantics implicitly.
-
-### Worker lateness is diagnostic only
-
-The current GUI can label a standalone worker `LATE`, but the controller does not kill it. A future watchdog must distinguish harmless scheduler drift from genuinely stuck work and must force target recovery after any killed partial operation.
-
-## Important user-facing controls
-
-Main GUI: `ui/dashboard.js`
-
-Tabs:
-
-- Overview
-- Targets
-- Economy
-- **Batch**
-- Network
-- Diagnostics
-
-The Batch tab is the primary synchronized-HWGW observability surface. Overview also exposes active standalone worker timing and ETA.
+Do not add automatic worker killing until batch/pipeline timing is stable. Any future watchdog must verify the PID, apply measured grace, and force target recovery after a killed partial operation.
 
 ## Useful commands
 
@@ -264,37 +209,26 @@ run diagnostics/mem-audit.js
 run diagnostics/economy-targets.js
 run diagnostics/income.js
 run diagnostics/progression.js
-run economy/manual-goal.js status
 run network/inspect.js
 run network/root.js
 run hacking/batch-runner.js n00dles 0.10 200 1
 run hacking/batch-scheduler.js phantasy 0.10 200
+run hacking/batch-scheduler.js phantasy 0.10 200 admission
 ```
 
-For repository updates in-game:
+For repository updates:
 
 ```text
 run gitpull.js
 run startup.js
 ```
 
-## Development workflow for a new chat
-
-A good first instruction is:
-
-```text
-Continue my Bitburner automation project from GitHub.
-Read docs/HANDOFF.md first, then inspect the current live files before editing anything.
-The current priority is the highest-priority known issue in the handoff document.
-Keep GitHub main as the source of truth and refresh the docs after major changes.
-```
-
 ## Related documentation
 
 - `docs/README.md` — documentation index
-- `docs/architecture.md` — architectural design and data flow
-- `docs/BATCH_SCHEDULER.md` — dry-run pipeline scheduler design and milestones
+- `docs/architecture.md` — architecture and data flow
+- `docs/BATCH_SCHEDULER.md` — pipeline scheduler design and milestones
 - `docs/SYSTEM_MAP.md` — responsibility map by script/module
-- `docs/RUNTIME_STATE.md` — ports, controller commands, and state contracts
-- `docs/TESTING.md` — validation procedures and current acceptance criteria
-- `docs/ROADMAP.md` — staged priorities and future work
+- `docs/RUNTIME_STATE.md` — ports/state contracts
+- `docs/TESTING.md` — validation procedures
+- `docs/ROADMAP.md` — staged roadmap
