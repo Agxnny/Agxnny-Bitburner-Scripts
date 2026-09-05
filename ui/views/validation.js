@@ -20,12 +20,14 @@ export function validationView(s) {
                 labeledControl("Hack %", input("validationHackPercent", "number", 0.1, 50)),
                 labeledControl("Stage gap ms", input("validationStageGap", "number", 75, 1000)),
                 el("div", { style: styles.multiLaunch }, button(running ? "VALIDATING…" : "START VALIDATION", queueValidationRun, !canStart)),
-                el("div", { style: styles.multiLaunch }, button(runtime.fullDepth ? "FULL DEPTH RUNNING…" : "FULL DEPTH TEST", () => queueFullDepth(), !canStart || !individual)),
+                el("div", { style: styles.multiLaunch }, button(runtime.fullDepth ? "FULL DEPTH RUNNING…" : "FULL DEPTH TEST", queueFullDepth, !canStart || !individual)),
             ),
             el("div", { style: styles.goalStatus }, status("validationStatus")),
             note(controlNote(controllerMode, controllerPending, running, fresh, individual)),
         ), true),
-        liveOverview(state, runtime, fresh), landingStream(state), evidenceTable(targetRows(s)),
+        liveOverview(state, runtime, fresh),
+        landingStream(state),
+        evidenceTable(targetRows(s)),
     );
 }
 
@@ -64,10 +66,19 @@ function liveOverview(state, runtime, fresh) {
 }
 function landingStream(state) {
     const batches = Array.isArray(state.inFlight) ? state.inFlight : [];
-    return card("Landing stream", el("div", null, batches.length ? batches.map((batch, index) => el("div", { key: batch.id, style: { marginBottom: "8px" } },
+    const rows = batches.map((batch, index) => landingBatch(batch, index));
+    return card("Landing stream", el("div", null, ...(rows.length ? rows : [note("No active validation batches.")])), true);
+}
+function landingBatch(batch, index) {
+    const stages = (batch.stages ?? []).map((stage) => el("div", { key: stage.name, style: styles.stat },
+        el("div", { style: styles.statLabel }, stage.name),
+        el("div", { style: styles.statValue }, stage.actualLandingAt ? `✓ ${signedMs(Number(stage.actualLandingAt) - Number(stage.landingAt))}` : stage.launched ? "IN FLIGHT" : "WAITING"),
+        el("div", { style: styles.dimText }, `${stage.events ?? 0}/${stage.jobs ?? 0} jobs`),
+    ));
+    return el("div", { key: batch.id, style: { marginBottom: "8px" } },
         el("div", { style: styles.strategyTitle }, `Batch ${index + 1} · ${batch.done ? "DONE" : "ACTIVE"}`),
-        el("div", { style: styles.stageStrip }, ...(batch.stages ?? []).map((stage) => el("div", { key: stage.name, style: styles.stat },
-            el("div", { style: styles.statLabel }, stage.name), el("div", { style: styles.statValue }, stage.actualLandingAt ? `✓ ${signedMs(Number(stage.actualLandingAt) - Number(stage.landingAt))}` : stage.launched ? "IN FLIGHT" : "WAITING"), el("div", { style: styles.dimText }, `${stage.events ?? 0}/${stage.jobs ?? 0} jobs`))))) : note("No active validation batches.")), true);
+        el("div", { style: styles.stageStrip }, ...stages),
+    );
 }
 function evidenceTable(rows) {
     return card("Per-target depth evidence", el("div", null,
