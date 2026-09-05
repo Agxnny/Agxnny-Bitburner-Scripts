@@ -56,7 +56,9 @@ Neither multi-target planning script, the prepper, nor the batch-history collect
 
 ## Port 15 — latest completed batch
 
-Port 15 accepts compatible serialized and pipeline completion payloads. It remains latest-only. `hacking/batch-history.js` watches this snapshot and folds each new completed batch into Port 19.
+Port 15 accepts compatible serialized and pipeline completion payloads. It remains latest-only. `hacking/batch-history.js` watches this snapshot and folds genuinely new completed batches into Port 19.
+
+The collector treats the Port 15 snapshot already present at collector startup as stale/observed, requires a completion timestamp at or after collector startup, and keeps a set of previously seen batch IDs. This prevents restarts or replayed latest-value snapshots from manufacturing extra safety evidence.
 
 ## Port 16 — single-target pipeline state
 
@@ -103,16 +105,18 @@ DEDICATED_TARGET_PREPPER_V1
 Published by `hacking/batch-history.js` with model:
 
 ```text
-ROLLING_BATCH_HISTORY_V1
+ROLLING_BATCH_HISTORY_V2_PIPELINE_EVIDENCE
 ```
 
-The collector watches Port 15 for new `COMPLETE` batch IDs and keeps up to 16 real samples per target. Each sample records order correctness, missing timing jobs, final money/security recovery, maximum landing drift, minimum spacing, allocation spread, gap, and batch interval.
+The collector watches Port 15 for fresh `COMPLETE` batch IDs and keeps up to 16 real samples per target. Each sample records whether it came from a real pipeline completion, source model, order correctness, missing timing jobs, final money/security recovery, maximum landing drift, minimum spacing, allocation spread, gap, and batch interval.
 
 Per-target summary fields include:
 
 ```text
 sampleCount
+pipelineSampleCount
 cleanSamples
+cleanPipelineSamples
 consecutiveClean
 recommendedDepth
 confidence
@@ -127,16 +131,16 @@ samples[]
 
 A clean sample currently requires correct stage order, zero missing timing jobs, >=99.5% money recovery, <=+0.05 security, <=150 ms maximum absolute landing error, and >=75 ms minimum observed spacing.
 
-The conservative depth recommendation is intentionally evidence-gated:
+Higher depth recommendations now require consecutive clean **pipeline** samples. Serialized single-batch completions may remain in history for diagnostics but cannot promote the target above depth 1.
 
 ```text
-0-1 consecutive clean samples -> depth 1 / UNPROVEN
-2-3 consecutive clean samples -> depth 2 / LOW
-4-7 consecutive clean samples -> depth 4 / MEDIUM
-8+ consecutive clean samples  -> depth 8 / HIGH
+0-1 consecutive clean pipeline samples -> depth 1 / UNPROVEN
+2-3 consecutive clean pipeline samples -> depth 2 / LOW
+4-7 consecutive clean pipeline samples -> depth 4 / MEDIUM
+8+ consecutive clean pipeline samples  -> depth 8 / HIGH
 ```
 
-This is advisory only for now. The persistent simulator has not yet been wired to enforce the recommendation; that is the next safety step before real multi-target execution.
+This is advisory only for now. The persistent simulator has not yet been wired to enforce the recommendation; that remains the next safety step before real multi-target execution.
 
 ## GUI rule
 
