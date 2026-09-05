@@ -2,41 +2,27 @@
 
 GitHub `main` is the source of truth. Read this file first, then fetch current live files before editing. Target is Bitburner v3.x; live testing is v3.0.1.
 
-## Engineering constraints: prefer modules over monoliths
+## Engineering constraints
 
-Prefer small modules with narrow responsibilities that work together over large monolithic scripts.
+Prefer small modules with narrow responsibilities over monoliths. Soft targets: ordinary modules <=300 lines when practical, review/split around 400, >500 needs a reason; UI views/components ideally 100-250; individual functions usually <=40-60 lines. Split by responsibility, avoid circular imports, preserve Bitburner RAM awareness.
 
-Soft size targets:
+GUI rule: React callbacks stay Netscript-free. The async Netscript loop owns ports/files/process launches; React consumes cached plain-JS state and emits plain-JS requests.
 
-```text
-ordinary module / script        aim for <= 300 lines
-review / split threshold        ~400 lines
-exception threshold             >500 lines requires a clear reason
-UI view module                  ideally 100-250 lines
-shared UI component module      ideally 100-250 lines
-entrypoint / coordinator        keep as small as practical
-individual function             usually <= 40-60 lines
-```
-
-These are guardrails, not arbitrary hard failures. Split by responsibility, not merely to satisfy line count. Avoid circular imports and preserve Bitburner RAM awareness when introducing shared modules.
-
-For GUI work specifically: React callbacks must remain Netscript-free. The async Netscript loop owns ports/files/process launches; React consumes cached plain-JS state and emits plain-JS requests.
-
-## Current control modes
+## Current execution modes
 
 ```text
 STANDBY   controller parked
 HGW       sequential automation
 BATCH     serialized HWGW
 PIPELINE  continuous single-target depth-2 HWGW
-MULTI     controller-managed repeated finite multi-target waves
+MULTI     repeated finite multi-target waves
 ```
 
-Startup defaults to STANDBY. Background prep is independent of production mode.
+Startup defaults to STANDBY. Distributed background prep is independent of production mode.
 
-## Latest validated batching evidence
+## Validated concurrency evidence
 
-Historical real stress validation completed cleanly through distinct-target depth 5:
+Historical real distinct-target stress validation completed cleanly through global depth 5:
 
 ```text
 depth 2: 2/2 clean
@@ -47,89 +33,85 @@ worst max drift: 129 ms
 worst minimum spacing: 151 ms
 ```
 
-Depth 6 was prep-limited, not failed. Per-target real MULTI overlap remains hard-capped at 1. Port 19 same-target history and global distinct-target stress evidence are separate safety signals.
+Depth 6 was prep-limited rather than failed. The historical result predates durable stress evidence and is intentionally not silently seeded.
 
-## AUTOMULTI / stress evidence foundation
+Real same-target overlap evidence is a separate dimension. The single-target PIPELINE has real clean depth-2 history on some targets; real MULTI itself still hard-caps each target at depth 1 until the dedicated overlap rollout is validated.
 
-Durable evidence:
+## Durable global stress evidence
 
 ```text
 lib/multi-stress-evidence.js
-data file: /data/multi-stress-evidence.txt
+/data/multi-stress-evidence.txt
 model: MULTI_STRESS_EVIDENCE_V1
 ```
 
-Completed stress runs persist highest proven clean depth, highest attempted depth, accumulated clean waves, unique targets, drift/spacing extremes, last status/reason, and real FAILED/SAFETY_STOP depth. BLOCKED/ABORTED runs never reduce already-proven depth. Historical depth-5 evidence predates this file and is intentionally not silently seeded; controlled tests should recreate machine-readable proof.
+Completed stress runs persist highest proven clean global distinct-target depth, attempted depth, clean waves, targets, drift/spacing extremes, last result, and real failed depth. BLOCKED/ABORTED do not reduce proof.
 
-### Stress tester V2: prep-aware + resumable
+Stress tester:
 
 ```text
 diagnostics/multi-target-stress.js
 model: MULTI_TARGET_STRESS_V2_PREP_AWARE_RESUME
-Port: 20 live state
 ```
 
-Usage accepts an eighth positional argument `startDepth|resume`.
+Usage:
 
 ```text
-run diagnostics/multi-target-stress.js mixed 6 2 12 0.10 200 10 2
-run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 20 resume
-run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 20 6
+run diagnostics/multi-target-stress.js [profile] [maxDepth] [wavesPerDepth] [targetCount] [hackFraction] [stageGapMs] [prepWaitMinutes] [startDepth|resume]
 ```
 
-When a child wave returns BLOCKED, stress enters WAITING_PREP, watches fresh Port 18 every ~2 seconds, publishes prepared/required counts, and only retries once enough prepared targets exist.
+BLOCKED waves enter WAITING_PREP and observe fresh Port 18 readiness instead of relaunching blindly.
 
-## AUTOMULTI decision engine V1
+## AUTOMULTI decision/controller
 
-Pure decision module:
+Pure decision engine:
 
 ```text
 lib/automulti-decision.js
 model: AUTOMULTI_DECISION_V1
 ```
 
-It explicitly separates:
+It separates:
 
 ```text
-Possible depth   prepared + conservative RAM-feasible distinct targets
-Proven depth     durable stress proof, with conservative depth-2 fallback
-Effective depth  min(Possible, Proven)
-Validation depth next unproven level when Possible > Proven
+Possible   prepared + conservative RAM-feasible global distinct-target depth
+Proven     durable global stress proof, with conservative depth-2 fallback
+Effective  min(Possible, Proven)
+Validation next unproven global depth
 ```
 
-The chosen config contains profile/objective, targetCount, globalDepth, hackPercent, and stageGapMs. Target scoring uses throughput/efficiency plus Port 19 history safety weighting. Global production depth never exceeds proven stress evidence.
-
-Current RAM feasibility intentionally sums complete per-batch RAM requirements rather than assuming perfect stage-time reuse, so Possible depth is conservative.
-
-### Shared live candidate path
+Shared live path:
 
 ```text
 lib/multi-target-ranking.js
 lib/automulti-live.js
 ```
 
-`multi-target-ranking.js` centralizes the intended candidate-source policy:
+Candidate-source policy is now literally shared by advisor and real runner:
 
 ```text
-XP             planner baseline ranking
-MONEY/BALANCED economic ranking when >=2 rows exist
-               otherwise planner fallback
+XP             planner baseline rankings
+MONEY/BALANCED economic rankings when >=2 rows
+               planner fallback otherwise
 ```
 
-`automulti-live.js` is now the single live adapter for AUTOMULTI. It reads planner/economic state, production RAM after prep reservations, Port 19 target history, durable stress evidence, and builds the hack-percent scenarios consumed by the pure decision engine.
+The old local `sourceRankings()` helper has been removed from `hacking/multi-target-runner.js`. Do not reintroduce ranking-policy duplication.
 
-`diagnostics/automulti-advisor.js` now uses this live adapter and prints the ranking source. This matches the existing real MULTI runner candidate-source behavior. The runner still contains its tiny legacy `sourceRankings()` helper with the same policy; remove that duplicate when the runner is next safely rewritten so there is one literal implementation as well as behavioral parity.
+Read-only advisor:
 
-### AUTOMULTI supervisory coordinator V1
+```text
+diagnostics/automulti-advisor.js
+run diagnostics/automulti-advisor.js [money|balanced|xp]
+```
+
+AUTOMULTI supervisor:
 
 ```text
 hacking/automulti-controller.js
-state file: /data/automulti-controller-state.txt
+/data/automulti-controller-state.txt
 model: AUTOMULTI_CONTROLLER_V1
-usage: run hacking/automulti-controller.js [money|balanced|xp] [validate|no-validate]
+run hacking/automulti-controller.js [money|balanced|xp] [validate|no-validate]
 ```
-
-This is a focused supervisor rather than more logic inside the already-large main controller. The normal `hacking/controller.js` and finite `multi-target-runner.js` remain the execution plane; AUTOMULTI only sends normal Port 13 controller requests.
 
 State flow:
 
@@ -139,130 +121,135 @@ ASSESS -> RUN -> OBSERVE -> ADAPT
                     +-> VALIDATE_PENDING -> STANDBY/drain -> VALIDATING -> ASSESS
 ```
 
-Behavior:
+It sends normal Port 13 requests to the existing main controller; it does not own Port 14 or launch H/G/W directly. It respects MULTI safety stops and does not take over HGW/BATCH/PIPELINE.
+
+## Same-target overlap foundation
+
+New focused policy:
 
 ```text
-- reassesses live candidates/RAM/evidence every ~5 seconds
-- starts MULTI from STANDBY using the safe Effective configuration
-- while MULTI runs, config changes are queued for subsequent finite waves
-- observes completed real MULTI runIds and counts clean AUTO waves
-- after 3 clean AUTO waves, if Possible > Proven and validation is enabled:
-    request STANDBY
-    allow the current finite wave to drain naturally
-    launch the existing stress tester only at the next validation depth
-    use 2 validation waves, mixed profile, 10% hack, 200 ms gap, 20 minute prep wait
-    after stress exits, reassess durable evidence and resume production
-- a MULTI safety stop is respected; AUTOMULTI does not auto-clear it
-- if another execution mode (HGW/BATCH/PIPELINE) owns the controller, AUTOMULTI reports BLOCKED and does not take it over
+lib/multi-overlap-policy.js
+model: MULTI_TARGET_OVERLAP_POLICY_V1
 ```
 
-AUTOMULTI validation therefore never overlaps production MULTI. Validation temporarily parks production at a safe boundary and reuses the existing evidence system.
+This deliberately treats global distinct-target proof and same-target overlap proof as different safety dimensions.
 
-Known V1 follow-up: if a validation depth records a real FAILED/SAFETY_STOP, add an evidence-aware retry cooldown/lockout so AUTOMULTI does not repeatedly re-attempt the same failed depth after another clean-wave interval.
+Current real overlap policy:
 
-## Distributed target prepper V3 adaptive focus
+```text
+no usable real history / latest unhealthy -> depth 1
+>=2 consecutive clean real pipeline samples -> eligible for depth 2
+real MULTI promotion hard ceiling for now -> depth 2
+```
+
+Important: Port 19's older `recommendedDepth` ladder can report 4/8 after many clean samples, but that is not accepted as proof that real MULTI may safely overlap 4/8 batches on the same target. The new policy caps real overlap at 2 until dedicated overlap validation proves higher depths.
+
+Read-only overlap advisor:
+
+```text
+diagnostics/multi-overlap-advisor.js
+run diagnostics/multi-overlap-advisor.js [money|balanced|xp] [hackFraction] [targetCount]
+```
+
+It reports current shared ranking source, prepared targets, per-batch RAM, and which targets have enough real pipeline evidence to be depth-2 overlap candidates. It does not launch workers or alter controller mode.
+
+The existing planning-only `hacking/multi-target-sim.js` already models repeated per-target admissions using Port 19 caps and a shared host/time calendar. Its historical cap logic is more permissive than the new real-overlap policy and should be reconciled next so simulation, diagnostics, and the future real executor use one explicit overlap policy.
+
+### Safe overlap rollout plan
+
+Do not simply remove the runner's `batches.some(target)` uniqueness guard. Same-target batches must be scheduled as one coordinated landing stream so H/W/G/W from adjacent batches cannot cross or corrupt money/security assumptions.
+
+Next sequence:
+
+```text
+1. wire multi-target-sim.js to lib/multi-overlap-policy.js and shared ranking helper
+2. add a dedicated finite same-target overlap validator (start at depth 2)
+3. persist same-target overlap evidence separately from global distinct-target evidence
+4. extend the real MULTI planner to admit repeated target batches only up to per-target proven depth
+5. maintain one global host/time calendar and global landing-gap guard
+6. add target-local landing cadence so adjacent batches preserve H->W1->G->W2 ordering
+7. expose global distinct depth and per-target overlap depth separately to AUTOMULTI
+8. only then let AUTOMULTI exploit repeated high-value targets for throughput
+```
+
+The initial production goal is depth 2 on independently proven targets, not aggressive 4/8 overlap.
+
+## Distributed prepper
 
 ```text
 hacking/prepper.js
 hacking/prepper-allocation.js
 model: DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS
-state: Port 18
+Port 18
 ```
 
-The prepper scans the full eligible target universe and reserves a bounded slice of remote RAM. Allocation is adaptive. Defaults are 12.5% remote RAM reserve, min 64 GB, max 1024 GB, money ready >=99.5%, security ready <= min+0.05. Prep is money-first, then security cleanup. One target may receive multiple same-wave jobs across different reserved hosts.
+Adaptive money-first prep, 12.5% remote RAM reserve by default, bounded 64-1024 GB, ready >=99.5% money and <=min+0.05 security. Multiple reserved hosts may work one target in the same prep wave.
 
-## Modular dashboard architecture
+## Dashboard architecture
 
 ```text
-ui/
-  dashboard.js
-  state.js
-  actions.js
-  styles.js
-  components/format.js
-  components/layout.js
-  views/overview.js
-  views/targets.js
-  views/economy.js
-  views/batch.js
-  views/network.js
-  views/diagnostics.js
+ui/dashboard.js
+ui/state.js
+ui/actions.js
+ui/styles.js
+ui/components/format.js
+ui/components/layout.js
+ui/views/{overview,targets,economy,batch,network,diagnostics}.js
 ```
 
-React callbacks must remain Netscript-free. The dashboard uses one mounted React tree; the async Netscript loop owns process/port/file operations.
+Single mounted React tree; async Netscript bridge. Batch currently has manual MULTI controls. AUTOMULTI button/status still follows backend runtime validation.
 
-### Current UI refinement state
-
-- global typography enlarged for at-a-glance use
-- Diagnostics has health verdict, real test/diagnostic buttons, direct diagnostic PID/status tracking, and state-age severity
-- Overview duplicate BATCH/PIPELINE/MULTI/Prep+hold launch buttons removed; Standby/HGW/Resume remain
-- Batch currently exposes manual MULTI controls; AUTOMULTI button/status is next after coordinator runtime validation
-- Targets still needs focused allocation display `N hosts · Nt`
-
-## Multi-target runner/controller
+## Multi-target runtime contracts
 
 ```text
 hacking/multi-target-runner.js
 model: MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE
 ```
 
-Controller MULTI repeats finite waves automatically. COMPLETE re-evaluates and relaunches; BLOCKED retries; SAFETY_STOP stops admissions until Resume; mode changes wait for active wave drain. Per-target overlap remains 1.
+Current real MULTI remains finite, global configurable 2-12, and per-target depth 1. Controller repeats finite waves and drains safely on transitions.
 
-## Runtime state ports
+Ports:
 
 ```text
 12 serialized batch
-14 worker timing event queue; exactly one real coordinator owns it
+14 worker timing queue; exactly one real coordinator owns it
 15 latest completed batch
 16 single-target pipeline
 17 multi-target scheduler/executor
 18 adaptive prepper
-19 rolling per-target history
-20 progressive global stress test
+19 rolling per-target batch history
+20 global distinct-target stress test
 ```
 
-## Immediate validation sequence
-
-The previous read-only advisor run showed:
-
-```text
-Possible 5 · Proven 2 · Effective 2
-4196 GB usable / 59 production hosts
-MONEY chose 20% hack
-validation candidate depth 3
-```
+## Immediate validation
 
 After pulling this pass:
 
 ```text
 1. run gitpull.js
-2. rerun diagnostics/automulti-advisor.js money
-3. confirm output now includes ranking ECONOMIC (or PLANNER_FALLBACK if economic state is unavailable)
-4. before live AUTOMULTI testing, put the main controller in STANDBY and let any existing MULTI wave drain
-5. first conservative supervisor test:
-   run hacking/automulti-controller.js money no-validate
-6. confirm it transitions the main controller into MULTI at Effective depth and adapts without exceeding Proven
-7. inspect: cat /data/automulti-controller-state.txt
-8. only after the no-validate path is clean, test automatic validation with:
-   run hacking/automulti-controller.js money validate
-9. confirm it waits for 3 clean observed AUTO waves, requests STANDBY, drains, then launches only the next validation depth
+2. rerun: run diagnostics/automulti-advisor.js money
+3. run: run diagnostics/multi-overlap-advisor.js money 0.10 12
+4. send the overlap-advisor output back for review
+5. real MULTI behavior should otherwise remain unchanged: per-target depth is still 1
 ```
 
-Do not run two AUTOMULTI coordinators simultaneously.
+The overlap advisor is safe to run while production MULTI is active because it is read-only.
 
-## AUTOMULTI implementation sequence
+For AUTOMULTI supervisor validation, continue to test `no-validate` before autonomous validation. Do not run two AUTOMULTI coordinators simultaneously.
+
+## Priority sequence
 
 ```text
-DONE 1. persistent stress evidence helper + stress-run recording
-DONE 2. prep-aware WAITING_PREP + explicit startDepth + durable-evidence resume
-DONE 3. pure AUTOMULTI decision module + shared live adapter + read-only advisor
-DONE 4. supervisory AUTO state machine with controlled next-depth validation
-NEXT 5. runtime validate no-validate supervisor path, then validate path
-6. Batch-tab AUTOMULTI button/status; keep manual controls as Advanced/Manual
-7. expose Possible / Proven / AUTO effective concurrency in GUI
-8. add failed-depth validation cooldown/lockout
-9. remove the runner's now-redundant local sourceRankings helper
-10. later keep global distinct-target depth separate from per-target overlap depth
+DONE global stress evidence + prep-aware resume
+DONE pure AUTOMULTI decision + shared ranking/live adapter
+DONE AUTOMULTI supervisor state machine
+DONE runner ranking cleanup
+DONE conservative real-overlap policy + read-only overlap advisor
+NEXT reconcile persistent simulator with shared overlap policy
+NEXT build dedicated same-target finite overlap validator + durable overlap evidence
+NEXT extend real MULTI scheduler to proven per-target depth 2
+THEN feed overlap capacity into AUTOMULTI and GUI
+LATER failed-global-depth validation cooldown/lockout, UI refinements, watchdog
 ```
 
-AUTOMULTI must never treat more RAM or more prepared targets as permission to exceed proven stress evidence. XP scoring remains a proxy rather than exact Formula-based hacking XP.
+AUTOMULTI must never treat more RAM, more prepared targets, or a high Port 19 sample count as permission to exceed the separately proven safety ceiling for the relevant concurrency dimension. XP scoring remains a proxy rather than exact Formula-based hacking XP.
