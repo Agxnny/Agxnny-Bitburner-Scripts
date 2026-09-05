@@ -1,4 +1,5 @@
-import { readStockHistory, readStockMarketState, stockSeries, stockSeriesStats } from "/lib/stock-history.js";
+import { latestStockGap, readStockHistory, readStockMarketState, stockSeries, stockSeriesStats } from "/lib/stock-history.js";
+import { buildCandles } from "/stocks/candles.js";
 import { stockStyles as s } from "/stocks/styles.js";
 
 const KEEPER = "/stocks/history-keeper.js";
@@ -58,16 +59,18 @@ function App() {
 
 function header(market) {
     const access = market.access ?? {};
+    const gap = latestStockGap(cache.history);
     return el("div", { style: s.header },
         el("div", null,
             el("div", { style: s.eyebrow }, "AGXNNY STOCK RESEARCH"),
             el("div", { style: s.title }, "Market Lab"),
-            el("div", { style: s.subtitle }, "Persistent price history · volatility baseline · portfolio observability"),
+            el("div", { style: s.subtitle }, "Persistent price history · OHLC candles · wall-clock continuity · portfolio observability"),
         ),
         el("div", { style: s.badges },
             badge(cache.keeperRunning ? "RECORDER ONLINE" : "RECORDER OFFLINE", cache.keeperRunning ? "good" : "warn"),
             badge(access.tix ? "TIX API" : "NO TIX", access.tix ? "accent" : "warn"),
             badge(access.fourSApi ? "4S API" : "PRE-4S", access.fourSApi ? "good" : "warn"),
+            gap ? badge(`LAST GAP ${duration(gap.durationMs)}`, "warn") : badge("CONTINUOUS", "good"),
             badge("TRADING OFF", "accent"),
         ),
     );
@@ -90,42 +93,70 @@ function chartCard(symbol, symbols, setSelected) {
     const series = symbol ? stockSeries(cache.history, symbol) : [];
     const stats = symbol ? stockSeriesStats(cache.history, symbol) : {};
     const current = symbols.find((row) => row.symbol === symbol);
+    const gap = latestStockGap(cache.history);
+    const jump = Number(gap?.jumps?.[symbol] ?? 0);
     return el("div", { style: s.card },
         el("div", { style: s.titleRow },
-            el("span", { style: s.cardTitle }, "Price history"),
+            el("span", { style: s.cardTitle }, "Price history · candles"),
             el("select", { value: symbol, onChange: (event) => setSelected(event.target.value), style: s.select },
                 ...symbols.map((row) => el("option", { key: row.symbol, value: row.symbol }, row.symbol)),
             ),
         ),
-        priceChart(series, symbol, current?.price),
+        candleChart(series, symbol, current?.price),
         el("div", { style: s.stats },
             stat("Samples", Number(stats.samples ?? 0)),
             stat("Window change", signedPct(stats.change)),
             stat("Tick volatility", pct(stats.tickVolatility)),
             stat("Range", stats.min > 0 ? `${money(stats.min)} – ${money(stats.max)}` : "—"),
         ),
-        el("div", { style: s.note }, "Volatility is currently the standard deviation of recorded tick-to-tick returns. The collector stores roughly three hours at the default 6-second cadence."),
+        continuityNote(stats, gap, jump),
     );
 }
 
-function priceChart(series, symbol, currentPrice) {
+function candleChart(series, symbol, currentPrice) {
     if (series.length < 2) return el("div", { style: s.chartWrap }, el("div", { style: s.chartLabel }, `${symbol || "—"} · collecting baseline…`));
-    const prices = series.map((point) => point.price).filter((value) => value > 0);
-    const min = Math.min(...prices), max = Math.max(...prices), range = Math.max(1e-9, max - min);
-    const width = 1000, height = 280, pad = 18;
-    const points = series.map((point, index) => {
-        const x = pad + (index / Math.max(1, series.length - 1)) * (width - pad * 2);
-        const y = height - pad - ((point.price - min) / range) * (height - pad * 2);
-        return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }).join(" ");
-    const mid = height / 2;
+    const expected = Number(cache.history?.intervalMs ?? 6000);
+    const built = buildCandles(series, 60, expected);
+    const candles = built.candles;
+    if (!candles.length) return el("div", { style: s.chartWrap }, el("div", { style: s.chartLabel }, `${symbol || "—"} · collecting candles…`));
+
+    const lows = candles.map((candle) => candle.low), highs = candles.map((candle) => candle.high);
+    const min = Math.min(...lows), max = Math.max(...highs), range = Math.max(1e-9, max - min);
+    const width = 1000, height = 280, padX = 20, padY = 24;
+    const slot = (width - padX * 2) / Math.max(1, candles.length);
+    const bodyWidth = Math.max(2, Math.min(11, slot * 0.58));
+    const y = (price) => height - padY - ((price - min) / range) * (height - padY * 2);
+    const elements = [];
+
+    for (let i = 0; i < candles.length; i++) {
+        const candle = candles[i];
+        const x = padX + slot * i + slot / 2;
+        const openY = y(candle.open), closeY = y(candle.close), highY = y(candle.high), lowY = y(candle.low);
+        const up = candle.close >= candle.open;
+        const color = up ? "#72d6a0" : "#ff8f8f";
+        if (candle.gapBefore) elements.push(el("line", { key: `gap-${i}`, x1: x - slot / 2, y1: padY, x2: x - slot / 2, y2: height - padY, stroke: "#d9a441", strokeWidth: 1, strokeDasharray: "4 5", opacity: 0.75 }));
+        elements.push(el("line", { key: `wick-${i}`, x1: x, y1: highY, x2: x, y2: lowY, stroke: color, strokeWidth: 1.4, vectorEffect: "non-scaling-stroke" }));
+        elements.push(el("rect", { key: `body-${i}`, x: x - bodyWidth / 2, y: Math.min(openY, closeY), width: bodyWidth, height: Math.max(2, Math.abs(closeY - openY)), fill: up ? "#163c2a" : "#4a2020", stroke: color, strokeWidth: 1.2, vectorEffect: "non-scaling-stroke" }));
+    }
+
+    const midY = y((min + max) / 2);
     return el("div", { style: s.chartWrap },
-        el("div", { style: s.chartLabel }, `${symbol} · ${duration(series.at(-1).at - series[0].at)} window`),
+        el("div", { style: s.chartLabel }, `${symbol} · ${duration(series.at(-1).at - series[0].at)} window · ~${duration(built.intervalMs)} candles`),
         el("div", { style: s.chartLast }, money(currentPrice ?? series.at(-1).price)),
         el("svg", { viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: "none", style: s.svg },
-            el("line", { x1: pad, y1: mid, x2: width - pad, y2: mid, stroke: "#1e2a34", strokeWidth: 1 }),
-            el("polyline", { points, fill: "none", stroke: "#6eb6e5", strokeWidth: 2, vectorEffect: "non-scaling-stroke" }),
+            el("line", { x1: padX, y1: midY, x2: width - padX, y2: midY, stroke: "#1e2a34", strokeWidth: 1 }),
+            ...elements,
         ),
+    );
+}
+
+function continuityNote(stats, gap, jump) {
+    if (!gap) return el("div", { style: s.note }, "Candles are built from wall-clock timestamped samples. No recorder outage has been detected in the retained history. Tick volatility excludes returns that cross a detected outage gap.");
+    return el("div", { style: { ...s.note, borderLeftColor: "#8a6728" } },
+        `Recorder gap detected: ${duration(gap.durationMs)} from ${clock(gap.from)} to ${clock(gap.to)}. `,
+        `Selected-stock net change across that unobserved interval: ${signedPct(jump)}. `,
+        `We can detect the missing interval and endpoint jump, but cannot reconstruct what happened inside it. `,
+        `${Number(stats.gapCount ?? 0)} gap(s) intersect this retained series.`,
     );
 }
 
@@ -201,3 +232,4 @@ function signedPct(value) { const n = Number(value) || 0; return `${n >= 0 ? "+"
 function integer(value) { return Math.floor(Number(value) || 0).toLocaleString(); }
 function sampleAge(at) { const sec = Math.max(0, Math.floor((Date.now() - Number(at ?? 0)) / 1000)); return at ? `${sec}s ago` : "never"; }
 function duration(ms) { const sec = Math.max(0, Math.floor(Number(ms) / 1000)); if (sec < 60) return `${sec}s`; if (sec < 3600) return `${Math.floor(sec / 60)}m`; return `${(sec / 3600).toFixed(1)}h`; }
+function clock(at) { return Number(at) > 0 ? new Date(Number(at)).toLocaleTimeString() : "—"; }
