@@ -2,142 +2,137 @@
 
 ## Current status
 
-`hacking/batch-scheduler.js` is a **dry-run planner only**. It does not launch workers and does not replace the current serialized `hacking/batch-runner.js` path.
+`hacking/batch-scheduler.js` is still **non-executing**: it does not launch H/G/W workers and does not replace the serialized `hacking/batch-runner.js` path.
 
-The purpose of this stage is to design and validate a global pipeline calendar before any overlapping batches are allowed to execute.
+It now has two dry-run modes:
+
+```text
+snapshot   → one host-window/cadence analysis
+admission  → persistent live depth-2 admission simulation
+```
+
+The purpose is to validate pipeline admission, RAM reservation, timing cadence, and safety-stop logic before any overlapping workers are allowed to execute.
 
 ## Two independent timing controls
 
 The scheduler treats timing as two separate knobs:
 
-1. **Stage gap** — spacing inside one HWGW batch:
+1. **Stage gap** — H → W1 → G → W2 spacing inside one batch.
+2. **Batch interval** — H(N) → H(N+1) spacing between successive batches.
 
-```text
-H → W1 → G → W2
-```
+Safe internal HWGW timing does not automatically imply a sustainable or safe cross-batch cadence.
 
-2. **Batch interval** — spacing between the H landing of batch N and the H landing of batch N+1.
+## Commands
 
-These must be tuned independently. Safe H/W1/G/W2 spacing inside one batch does not automatically imply safe spacing between adjacent batches.
-
-## Dry-run command
+One-shot capacity/cadence analysis:
 
 ```text
 run hacking/batch-scheduler.js <target> [hackFraction] [stageGapMs]
 ```
 
+Persistent admission simulation:
+
+```text
+run hacking/batch-scheduler.js <target> [hackFraction] [stageGapMs] admission
+```
+
 Example:
 
 ```text
-run hacking/batch-scheduler.js phantasy 0.10 200
+run hacking/batch-scheduler.js phantasy 0.10 200 admission
 ```
 
-The script publishes its latest analysis to **Port 16**.
+Both modes publish their latest state to **Port 16**.
 
-## Current model — V2 host windows
+## V2 host-window capacity model
 
-The planner now calculates:
-
-- H/W1/G/W2 thread counts using the same core analysis rules as the single-batch runner;
-- action durations for H/G/W;
-- per-stage RAM footprint;
-- a global landing calendar;
-- a conservative tuned stage gap;
-- an initial requested batch interval based on timing safety;
-- **host-by-host RAM reservations over each stage execution window**;
-- maximum tested burst depth before a host reservation fails;
-- a separate **sustainable steady-state batch interval**.
-
-A stage reserves RAM only for its planned execution window:
+The planner calculates H/W1/G/W2 sizing, action durations, per-stage RAM, a global landing calendar, timing-safe stage/batch spacing, and host-by-host RAM reservations over each stage execution window:
 
 ```text
 startAt = landingAt - actionDuration
 endAt   = landingAt
 ```
 
-A stage may be split across multiple hosts. The reservation model checks each host's overlapping reservations over the entire stage window before assigning threads.
+It reports both **burst depth** and a separate **sustainable batch interval**. These are intentionally different: a fast burst can fit temporarily even when that cadence cannot be maintained through the full weaken/grow residence window.
 
-## Burst depth versus sustainable cadence
+## V3 depth-2 admission simulation
 
-These are intentionally different metrics.
+Admission mode keeps running and applies the same decisions a first executable pipeline scheduler will need, but uses **virtual batches only**.
 
-A short 800 ms landing cadence may allow many batches to be admitted as a burst while RAM is still available, but that does **not** mean the cadence can continue indefinitely. Long weaken/grow durations can leave many batches resident at once.
+Hard rules:
 
-The scheduler therefore reports:
+- maximum simulated in-flight depth is **2**;
+- no H/G/W worker is launched;
+- the first admission requires a prepared baseline (`>=99.5%` money and `<=+0.05` security);
+- after the pipeline opens, raw target state is not used as a per-batch gate because an active HWGW pipeline intentionally moves money/security between stage landings;
+- the tuned sustainable batch interval controls when the second virtual batch may be admitted;
+- current live remote RAM is checked host-by-host before each virtual admission;
+- when depth 2 is reached, admissions stop until the oldest virtual batch reaches its planned W2 landing;
+- recent admission/drain/stop events are retained in the Port 16 snapshot.
 
-```text
-burstDepth
-requestedBatchIntervalMs
-sustainable tunedBatchIntervalMs
-steadyState.requiredDepth
-steadyState.peakRam
-```
+This models the first intended executable policy: **depth 2 only, admit conservatively, stop immediately on evidence of a bad batch, and let already-safe work drain**.
 
-The sustainable interval is searched separately. For a candidate interval, the planner simulates enough consecutive batches to cover the longest action duration plus the landing window, then checks host-by-host reservations. The selected interval is the smallest conservative value found to fit that steady-state window.
+## Safety-stop simulation
 
-The depth search currently checks up to 64 batches. If all 64 fit, output is marked as search-capped rather than incorrectly claiming 64 is the true maximum.
+While admission mode runs, it watches new matching Port 15 completed-batch telemetry. A newly observed completed batch triggers a simulated admission stop if any of these occur:
+
+- landing order is incorrect;
+- timing events are missing;
+- money recovery error exceeds 0.5 percentage points;
+- security recovery error exceeds 0.05;
+- final money is below the prepared tolerance;
+- final security is above +0.05.
+
+A safety stop prevents new virtual admissions. Existing virtual batches remain in the simulated in-flight set until their planned W2 landing. Restart the simulator to clear the stop; there is deliberately no automatic reset yet.
 
 ## Timing tuning
 
-If Port 15 contains a completed batch for the same target, the planner uses the retained timing measurements as a provisional safety signal:
-
-```text
-maxAbsLandingErrorMs
-max allocationSpreadMs across stages
-minimumSpacingMs
-orderCorrect
-```
-
-The current stage-gap rule remains conservative:
+If Port 15 contains a completed batch for the same target, its drift/spread telemetry is used provisionally:
 
 ```text
 stageGap >= requested gap
-stageGap >= observed drift + observed spread + 25 ms
+stageGap >= maxAbsLandingError + maxAllocationSpread + 25 ms
 ```
 
-The initial batch interval is at least four stage gaps and leaves room for observed drift/spread. RAM sustainability may then increase the interval further.
+The timing-only batch interval begins at least four stage gaps. The host-window steady-state search may increase that interval further when RAM cannot sustain the timing-only cadence.
 
-The scheduler prints why Port 15 telemetry was or was not accepted so `CONSERVATIVE_DEFAULT` can be diagnosed directly.
-
-Only one retained completed batch is currently available, so this is **telemetry-assisted**, not statistically adaptive. Aggressive automatic reduction of gaps must wait for a rolling timing history.
+Port 15 still holds only one completed batch, so tuning remains conservative. A rolling history is required before automatic gap reduction.
 
 ## Current-free-RAM rule
 
-The dry-run uses the execution pool's **currently free remote RAM** as its capacity baseline. RAM already consumed by an active serialized batch or unrelated process is therefore excluded and is not assumed to become available later. This is intentionally conservative while the scheduler remains non-executing.
+The scheduler uses **currently free remote RAM** as the baseline. RAM occupied by the live serialized system is excluded and is not assumed to become available later. This means admission simulation can be run safely alongside the production single-batch path, although its reported capacity will be conservative while production work is active.
 
 ## Important limitations
 
-The current dry-run planner does **not**:
+The scheduler still does **not**:
 
-- launch any H/G/W workers;
-- consume Port 14 timing events;
-- manage multiple live batch IDs;
-- change the controller review barrier;
-- recover from a failed/partial pipelined batch;
+- launch overlapping workers;
+- consume Port 14 as a multi-batch event router;
+- own multiple real batch IDs;
+- replace the controller's per-batch strategic-review barrier;
+- perform live reservation rollback after worker launch failure;
 - maintain rolling timing history;
-- automatically reduce the configured 200 ms single-batch gap.
+- automatically kill late workers.
 
-The V2 RAM planner is host-aware, but it is still a simulation. The eventual executable scheduler must make the same reservations atomically before launching live work and update them as jobs finish or fail.
+## Remaining milestones before live depth-2 execution
 
-## Required milestones before live pipelining
+1. Continue collecting repeated single-batch landing/recovery samples.
+2. Validate admission mode decisions while the serialized system runs.
+3. Add rolling timing history.
+4. Move Port 14 ownership to one multi-batch-safe consumer; do not clear the queue per batch.
+5. Reuse the host-window reservation plan as the actual launch allocation.
+6. Add atomic depth-2 live admission and rollback on partial launch failure.
+7. Replace the per-batch strategic-review barrier with pipeline-aware review/safety-stop behavior.
+8. First executable test remains hard-capped at depth 2.
+9. Raise depth only after repeated depth-2 recovery and timing validation.
 
-1. Collect repeated single-batch landing telemetry and establish realistic drift/spread bounds.
-2. Add rolling timing history rather than tuning from only Port 15.
-3. Validate V2 burst-depth and sustainable-interval predictions against observed execution capacity.
-4. Reuse the host-window reservation model in an executable scheduler with atomic admission.
-5. Replace Port 14 clearing with one shared multi-batch event consumer routed by `batchId`.
-6. Introduce a maximum live depth of 2 for the first executable test.
-7. Stop new admissions immediately on bad landing order, missing timing events, or recovery error.
-8. Let safe in-flight work drain, force target prep/review, then restart the pipeline.
-9. Only raise pipeline depth after repeated depth-2 validation.
+## Intended landing train
 
-## Intended future landing calendar
-
-With a 200 ms stage gap, a timing-only minimum interval starts near 800 ms:
+With a 200 ms stage gap, the timing-only pattern is:
 
 ```text
-H1  W1-1  G1  W2-1  H2  W1-2  G2  W2-2  H3 ...
-|----200----200----200----200----200----200----200----|
+H1 → W1-1 → G1 → W2-1 → H2 → W1-2 → G2 → W2-2
+     200      200     200      inter-batch safety/capacity gap
 ```
 
-However, V2 may recommend a larger sustainable interval when current RAM cannot support enough simultaneous long-running stages to maintain an 800 ms cadence. The scheduler should optimize for **sustainable throughput**, not a short burst that later stalls.
+The actual batch interval must satisfy both timing safety and sustainable RAM capacity. On the first V2 `phantasy` test, the timing-only request was 800 ms while host-window capacity increased the sustainable interval to roughly 6.28 seconds.
