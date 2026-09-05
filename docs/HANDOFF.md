@@ -8,59 +8,41 @@ GitHub `main` is the source of truth. Read this file first, then fetch the curre
 STANDBY   production controller parked
 HGW       normal sequential automation
 BATCH     serialized one-batch-at-a-time HWGW
-PIPELINE  continuous controller-managed depth-2 HWGW
+PIPELINE  continuous controller-managed single-target depth-2 HWGW
+MULTI     controller-managed repeated finite multi-target HWGW waves
 ```
 
-`startup.js` defaults the production controller to STANDBY. The dedicated prepper is a separate background maintenance service, so its reserved host may still run grow/weaken maintenance while production is parked.
+`startup.js` still defaults the production controller to STANDBY. The dedicated prepper is a separate background maintenance service, so its reserved host may still run grow/weaken maintenance while production is parked.
 
 ## Latest validated runtime milestones
 
-Dedicated prepper reservation is stable: production capacity remains `4156.5 GB / 58 hosts` with one host excluded for prep.
+Dedicated prepper reservation is stable: production capacity remained `4156.5 GB / 58 hosts` with one host excluded for prep during earlier validation.
 
 Rolling real Port 19 evidence is replay-safe. Latest validated `phantasy` single-target pipeline evidence reached 4 consecutive clean pipeline completions, producing recommended depth 4 / MEDIUM.
 
-Persistent history-capped multi-target simulation is validated. MONEY profile held:
+Persistent history-capped multi-target simulation is validated, and the real multi-target executor has now been validated at distinct-target concurrency 2 and 3.
+
+Latest visible 3-target MONEY run admitted:
 
 ```text
-phantasy        depth 4/4
-joesguns        depth 1/1
-sigma-cosmetics depth 1/1
-foodnstuff      depth 0/1 WAITING_PREP
+phantasy
+silver-helix
+omega-net
 ```
 
-while rolling admissions progressed from 6 admitted / 0 completed to 8 admitted / 2 completed without violating evidence caps.
-
-Controller-managed PIPELINE -> STANDBY drain is runtime-validated: the pipeline runner remained alive while the admitted wave drained, then exited while dashboard, prepper, history collector, and controller stayed running.
-
-Latest pre-GUI memory audit after adding the live multi-target runner was clean:
+The previous completed 3-target run admitted:
 
 ```text
-53 installed managed JS files
-41 runnable scripts
-12 library modules
-0 unmanaged installed .js files
+phantasy
+joesguns
+sigma-cosmetics
 ```
 
-A fresh audit is required after pulling the GUI integration because `ui/dashboard.js` now imports Port 17 state and has additional multi-target UI logic.
+and completed 3/3 clean. The latest completed batch visible in the GUI showed 100% money, +0.000 security, correct order, 188 ms minimum spacing, 33 ms max drift, and 4/4 timing events.
 
-## Real multi-target validation
+The collapsible dashboard and Multi-target activity card are runtime-visible and responsive while a 3-target wave is running.
 
-The conservative real multi-target runner has completed four valid consecutive MONEY waves at global live depth 2 / per-target depth 1. Each valid wave admitted `phantasy` and `joesguns`, and both targets returned to:
-
-```text
-money 100.00%
-security +0.000
-ORDER OK
-COMPLETE 2/2
-```
-
-A fifth pasted command was accidentally concatenated (`200run ...`) and produced an invalid stage-gap argument followed by `ns.exec failed on hgw-001`. Treat that run as malformed input, not as a proven scheduler/RAM failure.
-
-The runner now rejects malformed/extra positional arguments instead of allowing `NaN` timing values.
-
-Repeated old runs reused IDs such as `multi-phantasy-1`, which meant the Port 19 collector deduplicated later completions. This is fixed: every invocation now gets a unique run ID and unique batch IDs.
-
-## Configurable finite multi-target runner
+## Configurable real multi-target runner
 
 Managed script:
 
@@ -83,8 +65,8 @@ run hacking/multi-target-runner.js [money|balanced|xp] [targetCount 2-12] [hackF
 Safety posture:
 
 ```text
-finite one-wave execution only
-configurable global live depth up to 12
+finite one-wave executor
+configurable distinct-target global live depth up to 12
 per-target live depth remains hard-capped at 1
 one batch per distinct prepared target
 shared global host/time RAM reservation calendar
@@ -92,51 +74,86 @@ JIT H/W/G/W dispatch
 one global Port 14 consumer/router keyed by batchId
 Port 15 completion publication
 unique batch/run IDs
-controller must be fully parked in STANDBY
-no dynamic same-target overlap yet
+manual runs require controller STANDBY
+controller-owned runs require controller MULTI mode
+no same-target overlap yet
 ```
 
-The runner refuses to launch if the controller is not fully settled in STANDBY, if controller workers are still active, or if conflicting batch/pipeline/simulator coordinators are running.
+The runner now supports a controller-only `--controller` flag. That flag is not a positional argument and allows the main controller to own repeated MULTI waves while preserving the manual STANDBY preflight for one-shot tests.
 
-The landing summary publishes aggregate `expectedJobs`, `reportedJobs`, `missingJobs`, and `totalMissingJobs`, so Port 19 missing-job safety checks have an explicit aggregate field.
+## New controller-managed MULTI mode
+
+`hacking/controller.js` now recognizes:
+
+```text
+STANDBY | HGW | BATCH | PIPELINE | MULTI
+```
+
+New Port 13 request:
+
+```text
+START_MULTI { profile, targetCount, globalDepth, hackPercent, stageGapMs }
+```
+
+`START_MULTI` stores the requested configuration and transitions to MULTI at the next safe boundary. If MULTI is already active, the updated configuration applies to the next finite wave.
+
+Controller MULTI behavior:
+
+```text
+1. controller itself schedules no single-target H/G/W work in MULTI mode
+2. it launches multi-target-runner.js on home with --controller
+3. each runner invocation executes one conservative finite wave
+4. COMPLETE -> controller waits/re-evaluates and launches another wave
+5. BLOCKED -> controller retries later (important while prepper is preparing targets)
+6. SAFETY_STOP -> controller stops new admissions until Resume
+7. mode switch -> no new wave is admitted; current finite wave drains naturally before transition
+```
+
+Current defaults if MULTI is selected without a custom GUI request:
+
+```text
+profile MONEY
+top targets 6
+global distinct-target live depth 3
+hack 10%
+stage gap 200 ms
+```
+
+These remain deliberately conservative: repeated waves are continuous at the controller level, but there is still no same-target overlap inside a wave.
+
+Controller state now publishes:
+
+```text
+executionMode.multiRunning
+executionMode.multiRunnerHost
+executionMode.multiSafetyStopped
+executionMode.multiConfig
+```
 
 ## Main GUI multi-target controls and activity
 
-`ui/dashboard.js` reads Port 17 and exposes two multi-target cards in the **Batch** tab:
+The Batch tab now has:
 
 ```text
-Multi-target finite wave
+Multi-target controls
 Multi-target activity
 ```
 
-The finite-wave control card provides:
+The same Profile / Top targets / Live batches / Hack % / Stage gap fields drive either:
 
 ```text
-Profile: MONEY / BALANCED / XP
-Top targets: 2-12
-Live batches: 2-12
-Hack %
-Stage gap ms
-Run finite wave
+Finite wave       one-shot manual test, requires STANDBY
+Start controller  switches to controller MULTI mode
+Update controller changes the config used by the next MULTI wave
 ```
 
-`Live batches` means distinct-target global concurrency. Same-target overlap remains locked at depth 1. The Run button is disabled unless the production controller is fully in STANDBY with no active controller jobs.
+Quick Controls also has a `Multi` mode button using the current multi-target fields.
 
-The new activity card shows current executor profile/run ID, active-target count, completed count, and one row per active target with:
+The activity card shows current executor profile/run ID/owner, active-target count, completed count, and active target rows with H and W2 countdowns plus launched-stage progress.
 
-```text
-target
-ACTIVE status
-H landing countdown
-W2 landing countdown
-launched stage list
-```
+All dashboard content cards and hero cards are collapsible with React-local state. React callbacks remain Netscript-free.
 
-Completed target timing rows are available under an expandable section and show recovery health, money/security, max landing drift, minimum spacing, and order status.
-
-All dashboard content cards are now collapsible. The four compact hero metric cards are also collapsible. Collapse state is React-local UI state only; no Netscript work occurs inside card-toggle callbacks.
-
-React callbacks remain Netscript-free: they only update local/plain-JS request state. The async dashboard loop validates actions and performs Netscript I/O or `ns.run()` calls.
+The dashboard also now suppresses stale Port 16 pipeline state unless the controller says the pipeline is running or the Port 16 state is fresh, avoiding the earlier appearance of a pipeline still running many minutes after it stopped.
 
 ## Rolling real batch safety history
 
@@ -166,7 +183,7 @@ Depth ladder:
 8+ consecutive clean  -> depth 8 / HIGH
 ```
 
-The persistent simulator may use these caps. The real multi-target executor still ignores higher same-target recommendations and remains at one live batch per target.
+The persistent simulator may use these caps. Real controller MULTI still ignores higher same-target recommendations and remains at one live batch per target.
 
 ## Runtime batching / scheduler state
 
@@ -180,28 +197,27 @@ The persistent simulator may use these caps. The real multi-target executor stil
 
 ## Current important limitations
 
-- Controller PIPELINE is still single-target and fixed depth 2.
-- Multi-target runner is GUI-launchable but still finite/manual-test execution, not controller-integrated production.
+- Controller MULTI is newly integrated and has not yet been runtime-validated after this commit.
+- MULTI currently repeats whole finite waves; it is not yet a continuously rolling per-target admission scheduler.
 - Per-target real multi-target depth is intentionally fixed at 1.
-- Larger GUI tests increase the number of distinct concurrent targets, not same-target pipeline depth.
-- Active multi-target timing card currently shows first H and final W2 landing countdowns plus launched-stage progress; full four-stage per-target live timing bars are not yet published on Port 17.
-- Target-local failure/recovery policy is not yet implemented for continuous multi-target execution.
+- Larger tests increase the number of distinct concurrent targets, not same-target pipeline depth.
+- Target-local failure/recovery is not yet implemented; current safety policy is a global MULTI admission stop until Resume.
+- Active multi-target timing card still shows H and W2 countdowns plus launched-stage progress rather than full four-stage live timings.
 - XP scoring remains a proxy, not exact Formula-based hacking XP.
 - Automatic worker watchdog termination remains deferred.
-- Prepper and Port 19 safety history are still not fully surfaced in the GUI.
 
 ## Immediate next development sequence
 
 ```text
-1. Pull latest main and restart startup so the collapsible dashboard/activity card is live
-2. Run a fresh mem-audit and record the new dashboard RAM cost
-3. Finish the currently running MONEY multi-target test and record admitted targets/results
-4. In Batch tab, test MONEY with 3 distinct live batches and inspect the new activity rows/timing countdowns
-5. If clean, try 4 distinct live batches, then increase gradually rather than jumping directly to 12
-6. Compare BALANCED and XP target selection at the same safe distinct-target depth
-7. Add target-local failure/recovery policy before any continuous multi-target admission
-8. Only after repeated clean evidence consider same-target overlap/dynamic per-target live depth
-9. Keep automatic worker killing deferred until multi-target timing is stable
+1. Pull latest main and restart startup
+2. Run diagnostics/mem-audit.js and confirm 53 managed JS / 41 scripts / 12 modules / 0 unmanaged
+3. In Batch controls use MONEY, top 6, live 3, hack 10%, gap 200
+4. Click Start controller (or Multi in Quick Controls)
+5. Verify controller transitions STANDBY -> MULTI and launches one home multi-target-runner
+6. Verify first controller-owned wave completes cleanly and a second wave is launched automatically
+7. Switch MULTI -> STANDBY during an active wave and verify no replacement wave is admitted; current wave finishes then controller parks
+8. If a wave SAFETY_STOPs, verify MULTI stops admitting until Resume
+9. Only after repeated controller-owned clean waves consider rolling admission and evidence-gated same-target depth
 ```
 
 ## Useful commands
@@ -211,10 +227,5 @@ run gitpull.js
 run startup.js
 run diagnostics/mem-audit.js
 ps home
-run hacking/multi-target-sim.js money 4 0.10 200 64
-run hacking/multi-target-runner.js money 4 0.10 200 2
 run hacking/multi-target-runner.js money 6 0.10 200 3
-run hacking/multi-target-runner.js balanced 6 0.10 200 3
-run hacking/multi-target-runner.js xp 6 0.10 200 3
-run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
