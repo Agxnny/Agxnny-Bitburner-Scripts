@@ -1,7 +1,9 @@
 import { latestStockGap, readStockHistory, readStockMarketState, stockSeries, stockSeriesStats } from "/lib/stock-history.js";
 import { readTraderConfig, writeTraderConfig } from "/lib/stock-trader-config.js";
+import { createClosePositionRequest, readTraderAction, writeTraderAction } from "/lib/stock-trader-actions.js";
 import { buildCandles, filterSeriesByRange } from "/stocks/candles.js";
 import { TraderControls } from "/stocks/trader-controls.js";
+import { TraderPortfolio, portfolioPnl } from "/stocks/portfolio.js";
 import { stockStyles as s } from "/stocks/styles.js";
 
 const KEEPER = "/stocks/history-keeper.js";
@@ -17,8 +19,8 @@ const CANDLE_VIEWS = [
     { label: "4h", lookbackMs: 14_400_000, candleMs: 120_000 },
 ];
 const HISTORY_RANGES = [["15m", 900000], ["1h", 3600000], ["3h", 10800000], ["6h", 21600000], ["12h", 43200000], ["24h", 86400000], ["ALL", 0]];
-let cache = { history: null, market: null, traderConfig: null, traderState: null, keeperRunning: false, traderRunning: false, updatedAt: 0 };
-let pendingTraderConfig = null;
+let cache = { history: null, market: null, traderConfig: null, traderState: null, traderAction: null, keeperRunning: false, traderRunning: false, updatedAt: 0 };
+let pendingTraderConfig = null, pendingTraderAction = null;
 let version = 0;
 
 /** Separate React dashboard for stock history, portfolio and pre-4S controls. @param {NS} ns */
@@ -38,6 +40,11 @@ export async function main(ns) {
             pendingTraderConfig = null;
             await writeTraderConfig(ns, request);
         }
+        if (pendingTraderAction) {
+            const request = pendingTraderAction;
+            pendingTraderAction = null;
+            await writeTraderAction(ns, request);
+        }
         refresh(ns);
         await ns.sleep(REFRESH_MS);
     }
@@ -49,10 +56,12 @@ function refresh(ns) {
         market: readStockMarketState(ns),
         traderConfig: readTraderConfig(ns),
         traderState: readJson(ns, TRADER_STATE_FILE),
+        traderAction: readTraderAction(ns),
         keeperRunning: ns.scriptRunning(KEEPER, "home"),
         traderRunning: ns.scriptRunning(TRADER, "home"),
         updatedAt: Date.now(),
     };
+    if (cache.traderState) cache.traderState.manualAction = cache.traderAction ?? cache.traderState.manualAction ?? null;
     version += 1;
 }
 
@@ -72,7 +81,9 @@ function App() {
     return el("div", { style: s.app },
         header(market), hero(market),
         el(TraderControls, { config: cache.traderConfig, traderState: cache.traderState, traderRunning: cache.traderRunning, onSave: queueTraderConfig }),
-        el("div", { style: s.grid }, chartCard(active, symbols, setSelected, view, setView, candleView, setCandleView, range, setRange), portfolioCard(market)),
+        el("div", { style: s.grid },
+            chartCard(active, symbols, setSelected, view, setView, candleView, setCandleView, range, setRange),
+            el(TraderPortfolio, { market, traderState: cache.traderState, onClose: queueManualClose })),
         marketTable(symbols, active, setSelected),
         el("div", { style: s.footer },
             el("span", null, `MARKET LAB · ${cache.traderRunning ? "pre-4S trader live" : "trader stopped"}`),
@@ -142,29 +153,18 @@ function chartCard(symbol, symbols, setSelected, view, setView, candleView, setC
 function candlePanel(visible, symbol, currentPrice, config, selected, setSelected) {
     const expected = Number(cache.history?.intervalMs ?? 6000);
     const built = buildCandles(visible, config.candleMs, expected);
-    return el(React.Fragment, null,
-        candleControlStrip(selected, setSelected),
-        candleChart(built.candles, symbol, currentPrice, config),
-    );
+    return el(React.Fragment, null, candleControlStrip(selected, setSelected), candleChart(built.candles, symbol, currentPrice, config));
 }
-
 function historyPanel(visible, symbol, currentPrice, range, setRange) {
-    return el(React.Fragment, null,
-        controlStrip(HISTORY_RANGES, range, setRange),
-        lineChart(visible, symbol, currentPrice, range === 0),
-    );
+    return el(React.Fragment, null, controlStrip(HISTORY_RANGES, range, setRange), lineChart(visible, symbol, currentPrice, range === 0));
 }
-
 function candleControlStrip(value, setter) {
     return el("div", { style: { display: "flex", gap: "4px", flexWrap: "wrap", marginBottom: "7px" } },
-        ...CANDLE_VIEWS.map((entry) => tabButton(entry.label, value === entry.label, () => setter(entry.label))),
-    );
+        ...CANDLE_VIEWS.map((entry) => tabButton(entry.label, value === entry.label, () => setter(entry.label))));
 }
-
 function controlStrip(options, value, setter) {
     return el("div", { style: { display: "flex", gap: "4px", flexWrap: "wrap", marginBottom: "7px" } },
-        ...options.map(([label, option]) => tabButton(label, value === option, () => setter(option))),
-    );
+        ...options.map(([label, option]) => tabButton(label, value === option, () => setter(option))));
 }
 
 function candleChart(candles, symbol, currentPrice, config) {
@@ -172,8 +172,7 @@ function candleChart(candles, symbol, currentPrice, config) {
     const lows = candles.map((c) => c.low), highs = candles.map((c) => c.high);
     const min = Math.min(...lows), max = Math.max(...highs), priceRange = Math.max(1e-9, max - min);
     const width = 1000, height = 280, padX = 20, padY = 24;
-    const slot = (width - padX * 2) / Math.max(1, candles.length);
-    const bodyWidth = Math.max(2, Math.min(12, slot * 0.58));
+    const slot = (width - padX * 2) / Math.max(1, candles.length), bodyWidth = Math.max(2, Math.min(12, slot * 0.58));
     const y = (price) => height - padY - ((price - min) / priceRange) * (height - padY * 2);
     const elements = [];
     for (let i = 0; i < candles.length; i++) {
@@ -195,13 +194,9 @@ function lineChart(series, symbol, currentPrice, allHistory) {
     const min = Math.min(...prices), max = Math.max(...prices), priceRange = Math.max(1e-9, max - min);
     const width = 1000, height = 280, padX = 20, padY = 24;
     const y = (price) => height - padY - ((price - min) / priceRange) * (height - padY * 2);
-    const elements = [];
-    let segment = [];
+    const elements = []; let segment = [];
     const expected = Number(cache.history?.intervalMs ?? 6000) * 2.25;
-    const flush = (key) => {
-        if (segment.length > 1) elements.push(el("polyline", { key, points: segment.join(" "), fill: "none", stroke: "#6eb6e5", strokeWidth: 2, vectorEffect: "non-scaling-stroke" }));
-        segment = [];
-    };
+    const flush = (key) => { if (segment.length > 1) elements.push(el("polyline", { key, points: segment.join(" "), fill: "none", stroke: "#6eb6e5", strokeWidth: 2, vectorEffect: "non-scaling-stroke" })); segment = []; };
     for (let i = 0; i < series.length; i++) {
         const point = series[i], prior = series[i - 1];
         if (prior && point.at - prior.at > expected) {
@@ -221,53 +216,21 @@ function chartShell(label, currentPrice, min, max, elements) {
     return el("div", { style: s.chartWrap },
         el("div", { style: s.chartLabel }, label), el("div", { style: s.chartLast }, money(currentPrice)),
         el("svg", { viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: "none", style: s.svg },
-            el("line", { x1: 20, y1: mid, x2: width - 20, y2: mid, stroke: "#1e2a34", strokeWidth: 1 }), ...elements,
-        ),
-        el("div", { style: { position: "absolute", right: "8px", bottom: "7px", color: "#657789", fontSize: "9px" } }, `${money(min)} – ${money(max)}`),
-    );
+            el("line", { x1: 20, y1: mid, x2: width - 20, y2: mid, stroke: "#1e2a34", strokeWidth: 1 }), ...elements),
+        el("div", { style: { position: "absolute", right: "8px", bottom: "7px", color: "#657789", fontSize: "9px" } }, `${money(min)} – ${money(max)}`));
 }
-
 function emptyChart(label) { return el("div", { style: s.chartWrap }, el("div", { style: s.chartLabel }, label)); }
-
 function continuityNote(gap, jump) {
     if (!gap) return el("div", { style: s.note }, "No recorder gap intersects the currently visible chart window. Missing intervals outside this view remain retained in history but are not shown here.");
     return el("div", { style: { ...s.note, borderLeftColor: "#8a6728" } },
         `Visible recorder gap: ${duration(gap.durationMs)} from ${clock(gap.from)} to ${clock(gap.to)}. Selected-stock endpoint change: ${signedPct(jump)}. `,
-        "The missing path is intentionally not reconstructed.",
-    );
+        "The missing path is intentionally not reconstructed.");
 }
-
 function latestGapInSeries(history, series) {
     if (!Array.isArray(series) || series.length < 2) return null;
     const from = Number(series[0]?.at ?? 0), to = Number(series.at(-1)?.at ?? 0);
     const gaps = Array.isArray(history?.gaps) ? history.gaps : [];
     return [...gaps].reverse().find((gap) => Number(gap?.to ?? 0) >= from && Number(gap?.from ?? 0) <= to) ?? null;
-}
-
-function portfolioCard(market) {
-    const rows = Array.isArray(market.positions) ? market.positions : [];
-    const pnl = portfolioPnl(rows);
-    return el("div", { style: s.card },
-        el("div", { style: s.titleRow }, el("span", { style: s.cardTitle }, "Portfolio"), badge(rows.length ? `${rows.length} OPEN` : "FLAT", rows.length ? "accent" : "good")),
-        rows.length ? el("div", { style: s.table },
-            el("div", { style: { ...s.row, ...s.rowHead } }, el("span", null, "Symbol"), el("span", { style: s.right }, "Side"), el("span", { style: s.right }, "Shares"), el("span", { style: s.right }, "Value"), el("span", { style: s.right }, "P&L")),
-            ...rows.map(portfolioRow),
-        ) : el("div", { style: s.note }, "No stock positions are open."),
-        el("div", { style: s.stats }, stat("Long P&L", signedMoney(pnl.long)), stat("Short P&L", signedMoney(pnl.short)), stat("Gross exposure", money(market.portfolio?.grossExposure)), stat("Open positions", rows.length)),
-    );
-}
-
-function portfolioRow(row) {
-    const long = Number(row.longShares ?? 0) > 0;
-    const shares = long ? Number(row.longShares) : Number(row.shortShares ?? 0);
-    const average = long ? Number(row.longAverage ?? 0) : Number(row.shortAverage ?? 0);
-    const price = Number(row.price ?? 0), value = shares * price;
-    const pnl = long ? (price - average) * shares : (average - price) * shares;
-    return el("div", { key: `${row.symbol}-${long ? "L" : "S"}`, style: s.row },
-        el("span", { style: s.symbol }, row.symbol), el("span", { style: s.right }, long ? "LONG" : "SHORT"),
-        el("span", { style: s.right }, integer(shares)), el("span", { style: s.right }, money(value)),
-        el("span", { style: pnl >= 0 ? s.goodText : s.badText }, signedMoney(pnl)),
-    );
 }
 
 function marketTable(symbols, active, setSelected) {
@@ -280,26 +243,13 @@ function marketTable(symbols, active, setSelected) {
                 return el("button", { key: row.symbol, onClick: () => setSelected(row.symbol), style: { ...s.row, width: "100%", borderTop: 0, borderLeft: 0, borderRight: 0, background: row.symbol === active ? "#101d28" : "transparent", fontFamily: "monospace", cursor: "pointer", color: "inherit", textAlign: "left" } },
                     el("span", { style: s.symbol }, row.symbol), el("span", { style: s.right }, money(row.price)),
                     el("span", { style: Number(stats.change ?? 0) >= 0 ? s.goodText : s.badText }, signedPct(stats.change)),
-                    el("span", { style: s.right }, pct(stats.tickVolatility)), el("span", { style: s.right }, Number(stats.samples ?? 0)),
-                );
-            }),
-        ),
-    );
+                    el("span", { style: s.right }, pct(stats.tickVolatility)), el("span", { style: s.right }, Number(stats.samples ?? 0)));
+            })));
 }
 
 function queueTraderConfig(config) { pendingTraderConfig = config; }
-function readJson(ns, file) {
-    if (!ns.fileExists(file, "home")) return null;
-    try { return JSON.parse(String(ns.read(file) || "null")); } catch { return null; }
-}
-function portfolioPnl(rows) {
-    let long = 0, short = 0;
-    for (const row of rows) {
-        long += (Number(row.price ?? 0) - Number(row.longAverage ?? 0)) * Number(row.longShares ?? 0);
-        short += (Number(row.shortAverage ?? 0) - Number(row.price ?? 0)) * Number(row.shortShares ?? 0);
-    }
-    return { long, short, total: long + short };
-}
+function queueManualClose(symbol, side) { pendingTraderAction = createClosePositionRequest(symbol, side); }
+function readJson(ns, file) { if (!ns.fileExists(file, "home")) return null; try { return JSON.parse(String(ns.read(file) || "null")); } catch { return null; } }
 function tabButton(text, active, onClick) { return el("button", { onClick, style: { ...s.badge, ...(active ? s.accent : {}), borderColor: active ? (s.accent.borderColor ?? "#285276") : "#000000", cursor: "pointer", fontFamily: "monospace" } }, text); }
 function metric(label, value) { return el("div", { style: s.hero }, el("div", { style: s.heroLabel }, label), el("div", { style: s.heroValue }, value)); }
 function stat(label, value) { return el("div", { style: s.stat }, el("div", { style: s.statLabel }, label), el("div", { style: s.statValue }, String(value))); }
@@ -309,7 +259,6 @@ function money(value) { const n = Number(value) || 0; if (Math.abs(n) >= 1e12) r
 function signedMoney(value) { const n = Number(value) || 0; return `${n >= 0 ? "+" : "-"}${money(Math.abs(n))}`; }
 function pct(value) { return `${((Number(value) || 0) * 100).toFixed(2)}%`; }
 function signedPct(value) { const n = Number(value) || 0; return `${n >= 0 ? "+" : ""}${(n * 100).toFixed(2)}%`; }
-function integer(value) { return Math.floor(Number(value) || 0).toLocaleString(); }
 function sampleAge(at) { const sec = Math.max(0, Math.floor((Date.now() - Number(at ?? 0)) / 1000)); return at ? `${sec}s ago` : "never"; }
 function duration(ms) { const sec = Math.max(0, Math.floor(Number(ms) / 1000)); if (sec < 60) return `${sec}s`; if (sec < 3600) return `${Math.floor(sec / 60)}m`; if (sec < 86400) return `${(sec / 3600).toFixed(sec < 14400 ? 1 : 0)}h`; return `${(sec / 86400).toFixed(1)}d`; }
 function clock(at) { return Number(at) > 0 ? new Date(Number(at)).toLocaleTimeString() : "—"; }
