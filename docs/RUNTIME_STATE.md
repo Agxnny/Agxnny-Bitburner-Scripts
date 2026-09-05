@@ -1,6 +1,6 @@
 # Runtime State and Command Contract
 
-The project uses Netscript ports as lightweight shared transport between persistent and short-lived services. `lib/runtime-state.js` is the implementation source of truth.
+`lib/runtime-state.js` remains the transport implementation source of truth.
 
 ## Port map
 
@@ -23,90 +23,43 @@ The project uses Netscript ports as lightweight shared transport between persist
 | 15 | Latest completed batch | Latest-value snapshot |
 | 16 | Pipeline planner/simulation/executor | Latest-value snapshot |
 
-Snapshot writers replace the prior value. Ports 13 and 14 are queues.
-
 ## Port 1 — controller state
-
-Published by `hacking/controller.js`. Important concepts include current target, money/security, tactical state, execution-pool summary, prep state, target control, execution mode, and standalone worker observability.
 
 ### `executionMode`
 
+Current mode values are:
+
 ```text
-mode: HGW | BATCH
+STANDBY | HGW | BATCH | PIPELINE
+```
+
+Important fields include:
+
+```text
+mode
 pending
 transitioning
 transitionTarget
 batchGapMs
 batchRunning
 batchRunnerHost
+pipelineRunning
+pipelineRunnerHost
+pipelineMaxDepth
+pipelineSafetyStopped
 awaitingReview
 batchCompletedAt
 lastBatchId
 lastMessage
 ```
 
+Startup initializes the controller in `STANDBY`.
+
+`pipelineRunning` means the controller owns a continuous depth-2 pipeline coordinator. `pipelineSafetyStopped` means automatic pipeline admission has been blocked and the target is being/has been prepared for review.
+
 ### `execution.activeWorkers`
 
-Standalone/prep H/G/W allocations include:
-
-```text
-pid
-hostname
-threads
-action
-target
-startedAt
-expectedDurationMs
-expectedFinishAt
-```
-
-`execution.currentAction` contains the aggregate action/target/start/expected-finish summary used for ETA display. GUI `LATE` status is observational only; no automatic worker killing is enabled.
-
-## Ports 2–11
-
-- Port 2: planner/rankings/execution hosts.
-- Port 3: tactical plan.
-- Port 4: HACK completion queue used by strategic/income telemetry.
-- Port 5: income telemetry.
-- Port 6: diagnostic requests.
-- Port 7: economy/progression.
-- Port 8: economic target/review freshness.
-- Port 9: rooting/tool state.
-- Port 10: cloud-capacity actions.
-- Port 11: manual money-goal/spending lock.
-
-## Port 12 — current serialized batch
-
-Published by `hacking/batch-runner.js` using schema version 3 / model `SINGLE_HWGW_ADDITIONAL_MSEC_V3`.
-
-Lifecycle is typically:
-
-```text
-PLANNING → BLOCKED
-or
-READY → RUNNING → COMPLETE
-```
-
-`LAUNCH_FAILED` is used when partial startup must be cancelled.
-
-Important fields include batch id, target, thread counts, stage allocations, planned timings, recovery model, final state, comparison errors, and landing telemetry.
-
-On `COMPLETE`, `landing` contains:
-
-```text
-expectedOrder
-actualOrder
-orderCorrect
-expectedJobs
-reportedJobs
-missingJobs
-minimumSpacingMs
-maxAbsLandingErrorMs
-adjacentSpacing[]
-stages[]
-```
-
-For split stages, `actualLandingAt` is the last allocation completion and `allocationSpreadMs` is the earliest-to-latest completion spread.
+Standalone/prep H/G/W allocations continue to publish PID, host, threads, action, target, start time, expected duration, and expected finish time. `LATE` remains presentation-only; no watchdog kill is enabled.
 
 ## Port 13 — controller requests
 
@@ -117,101 +70,55 @@ PREP_TARGET
 RESUME_AUTO
 SET_MANUAL_TARGET
 CLEAR_MANUAL_TARGET
-SET_EXECUTION_MODE HGW|BATCH
+SET_EXECUTION_MODE STANDBY|HGW|BATCH|PIPELINE
 ```
+
+Mode changes wait for a safe boundary. For PIPELINE, the executor stops admitting later waves and drains the already-admitted wave before the controller applies the new mode.
 
 ## Port 14 — batch timing event queue
 
-Batch H/G/W workers publish `BATCH_STAGE_COMPLETE` events containing batch/stage/job identity, threads, planned landing, and actual finish timing.
+Batch workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error.
 
-### Serialized ownership
-
-`hacking/batch-runner.js` clears stale Port 14 data immediately before a serialized batch, then drains matching events for its one batch id.
-
-### Real depth-2 ownership
-
-`hacking/pipeline-runner.js` may only start while the controller is parked in PREPARED HOLD and serialized batching is idle. It clears stale Port 14 data once at test startup, then becomes the sole consumer for the whole real depth-2 test.
-
-It routes every event by `batchId` into the matching in-flight batch and does not clear the queue between the two overlapping batches.
-
-The serialized runner and pipeline runner must not run concurrently. Permanent controller-integrated pipelining still requires one shared queue owner.
+Serialized BATCH and PIPELINE remain mutually exclusive under controller scheduling. A real pipeline coordinator clears stale Port 14 data once at startup, then routes all subsequent events by `batchId` for the duration of the pipeline session.
 
 ## Port 15 — latest completed batch
 
-Port 15 now accepts either:
+Port 15 accepts compatible serialized and pipeline completion payloads. Pipeline completions use the `PIPELINE_HWGW_DEPTH2_V1` model and include `pipeline: true`, `maxDepth: 2`, `batchIntervalMs`, final target state, and landing telemetry.
 
-```text
-serialized complete → SINGLE_HWGW_ADDITIONAL_MSEC_V3
-pipeline complete   → PIPELINE_HWGW_DEPTH2_V1
-```
+Port 15 is still latest-only, not rolling history.
 
-Both expose compatible final/recovery and landing telemetry so the Batch GUI can reuse the same timing graph and diagnostics.
+## Port 16 — pipeline state
 
-Pipeline completion additionally includes concepts such as:
-
-```text
-pipeline: true
-maxDepth: 2
-batchIntervalMs
-gapMs
-```
-
-Port 15 remains a one-item snapshot, not a rolling history.
-
-## Port 16 — pipeline planner / simulation / executor
-
-### Snapshot planning mode
-
-Published by `hacking/batch-scheduler.js` with model:
+### Planner
 
 ```text
 PIPELINE_DRY_RUN_V2_HOST_WINDOWS
 ```
 
-Important fields include target, thread sizing, requested/tuned stage gap, timing-only and sustainable batch interval, host count/RAM, burst depth, steady-state simulation, stage template, and calendar preview.
-
-### Persistent admission simulation
-
-Published by `hacking/batch-scheduler.js ... admission` with model:
+### Admission simulation
 
 ```text
 PIPELINE_ADMISSION_SIM_V3_DEPTH2
 ```
 
-Important fields:
+### Real executor
+
+Current executor model:
 
 ```text
-dryRun: true
-simulation: true
-admission.enabled: true
-admission.launchesWorkers: false
-admission.maxDepth: 2
-admission.pipelineOpened
-admission.safetyStopped
-admission.safetyReason
-admission.inFlight
-admission.nextAdmissionAt
-admission.decision
-admission.batches[]
-admission.events[]
+PIPELINE_EXECUTOR_DEPTH2_V2
 ```
 
-### Real depth-2 execution
-
-Published by `hacking/pipeline-runner.js` with model:
+Key executor fields:
 
 ```text
-PIPELINE_EXECUTOR_DEPTH2_V1
-```
-
-Top-level fields include:
-
-```text
-version: 4
+version: 5
 dryRun: false
 simulation: false
 execution: true
 maxDepth: 2
+continuous
+controllerManaged
 target
 status
 reason
@@ -224,23 +131,24 @@ completedRecent[]
 events[]
 safetyStopped
 safetyReason
+drainRequested
 updatedAt
 ```
 
-`status` may include:
+Important statuses include:
 
 ```text
 BLOCKED
 RUNNING
 DRAINING_AFTER_STOP
+DRAINING_FOR_MODE_SWITCH
 SAFETY_STOP
+DRAINED_FOR_MODE_SWITCH
 COMPLETE
 ```
 
-Each `inFlight[]` entry includes its batch id, first/final landing timestamps, and per-stage start/landing/launched/job-count information. `completedRecent[]` retains a small in-process display history for the Port 16 snapshot only; Port 15 still retains only the latest completed batch globally.
+In controller-managed mode, `continuous: true` and `requestedBatches: 0` mean the executor continues depth-2 waves until a safety stop or controller drain request.
 
-The compact Batch GUI detects whether Port 16 represents planner, virtual admission, or real execution and renders the appropriate summary.
+## GUI rule
 
-## Queue design rule
-
-GUI React callbacks should only mutate plain-JS request/presentation state. Netscript port/file I/O remains in the asynchronous dashboard loop.
+React callbacks only update local/plain-JS request state. Netscript port/file I/O stays in the asynchronous dashboard loop.
