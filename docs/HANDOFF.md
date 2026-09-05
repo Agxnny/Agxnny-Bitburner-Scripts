@@ -67,7 +67,11 @@ Persistent history: `lib/stock-history.js` -> `/data/stock-history.txt`, model `
 
 `stocks/history-keeper.js` polls TIX every 200ms, persists a historical sample only when the price set changes, and refreshes market/portfolio heartbeat about once per second. Bitburner v3 access methods are `hasWseAccount`, `hasTixApiAccess`, `has4SData`, `has4SDataTixApi`.
 
-`stocks/dashboard.js` is a separate React Market Lab. CANDLES has fixed `1m/5m/15m/30m/1h/4h` wall-clock OHLC views only; direction is truthful (close>open green, close<open red, equal neutral), wicks are observed high/low, gaps are not bridged. HISTORY · LINE alone provides `15m/1h/3h/6h/12h/24h/ALL` historical ranges and breaks the line at gaps. Startup launches both main and stock dashboards.
+`stocks/dashboard.js` is a separate React Market Lab. CANDLES uses `1m/5m/15m/30m/1h/4h` as chart lookback windows, not candle widths. Longer windows intentionally render more candles: current mapping is approximately 1m→10s OHLC (~6), 5m→30s (~10), 15m→1m (~15), 30m→1m (~30), 1h→1m (~60), 4h→2m (~120), limited naturally by retained observations. Direction is truthful (close>open green, close<open red, equal neutral) and wicks use observed high/low only.
+
+Candle and line charts only show recorder gaps that actually intersect the currently visible chart range. Older retained gaps remain in history and the header may still report the latest historical gap, but stale gaps outside the selected window no longer render dashed markers or the chart continuity warning. HISTORY · LINE alone provides `15m/1h/3h/6h/12h/24h/ALL`; ALL intentionally includes all retained gaps. Inactive chart/timeframe buttons now use a black border instead of the previous grey border; active buttons retain the blue accent border.
+
+Startup launches both main and stock dashboards.
 
 ## Prepper
 `hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM. Current reserve selection is host-based and the prepper owns those hosts. Automatic validation borrowing is NOT implemented yet; it must coordinate ownership explicitly rather than simply launching the existing validator against the general execution pool.
