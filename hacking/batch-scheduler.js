@@ -8,14 +8,16 @@ const MIN_STAGE_GAP_MS = 75;
 const DEFAULT_BATCH_INTERVAL_MULTIPLIER = 4;
 const MIN_TIMING_MARGIN_MS = 25;
 const START_LEAD_MS = 150;
-const MAX_SIMULATED_BATCHES = 12;
+const MAX_DEPTH_SEARCH = 64;
+const MAX_STEADY_BATCHES = 512;
 
 /**
  * Dry-run planner for future pipelined HWGW scheduling.
  *
  * This script does NOT launch workers. It models a global landing calendar,
  * estimates safe intra-batch stage spacing and inter-batch admission spacing,
- * and simulates RAM occupancy over time using the current execution pool.
+ * and simulates host-by-host RAM occupancy over time using the current remote
+ * execution pool.
  *
  * Usage:
  *   run hacking/batch-scheduler.js <target> [hackFraction] [stageGapMs]
@@ -53,8 +55,8 @@ function analyzeScheduler(ns, planner, last, target, requestedHackFraction, requ
     const weakenPerThread = Math.max(0, ns.weakenAnalyze(1, 1));
 
     const base = {
-        version: 1,
-        model: "PIPELINE_DRY_RUN_V1",
+        version: 2,
+        model: "PIPELINE_DRY_RUN_V2_HOST_WINDOWS",
         dryRun: true,
         target,
         createdAt: now,
@@ -86,7 +88,7 @@ function analyzeScheduler(ns, planner, last, target, requestedHackFraction, requ
 
     const telemetry = timingTelemetry(last, target);
     const tunedStageGapMs = recommendStageGap(requestedStageGapMs, telemetry);
-    const tunedBatchIntervalMs = recommendBatchInterval(tunedStageGapMs, telemetry);
+    const requestedBatchIntervalMs = recommendBatchInterval(tunedStageGapMs, telemetry);
     const firstLandingDelayMs = Math.max(
         times.hack,
         times.weaken - tunedStageGapMs,
@@ -104,28 +106,46 @@ function analyzeScheduler(ns, planner, last, target, requestedHackFraction, requ
     }
 
     const stageTemplate = [
-        { name: "HACK", threads: hackThreads, durationMs: times.hack, ram: hackThreads * scriptRam.HACK, offsetMs: 0 },
-        { name: "WEAKEN_HACK", threads: weakenHackThreads, durationMs: times.weaken, ram: weakenHackThreads * scriptRam.WEAKEN, offsetMs: tunedStageGapMs },
-        { name: "GROW", threads: growThreads, durationMs: times.grow, ram: growThreads * scriptRam.GROW, offsetMs: 2 * tunedStageGapMs },
-        { name: "WEAKEN_GROW", threads: weakenGrowThreads, durationMs: times.weaken, ram: weakenGrowThreads * scriptRam.WEAKEN, offsetMs: 3 * tunedStageGapMs },
+        { name: "HACK", threads: hackThreads, durationMs: times.hack, scriptRam: scriptRam.HACK, ram: hackThreads * scriptRam.HACK, offsetMs: 0 },
+        { name: "WEAKEN_HACK", threads: weakenHackThreads, durationMs: times.weaken, scriptRam: scriptRam.WEAKEN, ram: weakenHackThreads * scriptRam.WEAKEN, offsetMs: tunedStageGapMs },
+        { name: "GROW", threads: growThreads, durationMs: times.grow, scriptRam: scriptRam.GROW, ram: growThreads * scriptRam.GROW, offsetMs: 2 * tunedStageGapMs },
+        { name: "WEAKEN_GROW", threads: weakenGrowThreads, durationMs: times.weaken, scriptRam: scriptRam.WEAKEN, ram: weakenGrowThreads * scriptRam.WEAKEN, offsetMs: 3 * tunedStageGapMs },
     ];
 
     const pool = getExecutionPool(ns, planner);
     const availableRam = pool.reduce((sum, host) => sum + Math.max(0, Number(host.usableRam ?? 0)), 0);
-    const firstLandingAt = now + firstLandingDelayMs;
-    const simulations = [];
-    let safeDepth = 0;
-
-    for (let depth = 1; depth <= MAX_SIMULATED_BATCHES; depth += 1) {
-        const batches = makeBatches(stageTemplate, depth, firstLandingAt, tunedBatchIntervalMs);
-        const peak = peakRamUsage(batches);
-        const fits = peak.peakRam <= availableRam + 1e-9;
-        simulations.push({ depth, peakRam: peak.peakRam, peakAt: peak.peakAt, fits });
-        if (!fits) break;
-        safeDepth = depth;
+    if (!(availableRam > 0) || pool.length === 0) {
+        return { ...base, status: "BLOCKED", reason: "No remote execution RAM is currently available" };
     }
 
-    const calendarPreview = makeBatches(stageTemplate, Math.min(Math.max(2, safeDepth), 4), firstLandingAt, tunedBatchIntervalMs)
+    const firstLandingAt = now + firstLandingDelayMs;
+    const simulations = [];
+    let burstDepth = 0;
+    let depthSearchLimited = false;
+
+    for (let depth = 1; depth <= MAX_DEPTH_SEARCH; depth += 1) {
+        const batches = makeBatches(stageTemplate, depth, firstLandingAt, requestedBatchIntervalMs);
+        const aggregatePeak = peakRamUsage(batches);
+        const hostReservation = reserveHostWindows(pool, batches);
+        const fits = aggregatePeak.peakRam <= availableRam + 1e-9 && hostReservation.ok;
+        simulations.push({
+            depth,
+            peakRam: aggregatePeak.peakRam,
+            peakAt: aggregatePeak.peakAt,
+            fits,
+            hostFit: hostReservation.ok,
+            blockedStage: hostReservation.blockedStage ?? "",
+            blockedBatch: hostReservation.blockedBatch ?? 0,
+        });
+        if (!fits) break;
+        burstDepth = depth;
+        if (depth === MAX_DEPTH_SEARCH) depthSearchLimited = true;
+    }
+
+    const steady = findSteadyInterval(pool, stageTemplate, firstLandingAt, requestedBatchIntervalMs, tunedStageGapMs);
+    const effectiveBatchIntervalMs = steady.ok ? steady.intervalMs : requestedBatchIntervalMs;
+    const calendarDepth = Math.min(Math.max(2, Math.min(burstDepth || 1, 4)), 4);
+    const calendarPreview = makeBatches(stageTemplate, calendarDepth, firstLandingAt, effectiveBatchIntervalMs)
         .flatMap((batch) => batch.stages.map((stage) => ({
             batch: batch.index,
             stage: stage.name,
@@ -138,10 +158,12 @@ function analyzeScheduler(ns, planner, last, target, requestedHackFraction, requ
 
     return {
         ...base,
-        status: safeDepth > 0 ? "READY" : "BLOCKED",
-        reason: safeDepth > 0
-            ? "Dry-run pipeline calendar fits current aggregate remote RAM at the reported depth"
-            : "Even one modeled batch exceeds current aggregate remote RAM",
+        status: burstDepth > 0 && steady.ok ? "READY" : "BLOCKED",
+        reason: burstDepth > 0 && steady.ok
+            ? "Dry-run host-window planner found a feasible burst depth and sustainable batch interval"
+            : burstDepth < 1
+                ? "Even one modeled batch cannot be reserved across current remote hosts"
+                : "Burst batching fits, but no sustainable interval was found in the current search range",
         currentTarget: {
             money,
             maxMoney,
@@ -162,15 +184,21 @@ function analyzeScheduler(ns, planner, last, target, requestedHackFraction, requ
             telemetry,
             requestedStageGapMs,
             tunedStageGapMs,
-            tunedBatchIntervalMs,
+            requestedBatchIntervalMs,
+            tunedBatchIntervalMs: effectiveBatchIntervalMs,
             firstLandingDelayMs,
             batchLandingWindowMs: 3 * tunedStageGapMs,
             tuningMode: telemetry.samples > 0 ? "TELEMETRY_ASSISTED" : "CONSERVATIVE_DEFAULT",
+            steadyState: steady,
         },
         ram: {
             availableRam,
+            hostCount: pool.length,
             singleBatchRam: stageTemplate.reduce((sum, stage) => sum + stage.ram, 0),
-            safeDepth,
+            burstDepth,
+            safeDepth: burstDepth,
+            depthSearchLimited,
+            maxDepthSearch: MAX_DEPTH_SEARCH,
             simulations,
         },
         stageTemplate,
@@ -178,21 +206,32 @@ function analyzeScheduler(ns, planner, last, target, requestedHackFraction, requ
         notes: [
             "Dry-run only: no workers are launched.",
             "Stage gap controls H→W1→G→W2 spacing inside each batch.",
-            "Batch interval controls spacing between H landings of successive batches.",
-            "The RAM model is time-aware but aggregate; host-by-host reservation is a later scheduler milestone.",
-            "One retained completed batch is not enough for aggressive tuning; recommendations remain conservative until history exists.",
+            "Batch interval controls H(N)→H(N+1) spacing across the landing stream.",
+            "Burst depth and sustainable interval are different: a short burst can fit even when that cadence cannot be maintained indefinitely.",
+            "RAM is reserved host-by-host over each stage's planned execution window; one stage may be split across several hosts.",
+            "Current free RAM is treated conservatively as the scheduling capacity for the whole simulation; RAM already occupied by unrelated/current work is not assumed to become available later.",
+            "One retained completed batch is not enough for aggressive timing reduction; recommendations remain conservative until history exists.",
         ],
     };
 }
 
 function timingTelemetry(last, target) {
-    if (!last || String(last.target ?? "") !== target || last.status !== "COMPLETE") {
-        return { samples: 0, orderCorrect: null, minimumSpacingMs: null, maxAbsLandingErrorMs: null, maxAllocationSpreadMs: null };
+    if (!last) {
+        return { samples: 0, source: "NONE", reason: "No retained completed batch", orderCorrect: null, minimumSpacingMs: null, maxAbsLandingErrorMs: null, maxAllocationSpreadMs: null };
+    }
+    if (String(last.target ?? "") !== target) {
+        return { samples: 0, source: "PORT15", reason: `Retained batch target ${String(last.target ?? "?")} does not match ${target}`, orderCorrect: null, minimumSpacingMs: null, maxAbsLandingErrorMs: null, maxAllocationSpreadMs: null };
+    }
+    if (last.status !== "COMPLETE") {
+        return { samples: 0, source: "PORT15", reason: `Retained batch status is ${String(last.status ?? "UNKNOWN")}`, orderCorrect: null, minimumSpacingMs: null, maxAbsLandingErrorMs: null, maxAllocationSpreadMs: null };
     }
     const stages = Array.isArray(last.landing?.stages) ? last.landing.stages : [];
     const spreads = stages.map((stage) => Number(stage.allocationSpreadMs ?? 0)).filter(Number.isFinite);
     return {
         samples: 1,
+        source: "PORT15",
+        reason: "Matching retained completed batch",
+        batchId: String(last.batchId ?? ""),
         orderCorrect: Boolean(last.landing?.orderCorrect),
         minimumSpacingMs: finiteOrNull(last.landing?.minimumSpacingMs),
         maxAbsLandingErrorMs: finiteOrNull(last.landing?.maxAbsLandingErrorMs),
@@ -216,6 +255,59 @@ function recommendBatchInterval(stageGapMs, telemetry) {
     return Math.max(nominal, Math.ceil(3 * stageGapMs + drift + spread + MIN_TIMING_MARGIN_MS));
 }
 
+function findSteadyInterval(pool, stageTemplate, firstLandingAt, minimumIntervalMs, stageGapMs) {
+    const maxDurationMs = Math.max(...stageTemplate.map((stage) => stage.durationMs));
+    const landingWindowMs = 3 * stageGapMs;
+    const upperBoundMs = Math.ceil(maxDurationMs + landingWindowMs + stageGapMs);
+    const test = (intervalMs) => {
+        const requiredDepth = Math.min(
+            MAX_STEADY_BATCHES,
+            Math.max(3, Math.ceil((maxDurationMs + landingWindowMs) / intervalMs) + 3),
+        );
+        const batches = makeBatches(stageTemplate, requiredDepth, firstLandingAt, intervalMs);
+        const hostReservation = reserveHostWindows(pool, batches);
+        const aggregatePeak = peakRamUsage(batches);
+        return {
+            ok: hostReservation.ok,
+            intervalMs,
+            requiredDepth,
+            peakRam: aggregatePeak.peakRam,
+            blockedStage: hostReservation.blockedStage ?? "",
+            blockedBatch: hostReservation.blockedBatch ?? 0,
+            truncated: requiredDepth >= MAX_STEADY_BATCHES,
+        };
+    };
+
+    const minimum = Math.max(1, Math.floor(minimumIntervalMs));
+    const minTest = test(minimum);
+    if (minTest.ok && !minTest.truncated) return minTest;
+
+    const upperTest = test(upperBoundMs);
+    if (!upperTest.ok || upperTest.truncated) {
+        return { ...upperTest, ok: false, reason: upperTest.truncated ? "steady-state horizon exceeded simulation cap" : "host reservation still blocked at upper search bound" };
+    }
+
+    let low = minimum;
+    let high = upperBoundMs;
+    let best = upperTest;
+    while (high - low > 25) {
+        const mid = Math.floor((low + high) / 2);
+        const result = test(mid);
+        if (result.ok && !result.truncated) {
+            best = result;
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    for (let interval = Math.max(minimum, low - 25); interval <= high; interval += 1) {
+        const result = test(interval);
+        if (result.ok && !result.truncated) return result;
+    }
+    return best;
+}
+
 function makeBatches(stageTemplate, depth, firstLandingAt, batchIntervalMs) {
     const batches = [];
     for (let index = 0; index < depth; index += 1) {
@@ -224,6 +316,7 @@ function makeBatches(stageTemplate, depth, firstLandingAt, batchIntervalMs) {
             const landingAt = batchFirstLandingAt + stage.offsetMs;
             return {
                 ...stage,
+                batch: index + 1,
                 landingAt,
                 startAt: landingAt - stage.durationMs,
             };
@@ -231,6 +324,73 @@ function makeBatches(stageTemplate, depth, firstLandingAt, batchIntervalMs) {
         batches.push({ index: index + 1, firstLandingAt: batchFirstLandingAt, stages });
     }
     return batches;
+}
+
+function reserveHostWindows(pool, batches) {
+    const hosts = pool.map((host) => ({
+        hostname: host.hostname,
+        usableRam: Math.max(0, Number(host.usableRam ?? 0)),
+        reservations: [],
+    }));
+    const stages = batches
+        .flatMap((batch) => batch.stages)
+        .sort((a, b) => a.startAt - b.startAt || b.ram - a.ram || a.landingAt - b.landingAt);
+
+    for (const stage of stages) {
+        let remainingThreads = stage.threads;
+        const candidates = hosts.map((host) => {
+            const occupied = maxReservedRam(host.reservations, stage.startAt, stage.landingAt);
+            const freeRam = Math.max(0, host.usableRam - occupied);
+            return { host, freeRam, capacity: Math.floor(freeRam / stage.scriptRam) };
+        }).sort((a, b) => b.capacity - a.capacity || b.freeRam - a.freeRam || a.host.hostname.localeCompare(b.host.hostname));
+
+        for (const candidate of candidates) {
+            if (remainingThreads <= 0) break;
+            const threads = Math.min(remainingThreads, candidate.capacity);
+            if (threads < 1) continue;
+            const ram = threads * stage.scriptRam;
+            candidate.host.reservations.push({
+                startAt: stage.startAt,
+                endAt: stage.landingAt,
+                ram,
+                batch: stage.batch,
+                stage: stage.name,
+                threads,
+            });
+            remainingThreads -= threads;
+        }
+
+        if (remainingThreads > 0) {
+            return {
+                ok: false,
+                blockedBatch: stage.batch,
+                blockedStage: stage.name,
+                missingThreads: remainingThreads,
+                hosts,
+            };
+        }
+    }
+
+    return { ok: true, blockedBatch: 0, blockedStage: "", missingThreads: 0, hosts };
+}
+
+function maxReservedRam(reservations, startAt, endAt) {
+    const events = [];
+    for (const reservation of reservations) {
+        if (reservation.endAt <= startAt || reservation.startAt >= endAt) continue;
+        const start = Math.max(startAt, reservation.startAt);
+        const end = Math.min(endAt, reservation.endAt);
+        events.push({ at: start, delta: reservation.ram });
+        events.push({ at: end, delta: -reservation.ram });
+    }
+    events.sort((a, b) => a.at - b.at || a.delta - b.delta);
+    let current = 0;
+    let peak = 0;
+    for (const event of events) {
+        current += event.delta;
+        peak = Math.max(peak, current);
+    }
+    return peak;
 }
 
 function peakRamUsage(batches) {
@@ -259,11 +419,14 @@ function printAnalysis(ns, state) {
     ns.tprint(`[PIPELINE] ${state.status} ${state.target} | ${state.reason}`);
     if (!state.timing || !state.ram) return;
     ns.tprint(`[PIPELINE] Stage gap requested ${state.timing.requestedStageGapMs}ms → tuned ${state.timing.tunedStageGapMs}ms`);
-    ns.tprint(`[PIPELINE] Batch interval ${state.timing.tunedBatchIntervalMs}ms | mode ${state.timing.tuningMode}`);
+    ns.tprint(`[PIPELINE] Batch interval requested ${state.timing.requestedBatchIntervalMs}ms → sustainable ${state.timing.tunedBatchIntervalMs}ms | mode ${state.timing.tuningMode}`);
+    ns.tprint(`[PIPELINE] Timing telemetry ${state.timing.telemetry.samples} sample(s) | ${state.timing.telemetry.reason}`);
     ns.tprint(`[PIPELINE] Threads ${state.threads.hack}H / ${state.threads.weakenHack}W / ${state.threads.grow}G / ${state.threads.weakenGrow}W`);
-    ns.tprint(`[PIPELINE] RAM available ${state.ram.availableRam.toFixed(2)} GB | one batch ${state.ram.singleBatchRam.toFixed(2)} GB | simulated safe depth ${state.ram.safeDepth}`);
+    ns.tprint(`[PIPELINE] RAM available ${state.ram.availableRam.toFixed(2)} GB across ${state.ram.hostCount} hosts | one batch ${state.ram.singleBatchRam.toFixed(2)} GB`);
+    ns.tprint(`[PIPELINE] Burst depth ${state.ram.burstDepth}${state.ram.depthSearchLimited ? `+ (search capped at ${state.ram.maxDepthSearch})` : ""} | steady-state concurrent window ${state.timing.steadyState.requiredDepth} batch(es) | peak ${state.timing.steadyState.peakRam.toFixed(2)} GB`);
     for (const row of state.ram.simulations) {
-        ns.tprint(`[PIPELINE] depth ${row.depth}: peak ${row.peakRam.toFixed(2)} GB ${row.fits ? "FIT" : "BLOCKED"}`);
+        const block = row.fits ? "FIT" : `BLOCKED${row.blockedStage ? ` at batch ${row.blockedBatch} ${row.blockedStage}` : ""}`;
+        ns.tprint(`[PIPELINE] depth ${row.depth}: peak ${row.peakRam.toFixed(2)} GB ${block}`);
     }
 }
 
