@@ -17,47 +17,9 @@ PIPELINE  continuous controller-managed depth-2 HWGW
 
 The dedicated prepper is live on home and the production pool correctly excludes its reserved host. Before prepper reservation the multi-target dry run saw `4196.00 GB / 59 hosts`; with prepper active it saw `4156.50 GB / 58 hosts`, while MONEY allocation remained `phantasy 16 | joesguns 4 | sigma-cosmetics 2`.
 
-`hacking/prepper.js` reserves one remote host, publishes Port 18, round-robins eligible targets with grow/weaken only, and returns the host to production automatically if its heartbeat goes stale.
-
-## Multi-target planning
-
-`hacking/multi-target-scheduler.js` remains the one-shot dry-run allocator. It now uses shared helpers from `lib/batch-allocation.js` so batch-template and host/time reservation logic are not duplicated with the persistent simulator.
-
-Usage:
-
-```text
-run hacking/multi-target-scheduler.js money 4 0.10 200 64
-run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
-run hacking/multi-target-scheduler.js xp 4 0.10 200 64
-```
-
-Current one-shot model:
-
-```text
-MULTI_TARGET_ALLOCATOR_DRY_RUN_V2_SHARED
-```
-
-Observed profile separation before the persistent simulator was added:
-
-```text
-MONEY:    phantasy 16 | joesguns 4 | sigma-cosmetics 2
-BALANCED: phantasy 11 | joesguns 4 | sigma-cosmetics 1 | foodnstuff 1
-XP:       joesguns 3  | foodnstuff 2 | sigma-cosmetics 1 | phantasy 1
-```
-
-XP sourcing now uses planner rankings instead of economic rankings so XP mode is not constrained by money-specific filtering. XP remains an explicit proxy metric, not exact Formula-based XP optimization.
-
 ## Persistent multi-target admission simulation
 
-`hacking/multi-target-sim.js` is the next planning stage. It is long-running but still launches **no workers**.
-
-Usage:
-
-```text
-run hacking/multi-target-sim.js money 4 0.10 200 64
-run hacking/multi-target-sim.js balanced 4 0.10 200 64
-run hacking/multi-target-sim.js xp 4 0.10 200 64
-```
+`hacking/multi-target-sim.js` is planning-only and launches no workers. Live validation proved rolling admission works: the simulation progressed from `21 in flight | 21 admitted | 0 completed` to `24 in flight | 25 admitted | 1 completed`, then `20 in flight | 25 admitted | 5 completed`. Dynamic depth redistributed globally during expiry/re-admission, including a temporary `joesguns` depth increase while `sigma-cosmetics` returned to READY. `foodnstuff` correctly remained `WAITING_PREP` while unprepared.
 
 Model:
 
@@ -65,21 +27,50 @@ Model:
 MULTI_TARGET_ADMISSION_SIM_V2_PERSISTENT
 ```
 
-Behavior:
+This validates the shared global reservation calendar and continuous replacement loop. It does not yet prove that high real depth is safe.
 
-- continuously refreshes the real production execution pool;
-- preserves one shared host/time RAM reservation calendar;
-- expires virtual reservations as their landing windows pass;
-- repeatedly admits new virtual batches as capacity becomes free;
-- applies fairness against **current virtual depth**, not lifetime admissions, so fairness pressure does not grow forever;
-- only admits production batches for targets currently at >=99.5% money and <=+0.05 security;
-- marks unprepared candidates `WAITING_PREP` while the independent Port 18 prepper works on them;
-- dynamically rebalances target depth as virtual batches complete;
-- resets the virtual calendar safely if the production host set changes;
-- publishes live per-target depth, lifetime admissions/completions, recent 60-second completions, prepper status, in-flight batches, and host peak reservations to Port 17;
-- does not consume Port 14 and does not interfere with the single-target pipeline state on Port 16.
+## Rolling real batch safety history
 
-For first validation, run the persistent simulator while the production controller is in STANDBY and leave it alive long enough for at least one virtual batch to complete and be replaced.
+The next safety layer is now scaffolded.
+
+New files/services:
+
+```text
+lib/batch-history.js
+hacking/batch-history.js
+```
+
+`kickstart.js` starts the batch-history collector on home. It watches latest completed real batches on Port 15 and publishes rolling per-target safety history on **Port 19**. It does not consume Port 14 and launches no workers.
+
+Port 19 model:
+
+```text
+ROLLING_BATCH_HISTORY_V1
+```
+
+Up to 16 real samples are retained per target. Samples include stage order, missing timing jobs, money/security recovery, maximum landing error, minimum spacing, allocation spread, gap, and batch interval.
+
+A sample is currently considered clean only if:
+
+```text
+order correct
+missing jobs == 0
+money >= 99.5%
+security <= +0.05
+max |landing error| <= 150 ms
+minimum spacing >= 75 ms
+```
+
+Conservative advisory depth ladder:
+
+```text
+0-1 consecutive clean -> depth 1 / UNPROVEN
+2-3 consecutive clean -> depth 2 / LOW
+4-7 consecutive clean -> depth 4 / MEDIUM
+8+ consecutive clean  -> depth 8 / HIGH
+```
+
+This recommendation is advisory only in the current commit. The immediate next implementation step is to make the persistent multi-target simulator expose and enforce this per-target cap before any real multi-target executor exists.
 
 ## Runtime batching / scheduler state
 
@@ -89,33 +80,32 @@ For first validation, run the persistent simulator while the production controll
 - Port 16: current single-target pipeline planner/simulator/executor.
 - Port 17: one-shot or persistent global multi-target planner/simulator.
 - Port 18: dedicated prepper/reserved-host state.
+- Port 19: rolling per-target real batch safety history.
 
-The current real PIPELINE executor still owns Port 14 while active. Neither multi-target planning script consumes Port 14. The prepper also does not consume or emit Port 14 timing events.
+The current real PIPELINE executor still owns Port 14 while active. Multi-target planning and the Port 19 collector do not consume Port 14.
 
 ## Current important limitations
 
 - Live PIPELINE depth is still fixed at 2.
 - Multi-target work is still simulation/planning only; no real multi-target worker launches yet.
-- Persistent simulation uses real wall-clock time but virtual batch completions do not mutate targets.
-- Port 15 is latest-only; rolling real landing/recovery history is still missing.
-- Timing adaptation still uses latest matching completion rather than several real samples.
-- XP scoring is a proxy, not exact hacking XP.
+- Port 19 history only learns from new Port 15 completions after the collector is running; old historical completions are not reconstructed.
+- The persistent multi-target simulator does not yet enforce Port 19 recommended depth.
+- XP scoring is still a proxy, not exact Formula-based hacking XP.
 - Automatic worker watchdog termination remains deferred.
-- Prepper and persistent multi-target state are not yet surfaced in the GUI.
+- Prepper, Port 17, and Port 19 state are not yet surfaced in the GUI.
 
 ## Immediate next development sequence
 
 ```text
-1. Pull and run mem-audit; expect 50 managed JS files, 39 runnable scripts, 11 modules
-2. Run persistent MONEY simulation in STANDBY and verify Port 17 model/state
-3. Leave it running until virtual completions occur and replacement admissions appear
-4. Confirm unprepared targets stay WAITING_PREP and become eligible after prepper readiness changes
-5. Compare persistent MONEY/BALANCED/XP depth over time
-6. Add rolling per-target real landing/recovery history
-7. Finish continuous PIPELINE + PIPELINE→STANDBY drain validation
-8. First real multi-target test with conservative global live depth 2 / per-target depth 1
-9. Evolve real executor toward dynamic per-target depth using the shared global calendar
-10. Keep automatic worker killing deferred until multi-target timing is stable
+1. Pull/start and confirm hacking/batch-history.js is running on home
+2. Run mem-audit and confirm manifest cleanliness
+3. Produce fresh real PIPELINE completions and verify Port 19 accumulates samples/streaks
+4. Wire Port 19 recommendedDepth into persistent multi-target simulation as a hard per-target admission cap
+5. Validate that unproven targets stay depth 1 while proven targets can earn higher simulated depth
+6. Finish continuous PIPELINE + PIPELINE→STANDBY drain validation
+7. First real multi-target test with conservative global live depth 2 / per-target depth 1
+8. Evolve real executor toward dynamic per-target depth only after clean timing evidence
+9. Keep automatic worker killing deferred until multi-target timing is stable
 ```
 
 ## Useful commands
@@ -123,11 +113,8 @@ The current real PIPELINE executor still owns Port 14 while active. Neither mult
 ```text
 run startup.js
 run diagnostics/mem-audit.js
-run hacking/prepper.js
-run hacking/multi-target-scheduler.js money 4 0.10 200 64
+ps home
 run hacking/multi-target-sim.js money 4 0.10 200 64
-run hacking/multi-target-sim.js balanced 4 0.10 200 64
-run hacking/multi-target-sim.js xp 4 0.10 200 64
 run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
 
@@ -137,13 +124,3 @@ For updates:
 run gitpull.js
 run startup.js
 ```
-
-## Related documentation
-
-- `README.md`
-- `docs/architecture.md`
-- `docs/BATCH_SCHEDULER.md`
-- `docs/RUNTIME_STATE.md`
-- `docs/TESTING.md`
-- `docs/SYSTEM_MAP.md`
-- `docs/ROADMAP.md`
