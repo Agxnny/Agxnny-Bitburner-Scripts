@@ -36,7 +36,7 @@ Latest runtime evidence from the user: joesguns validated cleanly; screenshot la
 Real `hacking/multi-target-runner.js` is still per-target depth 1. Do not remove its uniqueness guard until the current multi-target overlap evidence pass is reviewed.
 
 ## Stock research baseline
-The user is currently saving toward the $25b 4S forecasting API and requested observation/history first, no autonomous trading yet.
+The user is saving toward the $25b 4S forecasting API and requested observation/history first, no autonomous trading yet.
 
 ### Persistent compact history
 ```text
@@ -44,36 +44,29 @@ lib/stock-history.js
 /data/stock-history.txt
 model STOCK_HISTORY_V1_COMPACT
 ```
-History stores one shared timestamp array plus a compact price array per symbol. Default cadence is 6 seconds, max 1,800 samples, roughly a 3-hour rolling window.
+History stores one shared timestamp array plus a compact price array per symbol. Timestamps use JavaScript `Date.now()` wall-clock epoch time.
 
-Timestamps use normal JavaScript `Date.now()` wall-clock epoch time, so recorder downtime is detectable even when the script is not running. `appendStockSample()` compares the new wall-clock timestamp with the last persisted timestamp. A gap greater than 2.25x the expected sample interval is recorded in `history.gaps` with `from`, `to`, `durationMs`, and the net endpoint price jump for every symbol. Up to 24 recent gap records are retained.
+Retention is now `ALL`: new samples are no longer trimmed to the former 1,800-sample / ~3-hour rolling cap. Existing data that had already been trimmed before this change cannot be reconstructed, but all new observations remain persisted across normal pulls/restarts until the user explicitly deletes/resets the data file.
 
-Important limitation: after downtime we know exactly how long the recorder was absent and the net price change between the last pre-gap and first post-gap sample, but we cannot reconstruct the path or intermediate prices during that missing interval.
+Recorder gaps use wall-clock continuity. `appendStockSample()` can record an explicit restart gap from the last persisted market heartbeat to the first new changed-price sample. Gap records include `from`, `to`, `durationMs`, and endpoint price jumps by symbol. The dashboard never fabricates intermediate prices.
 
-`stockSeriesStats()` excludes returns that cross detected recorder gaps from the normal tick-volatility calculation so an hours-long outage jump is not misclassified as a 6-second return. It also reports per-series gap count and largest gap.
+`stockSeriesStats()` excludes returns crossing a detected outage from tick volatility.
 
 ### Stock history keeper
 ```text
 stocks/history-keeper.js
 ```
-Observation-only, never trades. It records every TIX-visible symbol, current price, bid/ask, max shares, and current long/short positions. Current market/portfolio snapshot is persisted separately:
-```text
-/data/stock-market-state.txt
-model STOCK_MARKET_STATE_V1
-```
-
-Bitburner v3 stock access methods in use:
+Observation-only, never trades. Bitburner v3 stock access methods:
 ```text
 ns.stock.hasWseAccount()
 ns.stock.hasTixApiAccess()
 ns.stock.has4SData()
 ns.stock.has4SDataTixApi()
 ```
-Do not use the removed v2-era names `hasWSEAccount`, `hasTIXAPIAccess`, or `has4SDataTIXAPI`.
 
-If TIX API access is unavailable, the keeper publishes WAITING state and parks until access becomes available rather than crashing.
+The keeper now polls TIX every 200ms to detect market changes as soon as practical. It does not persist duplicate unchanged prices every 200ms: it fingerprints the full symbol price set and writes a new historical sample only when prices actually change. Current market state/portfolio heartbeat is refreshed roughly once per second even if prices are unchanged. Observed market-tick interval is learned from recent changed-price timestamps and retained as `history.intervalMs` for gap/volatility logic.
 
-`kickstart.js` starts `stocks/history-keeper.js` quietly alongside prepper and batch-history collection. The dedicated stock dashboard also starts the keeper quietly if it is not already running.
+`kickstart.js` starts `stocks/history-keeper.js` quietly. The stock dashboard also guards/starts it.
 
 ### Separate React Market Lab dashboard
 ```text
@@ -82,22 +75,29 @@ stocks/candles.js
 stocks/styles.js
 run stocks/dashboard.js
 ```
-This is separate from the main hacking control plane. One React tree is mounted; the async Netscript loop refreshes plain JS cache. React callbacks only change local selected-symbol state.
+The dashboard is separate from the hacking control plane and refreshes cached file state at 250ms. React callbacks remain Netscript-free.
 
-Price history now renders stereotypical OHLC candlesticks instead of a simple line. `stocks/candles.js` aggregates sampled prices into up to 60 candles, with at least five recorded samples per candle. Candles show open/high/low/close; green is up and red is down. Candle aggregation will not bridge detected recorder gaps; a gap forces a new candle and the chart renders a dashed amber gap marker.
-
-Current dashboard sections:
+Two chart tabs now exist:
 ```text
-Header: recorder/TIX/4S/trading-off status plus latest gap/continuous badge
-Hero: cash, progress toward $25b 4S API, long value, short value, unrealized P&L
-Price history: selectable symbol, OHLC candlestick chart, sample count, window change, tick volatility, observed price range
-Continuity note: most recent recorder gap, wall-clock start/end, gap duration, and selected-symbol endpoint jump
-Portfolio: current LONG/SHORT positions, shares, value, unrealized P&L, exposure summary
-Market watch: every stock with price, rolling-window change, volatility, samples; clicking a row changes the chart
+CANDLES
+HISTORY · LINE
 ```
-Trading is explicitly OFF. The old `stocks/terminal.js` placeholder remains but `stocks/dashboard.js` is the preferred stock research surface.
 
-Long and short portfolio accounting are separate in the snapshot/dashboard so future execution logic can support both directions without changing the data model.
+`CANDLES` is only for fixed OHLC timeframe views. Current selectors:
+```text
+1m / 5m / 15m / 30m / 1h / 4h
+```
+Candles are aligned to real wall-clock timeframe buckets and calculated only from observed samples. Direction is truthful: close > open is green, close < open is red, close == open is neutral grey. Wicks use the candle's actual observed high/low. Recorder gaps force a new candle and display an amber dashed discontinuity marker; candles never bridge missing data.
+
+The candle tab deliberately does not have an ALL-HISTORY mode. It shows a recent window of roughly 70 candles at the chosen timeframe so old history is not compressed into misleading candles.
+
+`HISTORY · LINE` preserves the original line-graph style and is the only place where historical-range selection appears:
+```text
+15m / 1h / 3h / 6h / 12h / 24h / ALL
+```
+`ALL` displays all retained observations. The line is broken at recorder gaps with an amber dashed marker rather than connecting pre-gap and post-gap prices as though they were continuously observed.
+
+Header/hero/portfolio/market-watch remain read-only. Long and short holdings are accounted separately for future bidirectional trading support.
 
 ### Startup behavior
 `startup.js` launches both dashboards on home before spawning the quiet kickstart chain:
@@ -105,10 +105,10 @@ Long and short portfolio accounting are separate in the snapshot/dashboard so fu
 /ui/dashboard.js
 /stocks/dashboard.js
 ```
-Each is guarded with `ns.isRunning()`, so running `startup.js` again does not create duplicate dashboard processes.
+Each is guarded with `ns.isRunning()`.
 
 ### Stock next steps
-Do not build autonomous orders yet. First collect a meaningful pre-4S baseline and inspect runtime behavior/file growth. After 4S becomes available, signal source can switch to native forecast + volatility while preserving the same history/portfolio/dashboard layers.
+Do not build autonomous orders yet. Continue collecting a meaningful pre-4S baseline and inspect runtime/file growth. After 4S becomes available, signal source can switch to native forecast + volatility while preserving history/portfolio/dashboard layers.
 
 Likely future focused modules:
 ```text
@@ -129,13 +129,19 @@ Economy/manual-goal cash reservation must remain authoritative over future stock
 After pulling:
 ```text
 run gitpull.js
-run startup.js
 ```
-This will start the main control-plane dashboard, the stock Market Lab dashboard, and the normal quiet kickstart chain. The stock history keeper will come up through kickstart/dashboard guard logic.
+Restart the already-running stock keeper and dashboard (or restart the normal startup stack) because Bitburner running scripts do not hot-reload imports.
 
-For gap testing, allow some samples to collect, stop `stocks/history-keeper.js` for at least ~15 seconds, then restart it. The dashboard should show a LAST GAP badge, a dashed chart gap marker, and the selected symbol's net endpoint change across the missing interval. Existing `/data/stock-history.txt` data is preserved by normal git pulls.
-
-If the previous keeper/dashboard processes are still running old code after pulling, restart them; Bitburner running scripts do not hot-reload imported code.
+Validate:
+```text
+- CANDLES tab has only fixed 1m/5m/15m/30m/1h/4h timeframe buttons
+- green candles only when close > open; red only when close < open; neutral when equal
+- wick high/low matches observed data
+- HISTORY · LINE has 15m..24h plus ALL
+- ALL line uses all retained observations and breaks at gaps
+- recorder continues collecting with the dashboard closed
+- history sample count grows only when stock prices actually change
+```
 
 ## Priority
 ```text
