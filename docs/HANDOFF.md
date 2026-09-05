@@ -77,7 +77,7 @@ run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 20 resume
 run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 20 6
 ```
 
-When a child wave returns BLOCKED, stress enters WAITING_PREP, watches fresh Port 18 every ~2 seconds, publishes prepared/required counts, and only retries once enough prepared targets exist. A profile can still have fewer usable top candidates than the full prepper count, so another legitimate BLOCKED may return to waiting.
+When a child wave returns BLOCKED, stress enters WAITING_PREP, watches fresh Port 18 every ~2 seconds, publishes prepared/required counts, and only retries once enough prepared targets exist.
 
 ## AUTOMULTI decision engine V1
 
@@ -88,7 +88,7 @@ lib/automulti-decision.js
 model: AUTOMULTI_DECISION_V1
 ```
 
-This module has no Netscript calls. It consumes precomputed candidate scenarios and chooses a safe production configuration. It explicitly separates:
+It explicitly separates:
 
 ```text
 Possible depth   prepared + conservative RAM-feasible distinct targets
@@ -97,20 +97,68 @@ Effective depth  min(Possible, Proven)
 Validation depth next unproven level when Possible > Proven
 ```
 
-The chosen config contains profile/objective, targetCount, globalDepth, hackPercent, and stageGapMs. Target scoring combines objective throughput/efficiency with a target-history safety factor. A latest unhealthy real history sample heavily penalizes that target; repeated clean history can slightly prefer it. Global production depth never exceeds proven stress evidence.
+The chosen config contains profile/objective, targetCount, globalDepth, hackPercent, and stageGapMs. Target scoring uses throughput/efficiency plus Port 19 history safety weighting. Global production depth never exceeds proven stress evidence.
 
-Current V1 RAM feasibility is intentionally conservative: it sums complete per-batch RAM requirements for selected distinct targets rather than assuming perfect stage-time reuse. This may underestimate Possible depth but must not over-admit. Later controller integration can use the shared host/time calendar for a tighter feasibility check.
+Current RAM feasibility intentionally sums complete per-batch RAM requirements rather than assuming perfect stage-time reuse, so Possible depth is conservative.
 
-Read-only live advisor:
+### Shared live candidate path
 
 ```text
-diagnostics/automulti-advisor.js
-usage: run diagnostics/automulti-advisor.js [money|balanced|xp]
+lib/multi-target-ranking.js
+lib/automulti-live.js
 ```
 
-It reads planner rankings, actual production RAM after prep reservations, Port 19 batch history, and durable stress evidence. It evaluates hack percentages 5 / 7.5 / 10 / 12.5 / 15 / 20 at the currently validated 200 ms stage gap and prints the chosen config plus Possible / Proven / Effective / next validation depth. It never changes controller mode or launches workers.
+`multi-target-ranking.js` centralizes the intended candidate-source policy:
 
-The advisor currently uses planner baseline rankings for its candidate universe. Before controller AUTO is wired, reconcile this with the multi-runner profile/economic ranking helper so advisor and executor rank the same candidate set.
+```text
+XP             planner baseline ranking
+MONEY/BALANCED economic ranking when >=2 rows exist
+               otherwise planner fallback
+```
+
+`automulti-live.js` is now the single live adapter for AUTOMULTI. It reads planner/economic state, production RAM after prep reservations, Port 19 target history, durable stress evidence, and builds the hack-percent scenarios consumed by the pure decision engine.
+
+`diagnostics/automulti-advisor.js` now uses this live adapter and prints the ranking source. This matches the existing real MULTI runner candidate-source behavior. The runner still contains its tiny legacy `sourceRankings()` helper with the same policy; remove that duplicate when the runner is next safely rewritten so there is one literal implementation as well as behavioral parity.
+
+### AUTOMULTI supervisory coordinator V1
+
+```text
+hacking/automulti-controller.js
+state file: /data/automulti-controller-state.txt
+model: AUTOMULTI_CONTROLLER_V1
+usage: run hacking/automulti-controller.js [money|balanced|xp] [validate|no-validate]
+```
+
+This is a focused supervisor rather than more logic inside the already-large main controller. The normal `hacking/controller.js` and finite `multi-target-runner.js` remain the execution plane; AUTOMULTI only sends normal Port 13 controller requests.
+
+State flow:
+
+```text
+ASSESS -> RUN -> OBSERVE -> ADAPT
+                    |
+                    +-> VALIDATE_PENDING -> STANDBY/drain -> VALIDATING -> ASSESS
+```
+
+Behavior:
+
+```text
+- reassesses live candidates/RAM/evidence every ~5 seconds
+- starts MULTI from STANDBY using the safe Effective configuration
+- while MULTI runs, config changes are queued for subsequent finite waves
+- observes completed real MULTI runIds and counts clean AUTO waves
+- after 3 clean AUTO waves, if Possible > Proven and validation is enabled:
+    request STANDBY
+    allow the current finite wave to drain naturally
+    launch the existing stress tester only at the next validation depth
+    use 2 validation waves, mixed profile, 10% hack, 200 ms gap, 20 minute prep wait
+    after stress exits, reassess durable evidence and resume production
+- a MULTI safety stop is respected; AUTOMULTI does not auto-clear it
+- if another execution mode (HGW/BATCH/PIPELINE) owns the controller, AUTOMULTI reports BLOCKED and does not take it over
+```
+
+AUTOMULTI validation therefore never overlaps production MULTI. Validation temporarily parks production at a safe boundary and reuses the existing evidence system.
+
+Known V1 follow-up: if a validation depth records a real FAILED/SAFETY_STOP, add an evidence-aware retry cooldown/lockout so AUTOMULTI does not repeatedly re-attempt the same failed depth after another clean-wave interval.
 
 ## Distributed target prepper V3 adaptive focus
 
@@ -121,9 +169,7 @@ model: DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS
 state: Port 18
 ```
 
-The prepper scans the full eligible target universe and reserves a bounded slice of remote RAM. Allocation is adaptive: it may spread prep or concentrate multiple reserved hosts on one target. Defaults are 12.5% remote RAM reserve, min 64 GB, max 1024 GB, money ready >=99.5%, security ready <= min+0.05. Prep is money-first, then security cleanup. One target may receive multiple same-wave jobs across different reserved hosts.
-
-Port 18 publishes `preparedCount`, `needsPrepCount`, `activeJobs`, `activeTargetCount`, `prepTargets`, reserved hosts/RAM, and adaptive focus data. `prepTargets[].etaMs` estimates full ready time, not just current job completion.
+The prepper scans the full eligible target universe and reserves a bounded slice of remote RAM. Allocation is adaptive. Defaults are 12.5% remote RAM reserve, min 64 GB, max 1024 GB, money ready >=99.5%, security ready <= min+0.05. Prep is money-first, then security cleanup. One target may receive multiple same-wave jobs across different reserved hosts.
 
 ## Modular dashboard architecture
 
@@ -150,7 +196,7 @@ React callbacks must remain Netscript-free. The dashboard uses one mounted React
 - global typography enlarged for at-a-glance use
 - Diagnostics has health verdict, real test/diagnostic buttons, direct diagnostic PID/status tracking, and state-age severity
 - Overview duplicate BATCH/PIPELINE/MULTI/Prep+hold launch buttons removed; Standby/HGW/Resume remain
-- Batch currently exposes manual MULTI controls; AUTOMULTI will become the primary path after backend controller logic is ready
+- Batch currently exposes manual MULTI controls; AUTOMULTI button/status is next after coordinator runtime validation
 - Targets still needs focused allocation display `N hosts · Nt`
 
 ## Multi-target runner/controller
@@ -177,30 +223,46 @@ Controller MULTI repeats finite waves automatically. COMPLETE re-evaluates and r
 
 ## Immediate validation sequence
 
-Current production MULTI may remain active because `diagnostics/automulti-advisor.js` is read-only. After pulling:
+The previous read-only advisor run showed:
+
+```text
+Possible 5 · Proven 2 · Effective 2
+4196 GB usable / 59 production hosts
+MONEY chose 20% hack
+validation candidate depth 3
+```
+
+After pulling this pass:
 
 ```text
 1. run gitpull.js
-2. while MULTI is still running, run diagnostics/automulti-advisor.js money
-3. verify it prints Possible / Proven / Effective and does not alter the running controller
-4. sanity-check chosen hack %, selected targets, usable RAM, and validation recommendation
-5. optionally run balanced and xp advisor modes for comparison
-6. do not run stress until controller is fully STANDBY
+2. rerun diagnostics/automulti-advisor.js money
+3. confirm output now includes ranking ECONOMIC (or PLANNER_FALLBACK if economic state is unavailable)
+4. before live AUTOMULTI testing, put the main controller in STANDBY and let any existing MULTI wave drain
+5. first conservative supervisor test:
+   run hacking/automulti-controller.js money no-validate
+6. confirm it transitions the main controller into MULTI at Effective depth and adapts without exceeding Proven
+7. inspect: cat /data/automulti-controller-state.txt
+8. only after the no-validate path is clean, test automatic validation with:
+   run hacking/automulti-controller.js money validate
+9. confirm it waits for 3 clean observed AUTO waves, requests STANDBY, drains, then launches only the next validation depth
 ```
 
-If durable stress evidence has not yet been recreated, V1 deliberately reports a conservative proven fallback of depth 2 even though historical manual evidence was higher. After controlled stress is rerun, the advisor should automatically consume the higher durable proof.
+Do not run two AUTOMULTI coordinators simultaneously.
 
 ## AUTOMULTI implementation sequence
 
 ```text
 DONE 1. persistent stress evidence helper + stress-run recording
 DONE 2. prep-aware WAITING_PREP + explicit startDepth + durable-evidence resume
-DONE 3. pure AUTOMULTI decision module + read-only live advisor
-NEXT 4. reconcile shared profile/economic candidate ranking, then controller AUTO state machine: ASSESS -> VALIDATE if needed -> RUN -> OBSERVE -> ADAPT
-5. Batch-tab AUTOMULTI button/status; keep manual controls as Advanced/Manual
-6. expose Possible / Proven / AUTO effective concurrency
-7. runtime validation and conservative fallback/demotion behavior
-8. later keep global distinct-target depth separate from per-target overlap depth
+DONE 3. pure AUTOMULTI decision module + shared live adapter + read-only advisor
+DONE 4. supervisory AUTO state machine with controlled next-depth validation
+NEXT 5. runtime validate no-validate supervisor path, then validate path
+6. Batch-tab AUTOMULTI button/status; keep manual controls as Advanced/Manual
+7. expose Possible / Proven / AUTO effective concurrency in GUI
+8. add failed-depth validation cooldown/lockout
+9. remove the runner's now-redundant local sourceRankings helper
+10. later keep global distinct-target depth separate from per-target overlap depth
 ```
 
-AUTOMULTI must never treat more RAM or more prepared targets as permission to exceed proven stress evidence. It may request controlled validation for a higher depth, but production remains at the last trusted ceiling until that evidence exists. XP scoring remains a proxy rather than exact Formula-based hacking XP.
+AUTOMULTI must never treat more RAM or more prepared targets as permission to exceed proven stress evidence. XP scoring remains a proxy rather than exact Formula-based hacking XP.
