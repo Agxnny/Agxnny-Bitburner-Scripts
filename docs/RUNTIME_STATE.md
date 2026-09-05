@@ -25,6 +25,7 @@
 | 17 | Global multi-target planner/simulator/executor | Latest-value snapshot |
 | 18 | Dedicated prepper / reserved-host state | Latest-value snapshot |
 | 19 | Rolling real batch safety history | Latest-value snapshot |
+| 20 | Progressive multi-target stress test | Latest-value snapshot |
 
 ## Port 1 — controller state
 
@@ -38,7 +39,7 @@ Startup initializes the production controller in `STANDBY`. The background prepp
 
 `MULTI` is controller-managed repeated finite multi-target waves. It does not enable same-target overlap; per-target depth remains 1.
 
-Controller `executionMode` now also publishes:
+Controller `executionMode` also publishes:
 
 ```text
 multiRunning
@@ -76,7 +77,7 @@ hacking/pipeline-runner.js
 hacking/multi-target-runner.js
 ```
 
-The real multi-target executor routes Port 14 events by unique `batchId` to independent target batches. Planning-only multi-target scripts, the prepper, and the batch-history collector do not consume Port 14.
+The real multi-target executor routes Port 14 events by unique `batchId` to independent target batches. Planning-only multi-target scripts, the prepper, batch-history collector, and stress-test coordinator do not consume Port 14.
 
 ## Port 15 — latest completed batch
 
@@ -114,7 +115,7 @@ Current real finite executor:
 MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE
 ```
 
-The same finite executor is used for both manual/GUI tests and controller-managed MULTI waves. Manual runs require controller STANDBY; controller-owned runs carry `--controller` and require controller mode MULTI.
+The same finite executor is used for manual/GUI tests, controller-managed MULTI waves, and the progressive stress-test harness. Manual/stress-runner child waves require controller STANDBY; controller-owned runs carry `--controller` and require controller mode MULTI.
 
 Real execution remains deliberately conservative:
 
@@ -167,7 +168,7 @@ DEDICATED_TARGET_PREPPER_V1
 
 `lib/execution.js` treats a Port 18 reservation as active only while its heartbeat is fresh. A fresh reserved host is excluded from normal production capacity.
 
-The dedicated prepper is especially important in MULTI mode because a BLOCKED wave caused by too few prepared top-ranked targets can be retried later without weakening the prepared-target gate.
+The dedicated prepper is especially important in MULTI mode and stress testing because a BLOCKED wave caused by too few prepared top-ranked targets can be retried later without weakening the prepared-target gate.
 
 ## Port 19 — rolling real batch safety history
 
@@ -190,6 +191,57 @@ Higher depth recommendations require consecutive clean pipeline-style samples:
 
 The persistent simulator may use these recommendations, but controller MULTI still ignores higher same-target recommendations and remains hard-capped at one live batch per target.
 
+## Port 20 — progressive multi-target stress test
+
+Published by `diagnostics/multi-target-stress.js` with model:
+
+```text
+MULTI_TARGET_STRESS_V1
+```
+
+The stress coordinator itself never consumes Port 14 and never launches workers directly. It starts exactly one finite `hacking/multi-target-runner.js` child at a time, waits for that child to exit, then reads the final Port 17 executor state before deciding whether to advance concurrency.
+
+Important fields:
+
+```text
+status
+reason
+config { profileMode, maxDepth, wavesPerDepth, targetCount, hackFraction, stageGapMs, prepWaitMinutes }
+startedAt
+finishedAt
+currentDepth
+currentWave
+currentProfile
+runnerPid
+waveStatus
+highestCleanDepth
+depthCleanWaves
+totalCleanWaves
+blockedRetries
+maxObservedDriftMs
+minObservedSpacingMs
+uniqueTargets[]
+results[]
+updatedAt
+```
+
+Stress states include:
+
+```text
+RUNNING
+WAITING_PREP
+PASS
+BLOCKED
+BLOCKED_TIMEOUT
+SAFETY_STOP
+FAILED
+ABORTED
+```
+
+The test begins at distinct-target depth 2 and only increments after every requested wave at the current depth is clean. `mixed` mode rotates MONEY, BALANCED, and XP profiles to broaden target coverage. Any safety failure stops escalation. BLOCKED child waves may be retried while the prepper catches up, up to the configured timeout.
+
+Port 20 is advisory/test telemetry only. A high clean stress depth does not automatically alter controller MULTI configuration or same-target depth caps.
+
 ## GUI rule
 
 React callbacks only update local/plain-JS request state. Netscript port/file/process I/O stays in the asynchronous dashboard loop.
@@ -197,3 +249,5 @@ React callbacks only update local/plain-JS request state. Netscript port/file/pr
 The Batch tab exposes both a one-shot **Finite wave** button and a **Start controller / Update controller** button using the same profile/target/depth/hack/gap fields. Quick Controls also includes a Multi button using those current fields.
 
 All content/hero cards remain collapsible with React-local collapse state.
+
+The progressive stress test is currently terminal-driven while its backend behavior is validated. Port 20 exists specifically so a compact GUI stress card can be added without changing the test contract later.
