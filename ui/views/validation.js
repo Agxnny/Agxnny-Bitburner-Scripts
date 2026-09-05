@@ -5,13 +5,14 @@ import { styles } from "/ui/styles.js";
 
 const LIVE_STATE_MS = 2500;
 const FULL_DEPTH_TEST = "/diagnostics/multi-full-depth-test.js";
+const FULL_DEPTH_SET = "/diagnostics/multi-full-depth-set.js";
 
 export function validationView(s) {
     const state = s.overlapValidation ?? {}, runtime = s.validationRuntime ?? {};
     const fresh = Date.now() - Number(state.updatedAt ?? 0) <= LIVE_STATE_MS, running = Boolean(runtime.active);
     const controllerMode = String(s.controller?.executionMode?.mode ?? "STANDBY").toUpperCase(), controllerPending = String(s.controller?.executionMode?.pending ?? "");
     const canStart = controllerMode === "STANDBY" && !controllerPending && !running;
-    const selected = field("validationTarget") || "mixed", individual = selected !== "mixed" && selected !== "all";
+    const selected = field("validationTarget") || "mixed", individual = selected !== "mixed" && selected !== "all" && selected !== "proven-set";
     return el("div", null,
         card("Overlap validation control", el("div", null,
             el("div", { style: styles.validationControlGrid },
@@ -19,11 +20,11 @@ export function validationView(s) {
                 labeledControl("Waves / depth", input("validationWaves", "number", 2, 6)),
                 labeledControl("Hack %", input("validationHackPercent", "number", 0.1, 50)),
                 labeledControl("Stage gap ms", input("validationStageGap", "number", 75, 1000)),
-                el("div", { style: styles.multiLaunch }, button(running ? "VALIDATING…" : "START VALIDATION", queueValidationRun, !canStart)),
-                el("div", { style: styles.multiLaunch }, button(runtime.fullDepth ? "FULL DEPTH RUNNING…" : "FULL DEPTH TEST", queueFullDepth, !canStart || !individual)),
+                el("div", { style: styles.multiLaunch }, button(running ? "VALIDATING…" : "START VALIDATION", queueValidationRun, !canStart || selected === "proven-set")),
+                el("div", { style: styles.multiLaunch }, button(fullDepthLabel(runtime, selected), queueFullDepth, !canStart || (!individual && selected !== "proven-set"))),
             ),
             el("div", { style: styles.goalStatus }, status("validationStatus")),
-            note(controlNote(controllerMode, controllerPending, running, fresh, individual)),
+            note(controlNote(controllerMode, controllerPending, running, fresh, selected)),
         ), true),
         liveOverview(state, runtime, fresh),
         landingStream(state),
@@ -31,19 +32,29 @@ export function validationView(s) {
     );
 }
 
+function fullDepthLabel(runtime, selected) {
+    if (runtime.fullDepthSet) return "PROVEN SET RUNNING…";
+    if (runtime.fullDepth) return "FULL DEPTH RUNNING…";
+    return selected === "proven-set" ? "FULL DEPTH · PROVEN2+ SET" : "FULL DEPTH TEST";
+}
 function queueFullDepth() {
     const target = field("validationTarget"), waves = field("validationWaves"), hack = Number(field("validationHackPercent")) / 100, gap = field("validationStageGap");
+    if (target === "proven-set") return queueDiagnostic(FULL_DEPTH_SET, [waves, hack, gap, "--quiet"], "Full depth · PROVEN2+ set");
     queueDiagnostic(FULL_DEPTH_TEST, [target, waves, hack, gap, "--quiet"], `Full depth · ${target}`);
 }
-function controlNote(mode, pending, running, fresh, individual) {
+function controlNote(mode, pending, running, fresh, selected) {
     if (running && !fresh) return "Validation process is active but live telemetry is stale. Controls remain locked until the actual process exits.";
-    if (mode === "STANDBY" && !pending) return individual ? "FULL DEPTH TEST climbs this target through every depth from its current proven ceiling until RAM/timing/recovery stops it. Every clean depth is retained independently for future heterogeneous MULTI scheduling." : "Choose an individual target for FULL DEPTH TEST. MIXED/ALL retain the legacy depth-2 qualification flow.";
-    return `Validation launch locked until controller is fully STANDBY · current ${pending ? `${mode} → ${pending}` : mode}`;
+    if (mode !== "STANDBY" || pending) return `Validation launch locked until controller is fully STANDBY · current ${pending ? `${mode} → ${pending}` : mode}`;
+    if (selected === "proven-set") return "FULL DEPTH · PROVEN2+ SET snapshots planner targets with durable proven depth 2 or higher, then full-depth climbs them sequentially. Each target keeps independent per-depth evidence and its own safe ceiling.";
+    if (selected === "mixed" || selected === "all") return "Choose an individual target for FULL DEPTH TEST, or PROVEN2+ SET to climb every already-qualified target. MIXED/ALL retain the legacy depth-2 qualification flow.";
+    return "FULL DEPTH TEST climbs this target through every depth from its current proven ceiling until RAM/timing/recovery stops it. Every clean depth is retained independently for future heterogeneous MULTI scheduling.";
 }
 function targetSelect(s) {
     const current = field("validationTarget") || "mixed", rankings = Array.isArray(s.planner?.rankings) ? s.planner.rankings : [];
     return el("select", { value: current, onChange: (event) => setField("validationTarget", event.target.value), style: styles.input },
-        el("option", { value: "mixed" }, "MIXED · prepared VALIDATE2 only"), el("option", { value: "all" }, "ALL PREPARED · includes DEPTH1"),
+        el("option", { value: "mixed" }, "MIXED · prepared VALIDATE2 only"),
+        el("option", { value: "all" }, "ALL PREPARED · includes DEPTH1"),
+        el("option", { value: "proven-set" }, "PROVEN2+ SET · full-depth each"),
         ...rankings.map((entry) => el("option", { key: entry.hostname, value: entry.hostname }, entry.hostname)));
 }
 function input(name, type, min, max) { return el("input", { value: field(name), type, min, max, onChange: (event) => setField(name, event.target.value), style: styles.input }); }
@@ -56,7 +67,9 @@ function liveOverview(state, runtime, fresh) {
         card("Live validation", el("div", null,
             kv("Status", actualStatus), kv("Target", state.target ?? "—"), kv("Testing depth", Number(state.depth ?? 0) || "—"), kv("Proven depth", Number(state.provenDepth ?? 0) || "—"),
             kv("Wave", waveTotal ? `${currentWave}/${waveTotal}` : "—"), kv("Clean this depth", Number(state.cleanWaves ?? 0)), kv("Telemetry", fresh ? "LIVE" : "STALE"),
-            state.fullDepthTest ? kv("Mode", "FULL DEPTH CLIMB") : null, state.mixed ? kv("Mixed progress", `${Number(state.mixedIndex ?? 0)}/${Number(state.mixedTotal ?? 0)}`) : null,
+            state.fullDepthTest ? kv("Mode", "FULL DEPTH CLIMB") : null,
+            state.fullDepthSet ? kv("Set progress", `${Number(state.setCompleted ?? 0)}/${Number(state.setTotal ?? 0)}`) : null,
+            state.mixed ? kv("Mixed progress", `${Number(state.mixedIndex ?? 0)}/${Number(state.mixedTotal ?? 0)}`) : null,
             note(state.reason ?? (runtime.active ? "Validator process active" : "Waiting for validation activity")))),
         card("Progress", el("div", null,
             kv("Stages", `${completedStages}/${expectedStages || "—"}`), progressBar(expectedStages ? completedStages / expectedStages : 0),
