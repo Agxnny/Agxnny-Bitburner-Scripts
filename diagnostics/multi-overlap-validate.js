@@ -4,41 +4,46 @@ import { readOverlapEvidence, recordOverlapWave } from "/lib/multi-overlap-evide
 import { publishOverlapValidationState } from "/lib/overlap-validation-state.js";
 import { targetOverlapPolicy } from "/lib/multi-overlap-policy.js";
 import { RuntimePort, readBatchHistoryState, readControllerState, readPlannerState } from "/lib/runtime-state.js";
-import { positionalArgs } from "/lib/output.js";
+import { isQuiet, positionalArgs } from "/lib/output.js";
 
 const DEFAULT_WAVES = 2, DEFAULT_HACK_FRACTION = 0.10, DEFAULT_STAGE_GAP_MS = 200;
 const DEPTH = 2, DISPATCH_LEAD_MS = 100, LOOP_MS = 20, COMPLETE_GRACE_MS = 2_000;
 const MONEY_TOLERANCE = 0.995, SECURITY_TOLERANCE = 0.05, MAX_LANDING_ERROR_MS = 150, MIN_SPACING_MS = 75;
+const ALLOW_UNQUALIFIED_FLAG = "--allow-unqualified";
 
 /** Dedicated real same-target depth-2 validator. @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
-    const args = positionalArgs(ns);
+    const quiet = isQuiet(ns);
+    const allowUnqualified = ns.args.some((arg) => String(arg).toLowerCase() === ALLOW_UNQUALIFIED_FLAG);
+    const args = positionalArgs(ns).filter((arg) => String(arg).toLowerCase() !== ALLOW_UNQUALIFIED_FLAG);
     const requestedTarget = String(args[0] ?? "auto").trim();
     const waves = clampInt(Number(args[1] ?? DEFAULT_WAVES), 1, 6);
     const hackFraction = clamp(Number(args[2] ?? DEFAULT_HACK_FRACTION), 0.001, 0.50);
     const stageGapMs = clampInt(Number(args[3] ?? DEFAULT_STAGE_GAP_MS), 75, 1000);
     const startedAt = Date.now();
-    const base = { pid: ns.pid, requestedTarget, requestedWaves: waves, hackFraction, stageGapMs, depth: DEPTH, startedAt };
+    const base = { pid: ns.pid, requestedTarget, requestedWaves: waves, hackFraction, stageGapMs, depth: DEPTH, startedAt, allowUnqualified };
 
     const preflight = preflightCheck(ns);
     if (!preflight.ok) return stopEarly(ns, base, "BLOCKED", preflight.reason);
     const planner = readPlannerState(ns), history = readBatchHistoryState(ns), evidence = readOverlapEvidence(ns);
-    const target = chooseTarget(ns, planner, history, evidence, requestedTarget, hackFraction, stageGapMs);
+    const target = chooseTarget(ns, planner, history, evidence, requestedTarget, hackFraction, stageGapMs, allowUnqualified);
     if (!target.ok) return stopEarly(ns, base, "BLOCKED", target.reason);
 
-    ns.tprint("=== SAME-TARGET OVERLAP VALIDATOR · REAL DEPTH 2 ===");
-    ns.tprint(`[OVERLAP-VALIDATE] Target ${target.hostname} · ${waves} wave(s) · hack ${(hackFraction * 100).toFixed(1)}% · gap ${stageGapMs}ms`);
+    if (!quiet) {
+        ns.tprint("=== SAME-TARGET OVERLAP VALIDATOR · REAL DEPTH 2 ===");
+        ns.tprint(`[OVERLAP-VALIDATE] Target ${target.hostname} · ${waves} wave(s) · hack ${(hackFraction * 100).toFixed(1)}% · gap ${stageGapMs}ms${allowUnqualified ? " · explicit qualification test" : ""}`);
+    }
     ns.getPortHandle(RuntimePort.BATCH_TIMING_EVENTS).clear();
     let clean = 0;
-    await publishOverlapValidationState(ns, { ...base, target: target.hostname, status: "STARTING", reason: "Validation admitted", currentWave: 0, cleanWaves: 0, inFlight: [] });
+    await publishOverlapValidationState(ns, { ...base, target: target.hostname, status: "STARTING", reason: allowUnqualified && !target.policy.eligibleForValidation ? "Explicit prepared-target qualification admitted" : "Validation admitted", currentWave: 0, cleanWaves: 0, inFlight: [] });
 
     for (let wave = 1; wave <= waves; wave += 1) {
         if (!controllerStillStandby(ns)) return stopEarly(ns, { ...base, target: target.hostname, currentWave: wave, cleanWaves: clean }, "ABORTED", "Controller left STANDBY");
         if (!isPrepared(ns, target.hostname)) return stopEarly(ns, { ...base, target: target.hostname, currentWave: wave, cleanWaves: clean }, "BLOCKED", `${target.hostname} is no longer prepared`);
         const result = await runWave(ns, target.entry, wave, hackFraction, stageGapMs, base, clean, waves);
         await recordOverlapWave(ns, result);
-        ns.tprint(`[OVERLAP-VALIDATE] Wave ${wave}/${waves} ${result.healthy ? "CLEAN" : "FAILED"} | spacing ${fmt(result.minimumSpacingMs)} | drift ${fmt(result.maxAbsLandingErrorMs)} | ${result.reason}`);
+        if (!quiet) ns.tprint(`[OVERLAP-VALIDATE] Wave ${wave}/${waves} ${result.healthy ? "CLEAN" : "FAILED"} | spacing ${fmt(result.minimumSpacingMs)} | drift ${fmt(result.maxAbsLandingErrorMs)} | ${result.reason}`);
         if (!result.healthy) {
             await publishOverlapValidationState(ns, { ...base, target: target.hostname, status: result.status, reason: result.reason, currentWave: wave, cleanWaves: clean, lastResult: result, inFlight: [] });
             return;
@@ -48,7 +53,7 @@ export async function main(ns) {
     }
     const durable = readOverlapEvidence(ns)?.targets?.[target.hostname];
     await publishOverlapValidationState(ns, { ...base, target: target.hostname, status: "COMPLETE", reason: `${clean}/${waves} clean; proven depth ${Number(durable?.provenDepth ?? 1)}`, currentWave: waves, cleanWaves: clean, provenDepth: Number(durable?.provenDepth ?? 1), inFlight: [] });
-    ns.tprint(`[OVERLAP-VALIDATE] COMPLETE: ${clean}/${waves} clean this run · durable consecutive ${Number(durable?.consecutiveClean ?? 0)} · proven depth ${Number(durable?.provenDepth ?? 1)}`);
+    if (!quiet) ns.tprint(`[OVERLAP-VALIDATE] COMPLETE: ${clean}/${waves} clean this run · durable consecutive ${Number(durable?.consecutiveClean ?? 0)} · proven depth ${Number(durable?.provenDepth ?? 1)}`);
 }
 
 async function runWave(ns, entry, wave, hackFraction, stageGapMs, base, clean, requestedWaves) {
@@ -121,10 +126,17 @@ function summarizeBatch(batch) {
     return { stages, orderCorrect, missingJobs: stages.reduce((sum, s) => sum + s.missingJobs, 0), maxAbsLandingErrorMs: Math.max(...stages.map((s) => Math.abs(s.landingErrorMs))), minimumSpacingMs: Number.isFinite(spacing) ? spacing : 0 };
 }
 
-function chooseTarget(ns, planner, history, evidence, requestedTarget, hackFraction, stageGapMs) {
+function chooseTarget(ns, planner, history, evidence, requestedTarget, hackFraction, stageGapMs, allowUnqualified) {
     const candidates = (Array.isArray(planner?.rankings) ? planner.rankings : []).map((entry) => ({ entry, hostname: entry.hostname, template: buildPreparedBatchTemplate(ns, entry, hackFraction, stageGapMs), policy: targetOverlapPolicy(history, entry.hostname, evidence) }));
-    if (requestedTarget && requestedTarget.toLowerCase() !== "auto") { const found = candidates.find((c) => c.hostname === requestedTarget); if (!found) return { ok: false, reason: `${requestedTarget} is not an eligible planner target` }; if (!found.template.ok || !found.template.preparedNow) return { ok: false, reason: `${requestedTarget} is not prepared` }; if (!found.policy.eligibleForValidation) return { ok: false, reason: `${requestedTarget} is not depth-2 validation eligible: ${found.policy.reason}` }; return { ok: true, ...found }; }
-    const found = candidates.find((c) => c.template.ok && c.template.preparedNow && c.policy.eligibleForValidation && c.policy.provenDepth < 2); return found ? { ok: true, ...found } : { ok: false, reason: "No prepared, pipeline-qualified target still needs dedicated depth-2 proof" };
+    if (requestedTarget && requestedTarget.toLowerCase() !== "auto") {
+        const found = candidates.find((c) => c.hostname === requestedTarget);
+        if (!found) return { ok: false, reason: `${requestedTarget} is not an eligible planner target` };
+        if (!found.template.ok || !found.template.preparedNow) return { ok: false, reason: `${requestedTarget} is not prepared` };
+        if (!allowUnqualified && !found.policy.eligibleForValidation) return { ok: false, reason: `${requestedTarget} is not depth-2 validation eligible: ${found.policy.reason}` };
+        return { ok: true, ...found };
+    }
+    const found = candidates.find((c) => c.template.ok && c.template.preparedNow && c.policy.eligibleForValidation && c.policy.provenDepth < 2);
+    return found ? { ok: true, ...found } : { ok: false, reason: "No prepared, pipeline-qualified target still needs dedicated depth-2 proof" };
 }
 function preflightCheck(ns) {
     if (ns.getHostname() !== "home") return { ok: false, reason: "Run validator from home" };
@@ -139,7 +151,7 @@ function attachAllocations(batch, allocations) { for (const stage of batch.stage
 function launchStage(ns, batch, stage) { const additionalMsec = Math.max(0, Math.floor(stage.landingAt - Date.now() - stage.durationMs)); for (const a of stage.allocations) { const jobId = `${batch.id}-${stage.name}-${a.hostname}`; const pid = ns.exec(stage.script, a.hostname, a.threads, batch.target, jobId, a.threads, additionalMsec, batch.id, stage.name, stage.landingAt); if (pid <= 0) return { ok: false, reason: `ns.exec failed on ${a.hostname}` }; stage.jobs.push({ pid, hostname: a.hostname }); } stage.launched = true; return { ok: true }; }
 function drainTimingEvents(ns, batches) { const byId = new Map(batches.map((b) => [b.id, b])), port = ns.getPortHandle(RuntimePort.BATCH_TIMING_EVENTS); while (!port.empty()) try { const event = JSON.parse(String(port.read())); if (event?.type !== "BATCH_STAGE_COMPLETE") continue; const batch = byId.get(String(event.batchId ?? "")), stage = batch?.stages.find((s) => s.name === String(event.stage ?? "")); if (stage) stage.events.push(event); } catch {} }
 function cancelAll(ns, batches) { for (const b of batches) for (const s of b.stages) for (const job of s.jobs ?? []) try { ns.kill(job.pid, job.hostname); } catch {} }
-async function stopEarly(ns, base, status, reason) { await publishOverlapValidationState(ns, { ...base, status, reason, inFlight: [] }); ns.tprint(`[OVERLAP-VALIDATE] ${status}: ${reason}`); }
+async function stopEarly(ns, base, status, reason) { await publishOverlapValidationState(ns, { ...base, status, reason, inFlight: [] }); if (!isQuiet(ns)) ns.tprint(`[OVERLAP-VALIDATE] ${status}: ${reason}`); }
 function failed(target, wave, hackFraction, stageGapMs, reason, status = "FAILED") { return { target, runId: `overlap-${Date.now().toString(36)}-${wave}`, status, healthy: false, reason, depth: DEPTH, hackFraction, stageGapMs, maxAbsLandingErrorMs: 0, minimumSpacingMs: 0 }; }
 function clamp(value, min, max) { return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : min; }
 function clampInt(value, min, max) { return Math.floor(clamp(value, min, max)); }
