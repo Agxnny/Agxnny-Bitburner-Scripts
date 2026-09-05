@@ -59,6 +59,7 @@
     "stocks/styles.js",
     "stocks/terminal.js",
     "ui/dashboard.js",
+    "ui/dashboard-launcher.js",
     "ui/actions.js",
     "ui/state.js",
     "ui/styles.js",
