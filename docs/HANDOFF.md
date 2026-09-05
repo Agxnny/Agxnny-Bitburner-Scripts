@@ -4,8 +4,6 @@ GitHub `main` is the source of truth. Read this file first, then fetch the curre
 
 ## Current control modes
 
-The controller now supports four execution modes:
-
 ```text
 STANDBY   control plane online; no target-side worker/coordinator launches
 HGW       normal sequential automation
@@ -13,87 +11,73 @@ BATCH     serialized one-batch-at-a-time HWGW
 PIPELINE  continuous controller-managed depth-2 HWGW
 ```
 
-The controller defaults to **STANDBY**, so `run startup.js` no longer immediately begins hacking work. Planner/economy/controller/UI state still comes online; target-side execution begins only after the user selects HGW, BATCH, or PIPELINE, or explicitly requests Prep + hold.
+`startup.js` defaults the controller to **STANDBY**. Planner/economy/controller/UI processes still run, but target-side execution does not begin until the user chooses a mode or explicitly requests prep.
 
-## Latest real pipeline validation
+## Latest live pipeline state
 
-Four consecutive real overlapping `phantasy` batches were completed across two depth-2 runs. All four reported:
+The standalone depth-2 executor completed four consecutive overlapping `phantasy` batches with 100% money recovery, +0.000 security, correct H → W1 → G → W2 order, and a stable ~6262 ms sustainable cadence in the then-current pool.
 
-```text
-money:    100.00%
-security: +0.000
-order:    H → W1 → G → W2
-```
+The same executor is now controller-integrated in PIPELINE mode and runs its coordinator on **home** while H/G/W workers remain remote. Live depth remains hard-capped at 2 during integration validation. Keep the intra-batch stage gap at 200 ms until rolling timing history exists.
 
-Both runs selected a sustainable cadence of about **6262 ms** with the then-current execution pool. No safety stop occurred.
+## New multi-target allocator scaffold
 
-The 200 ms intra-batch stage gap remains unchanged. Do not reduce it until rolling timing history exists.
+`hacking/multi-target-scheduler.js` is the first planning-only global allocator for the eventual multi-target system.
 
-## Integrated pipeline execution
-
-`hacking/pipeline-runner.js` now supports both finite manual tests and controller-managed continuous mode.
-
-Manual finite test:
+Usage:
 
 ```text
-run hacking/pipeline-runner.js phantasy 0.10 200 2
+run hacking/multi-target-scheduler.js money 4 0.10 200 64
+run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
+run hacking/multi-target-scheduler.js xp 4 0.10 200 64
 ```
 
-Controller mode launches:
+It launches **no workers**. It:
 
-```text
-hacking/pipeline-runner.js <target> <hackFraction> 200 continuous --quiet
-```
+- considers several eligible targets at once;
+- builds a prepared-baseline HWGW template for each;
+- scores candidates for MONEY / BALANCED / XP;
+- uses one shared host/time RAM reservation calendar;
+- protects a global landing spacing floor between batches from different targets;
+- repeatedly admits the highest-value feasible virtual batch;
+- applies a diminishing-returns fairness penalty so a dominant target can receive more depth without trivially starving every secondary target;
+- produces **dynamic per-target depth** rather than a fixed `2 per target` split;
+- publishes the full snapshot to **Port 17** so it does not overwrite the live single-target pipeline state on Port 16.
 
-Hard rules remain:
+Current XP scoring is deliberately labelled a proxy (`ACTION_THREAD_DIFFICULTY_PROXY_PER_RAM_SECOND`), not exact Bitburner XP. It is enough to validate resource allocation behavior before implementing a dedicated XP executor/Formula-based score.
 
-- maximum live depth = 2;
-- stages are launched just in time;
-- RAM is reserved host-by-host over the full process lifetime including dispatch lead;
-- Port 14 has one real pipeline consumer and events are routed by `batchId`;
-- Port 15 receives each latest completed pipeline batch;
-- Port 16 publishes current pipeline executor state;
-- bad order, missing timing events, launch failure, low money recovery, or high security causes a safety stop;
-- an execution-mode change blocks new waves and lets the current admitted depth-2 wave drain before the controller completes the switch.
+## Runtime batching state
 
-If the pipeline safety-stops, the controller enters target recovery/prep and holds the target for inspection. `Resume` clears the reviewed stop and allows PIPELINE mode to restart.
+- Port 12: serialized batch snapshot.
+- Port 14: live batch timing-event queue.
+- Port 15: latest completed serialized/pipeline batch.
+- Port 16: current single-target pipeline planner/simulator/executor.
+- Port 17: global multi-target allocation planner.
 
-## GUI
-
-The compact dashboard remains the main operator surface. Overview has four top metrics, one Quick controls card, compact target/health cards, and Active Workers only when needed.
-
-Quick controls now include:
-
-```text
-Standby | HGW | Batch | Pipeline | Prep + hold | Resume
-```
-
-The Batch tab shows Port 16 pipeline status, depth, cadence, completion count, safety state, latest recovery/timing graph, and collapsible detailed telemetry.
-
-React callbacks remain Netscript-free.
+The current live PIPELINE executor still owns Port 14 while active. The new multi-target allocator is dry-run only and does not consume Port 14.
 
 ## Current important limitations
 
-- Pipeline live depth is intentionally fixed at 2.
-- Port 15 is still one latest-completed snapshot, not rolling history.
-- The old serialized batch runner still clears Port 14 before serialized batches; controller scheduling prevents serialized BATCH and PIPELINE from running concurrently.
-- Pipeline timing tuning still relies on the latest matching completed batch rather than a rolling history.
+- Live PIPELINE depth is still fixed at 2.
+- Multi-target allocation is simulation/planning only.
+- Multi-target candidate templates assume production from a prepared baseline; `preparedNow` is reported separately.
+- Port 15 is latest-only; rolling landing/recovery history is still missing.
+- Timing adaptation still uses latest matching completion rather than several samples.
+- XP scoring is a proxy, not exact hacking XP.
 - Automatic worker watchdog termination remains deferred.
-- Controller-managed PIPELINE currently expects a fully prepared baseline before executor admission; keep current testing on the validated full-money target path while integrated behavior is being validated.
 
 ## Immediate next development sequence
 
 ```text
-1. Pull and run startup.js; confirm initial mode is STANDBY with zero target-side jobs
-2. Select the intended target and choose PIPELINE from the GUI
-3. Confirm controller prep occurs automatically, then continuous depth-2 execution starts
-4. Verify Port 16/Batch tab shows in-flight depth <= 2 and healthy repeated waves
-5. Switch PIPELINE → STANDBY during a live wave and confirm no new wave is admitted while current work drains safely
-6. Repeat PIPELINE startup/drain/restart validation
-7. Add rolling landing/recovery history across integrated pipeline batches
-8. Base future timing adaptation on several samples, not Port 15 alone
-9. Only raise live depth above 2 after repeated integrated validation
-10. Keep automatic worker killing deferred until pipeline timing is stable
+1. Finish continuous PIPELINE + PIPELINE→STANDBY drain validation
+2. Pull/run the multi-target scheduler in MONEY, BALANCED, and XP profiles
+3. Inspect whether dynamic allocation gives dominant targets more depth while retaining viable secondary targets
+4. Tune fairness/global landing spacing from the dry-run results
+5. Add rolling per-target landing/recovery history
+6. Extract/reuse shared batch-template + host-reservation code to prevent planner/executor divergence
+7. Build a persistent multi-target admission simulation using Port 17
+8. First real multi-target test: global live depth 2, per-target depth 1, two targets
+9. Evolve to dynamic per-target depth with one global RAM/time calendar
+10. Keep automatic worker killing deferred until multi-target timing is stable
 ```
 
 ## Useful commands
@@ -102,6 +86,9 @@ React callbacks remain Netscript-free.
 run startup.js
 run diagnostics/mem-audit.js
 run hacking/batch-scheduler.js phantasy 0.10 200
+run hacking/multi-target-scheduler.js money 4 0.10 200 64
+run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
+run hacking/multi-target-scheduler.js xp 4 0.10 200 64
 run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
 
