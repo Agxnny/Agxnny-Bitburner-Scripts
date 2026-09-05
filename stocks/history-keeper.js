@@ -57,10 +57,10 @@ function collectSnapshot(ns) {
         status: "RECORDING",
         updatedAt: Date.now(),
         access: {
-            wse: Boolean(safe(() => ns.stock.hasWSEAccount(), false)),
-            tix: Boolean(safe(() => ns.stock.hasTIXAPIAccess(), false)),
+            wse: Boolean(safe(() => ns.stock.hasWseAccount(), false)),
+            tix: Boolean(safe(() => ns.stock.hasTixApiAccess(), false)),
             fourS: Boolean(safe(() => ns.stock.has4SData(), false)),
-            fourSApi: Boolean(safe(() => ns.stock.has4SDataTIXAPI(), false)),
+            fourSApi: Boolean(safe(() => ns.stock.has4SDataTixApi(), false)),
         },
         cash: number(safe(() => ns.getServerMoneyAvailable("home"), 0)),
         symbols: rows,
@@ -82,8 +82,21 @@ function position(ns, symbol) {
 }
 
 async function publishUnavailable(ns, reason) {
-    await writeStockMarketState(ns, { status: "WAITING", reason, access: { wse: false, tix: false, fourS: false, fourSApi: false }, cash: ns.getServerMoneyAvailable("home"), symbols: [], positions: [], portfolio: { longValue: 0, shortValue: 0, grossExposure: 0 } });
+    await writeStockMarketState(ns, {
+        status: "WAITING",
+        reason,
+        access: {
+            wse: Boolean(safe(() => ns.stock.hasWseAccount(), false)),
+            tix: Boolean(safe(() => ns.stock.hasTixApiAccess(), false)),
+            fourS: Boolean(safe(() => ns.stock.has4SData(), false)),
+            fourSApi: Boolean(safe(() => ns.stock.has4SDataTixApi(), false)),
+        },
+        cash: ns.getServerMoneyAvailable("home"),
+        symbols: [],
+        positions: [],
+        portfolio: { longValue: 0, shortValue: 0, grossExposure: 0 },
+    });
 }
-function hasTix(ns) { return Boolean(safe(() => ns.stock.hasTIXAPIAccess(), false)); }
+function hasTix(ns) { return Boolean(safe(() => ns.stock.hasTixApiAccess(), false)); }
 function safe(fn, fallback) { try { return fn(); } catch { return fallback; } }
 function number(value) { const n = Number(value); return Number.isFinite(n) ? n : 0; }
