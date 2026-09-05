@@ -8,6 +8,7 @@ import {
     normalizeObjectiveScores,
     tryReserve,
 } from "/lib/batch-allocation.js";
+import { multiTargetRankings } from "/lib/multi-target-ranking.js";
 import {
     RuntimePort,
     publishLastCompletedBatchState,
@@ -94,7 +95,7 @@ export async function main(ns) {
     const economic = readEconomyTargetState(ns);
     const pool = getExecutionPool(ns, planner);
     const weights = PROFILE_WEIGHTS[profile];
-    const templates = sourceRankings(planner, economic, profile)
+    const templates = multiTargetRankings(planner, economic, profile)
         .slice(0, targetCount)
         .map((entry) => buildPreparedBatchTemplate(ns, entry, hackFraction, stageGapMs, { dispatchLeadMs: DISPATCH_LEAD_MS }))
         .filter((entry) => entry.ok);
@@ -464,13 +465,6 @@ function publishState(ns, profile, globalLiveDepth, status, reason, batches, com
         })),
         updatedAt: Date.now(),
     });
-}
-
-function sourceRankings(planner, economic, profile) {
-    if (profile === "xp") return Array.isArray(planner?.rankings) ? planner.rankings : [];
-    const economicRows = Array.isArray(economic?.rankings) ? economic.rankings : [];
-    if (economicRows.length >= 2) return economicRows;
-    return Array.isArray(planner?.rankings) ? planner.rankings : [];
 }
 
 function scriptForStage(name) {
