@@ -58,7 +58,7 @@ Neither multi-target planning script, the prepper, nor the batch-history collect
 
 Port 15 accepts compatible serialized and pipeline completion payloads. It remains latest-only. `hacking/batch-history.js` watches this snapshot and folds genuinely new completed batches into Port 19.
 
-The collector treats the Port 15 snapshot already present at collector startup as stale/observed, requires a completion timestamp at or after collector startup, and keeps a set of previously seen batch IDs. This prevents restarts or replayed latest-value snapshots from manufacturing extra safety evidence.
+The collector treats the Port 15 snapshot already present at collector startup as stale/observed, requires a completion timestamp at or after collector startup, and deduplicates batch IDs. This prevents restarts or replayed latest-value snapshots from manufacturing extra safety evidence.
 
 ## Port 16 — single-target pipeline state
 
@@ -72,23 +72,48 @@ PIPELINE_EXECUTOR_DEPTH2_V2
 
 ## Port 17 — global multi-target planner / simulator
 
-Two planning-only writers currently use Port 17.
-
-One-shot allocator, `hacking/multi-target-scheduler.js`:
+One-shot allocator:
 
 ```text
 MULTI_TARGET_ALLOCATOR_DRY_RUN_V2_SHARED
 ```
 
-Persistent simulator, `hacking/multi-target-sim.js`:
+Persistent simulator current model:
 
 ```text
-MULTI_TARGET_ADMISSION_SIM_V2_PERSISTENT
+MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED
 ```
 
-Both launch no workers. The one-shot allocator produces a static global reservation snapshot. The persistent simulator continuously expires virtual reservations, refreshes target readiness and live remote capacity, and re-admits new virtual work.
+The persistent simulator remains planning-only and launches no workers. It continuously expires virtual reservations, refreshes target readiness and live remote capacity, and re-admits work through one shared global host/time RAM calendar.
 
-Only targets at >=99.5% money and <=+0.05 security receive persistent production admissions. Other candidates remain `WAITING_PREP` while the Port 18 prepper works independently.
+Port 19 `recommendedDepth` is now enforced as a hard per-target virtual admission cap. No trusted pipeline history means depth 1. Targets with clean real pipeline evidence may earn higher simulated caps. If an already-running virtual depth exceeds a newly reduced cap, existing virtual batches are not killed; new admissions pause until depth naturally falls below the cap.
+
+Important state fields now include:
+
+```text
+version: 3
+model: MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED
+enforcesBatchHistoryDepthCap: true
+batchHistory.online
+batchHistory.model
+batchHistory.updatedAt
+targets[].activeDepth
+targets[].safetyDepthCap
+targets[].safetyConfidence
+targets[].pipelineEvidence
+targets[].consecutiveCleanPipeline
+targets[].latestPipelineHealthy
+targets[].safetyReason
+```
+
+Target scheduler states include:
+
+```text
+WAITING_PREP
+READY
+RUNNING
+AT_SAFETY_CAP
+```
 
 ## Port 18 — dedicated prepper / reserved-host state
 
@@ -129,9 +154,9 @@ maxSecurityDelta
 samples[]
 ```
 
-A clean sample currently requires correct stage order, zero missing timing jobs, >=99.5% money recovery, <=+0.05 security, <=150 ms maximum absolute landing error, and >=75 ms minimum observed spacing.
+A clean sample requires correct stage order, zero missing timing jobs, >=99.5% money recovery, <=+0.05 security, <=150 ms maximum absolute landing error, and >=75 ms minimum observed spacing.
 
-Higher depth recommendations now require consecutive clean **pipeline** samples. Serialized single-batch completions may remain in history for diagnostics but cannot promote the target above depth 1.
+Higher depth recommendations require consecutive clean **pipeline** samples. Serialized single-batch completions may remain in history for diagnostics but cannot promote a target above depth 1.
 
 ```text
 0-1 consecutive clean pipeline samples -> depth 1 / UNPROVEN
@@ -139,8 +164,6 @@ Higher depth recommendations now require consecutive clean **pipeline** samples.
 4-7 consecutive clean pipeline samples -> depth 4 / MEDIUM
 8+ consecutive clean pipeline samples  -> depth 8 / HIGH
 ```
-
-This is advisory only for now. The persistent simulator has not yet been wired to enforce the recommendation; that remains the next safety step before real multi-target execution.
 
 ## GUI rule
 
