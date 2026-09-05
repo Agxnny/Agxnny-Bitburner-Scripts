@@ -16,6 +16,7 @@ const HEARTBEAT_MS = 1_000;
  * Distributed background target prepper.
  * Periodically scans every rooted/hackable money target and reserves a bounded
  * slice of remote RAM. Multiple reserved hosts may prep different targets.
+ * Money restoration is intentionally prioritized before security cleanup.
  *
  * Usage: run hacking/prepper.js [reserveRatio] [minReserveGb] [maxReserveGb]
  * @param {NS} ns
@@ -104,6 +105,7 @@ export async function main(ns) {
                 version: 2,
                 model: "DISTRIBUTED_TARGET_PREPPER_V2",
                 enabled: true,
+                policy: "GROW_THEN_WEAKEN",
                 status,
                 reason: status === "BLOCKED" ? "No remote RAM hosts available for prep reserve"
                     : status === "IDLE_PREPARED" ? `All ${targets.length} eligible target(s) prepared`
@@ -175,7 +177,7 @@ function targetProgress(ns, target, activeJob, queueIndex, reservations) {
     const money = Math.max(0, ns.getServerMoneyAvailable(hostname));
     const moneyRatio = maxMoney > 0 ? money / maxMoney : 1;
     const securityDelta = Math.max(0, ns.getServerSecurityLevel(hostname) - ns.getServerMinSecurityLevel(hostname));
-    const action = activeJob?.action ?? (securityDelta > SECURITY_READY_DELTA ? "WEAKEN" : "GROW");
+    const action = activeJob?.action ?? nextPrepAction(moneyRatio, securityDelta);
     const etaMs = estimatePrepEtaMs(ns, hostname, money, maxMoney, securityDelta, activeJob, queueIndex, reservations);
     return {
         hostname,
@@ -191,20 +193,31 @@ function targetProgress(ns, target, activeJob, queueIndex, reservations) {
     };
 }
 
+function nextPrepAction(moneyRatio, securityDelta) {
+    if (moneyRatio < MONEY_READY_RATIO) return "GROW";
+    if (securityDelta > SECURITY_READY_DELTA) return "WEAKEN";
+    return "READY";
+}
+
 function estimatePrepEtaMs(ns, target, money, maxMoney, securityDelta, activeJob, queueIndex, reservations) {
     const hostCount = Math.max(1, reservations.length);
     const queueRounds = activeJob ? 0 : Math.floor(Math.max(0, queueIndex) / hostCount);
     const growTime = Math.max(1, ns.getGrowTime(target));
     const weakenTime = Math.max(1, ns.getWeakenTime(target));
+    const moneyRatio = maxMoney > 0 ? money / maxMoney : 1;
+    let growThreads = 0;
     let workMs = 0;
-    if (securityDelta > SECURITY_READY_DELTA) workMs += weakenTime;
-    if (maxMoney > 0 && money / maxMoney < MONEY_READY_RATIO) {
-        let growThreads = 1;
+
+    if (moneyRatio < MONEY_READY_RATIO) {
         try { growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, maxMoney / Math.max(1, money), 1))); } catch { growThreads = 1; }
         const growRam = Math.max(0.001, ns.getScriptRam(WORKER_SCRIPTS.GROW, "home"));
         const bestCapacity = Math.max(1, ...reservations.map((host) => Math.floor(Number(host.maxRam ?? 0) / growRam)));
         workMs += Math.max(1, Math.ceil(growThreads / bestCapacity)) * growTime;
     }
+
+    const projectedSecurityDelta = securityDelta + (growThreads > 0 ? ns.growthAnalyzeSecurity(growThreads) : 0);
+    if (projectedSecurityDelta > SECURITY_READY_DELTA) workMs += weakenTime;
+
     const queueUnit = Math.max(growTime, weakenTime);
     let eta = workMs + queueRounds * queueUnit;
     if (activeJob) {
@@ -215,18 +228,23 @@ function estimatePrepEtaMs(ns, target, money, maxMoney, securityDelta, activeJob
 }
 
 function choosePrepWave(ns, host, target) {
-    const weakenPerThread = Math.max(0.000001, ns.weakenAnalyze(1, 1));
-    const securityDelta = Math.max(0, ns.getServerSecurityLevel(target) - ns.getServerMinSecurityLevel(target));
-    if (securityDelta > SECURITY_READY_DELTA) {
-        return { ok: true, action: "WEAKEN", script: WORKER_SCRIPTS.WEAKEN, requestedThreads: Math.max(1, Math.ceil((securityDelta - SECURITY_READY_DELTA) / weakenPerThread)) };
-    }
     const maxMoney = Math.max(0, ns.getServerMaxMoney(target));
     const money = Math.max(0, ns.getServerMoneyAvailable(target));
-    if (!(maxMoney > 0) || money / maxMoney >= MONEY_READY_RATIO) return { ok: false };
-    let growThreads = 1;
-    try { growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, maxMoney / Math.max(1, money), 1))); } catch { growThreads = 1; }
-    const ram = Math.max(0.001, ns.getScriptRam(WORKER_SCRIPTS.GROW, "home"));
-    return { ok: true, action: "GROW", script: WORKER_SCRIPTS.GROW, requestedThreads: Math.min(growThreads, Math.max(1, Math.floor(ns.getServerMaxRam(host) / ram))) };
+    const moneyRatio = maxMoney > 0 ? money / maxMoney : 1;
+
+    if (maxMoney > 0 && moneyRatio < MONEY_READY_RATIO) {
+        let growThreads = 1;
+        try { growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, maxMoney / Math.max(1, money), 1))); } catch { growThreads = 1; }
+        const ram = Math.max(0.001, ns.getScriptRam(WORKER_SCRIPTS.GROW, "home"));
+        return { ok: true, action: "GROW", script: WORKER_SCRIPTS.GROW, requestedThreads: Math.min(growThreads, Math.max(1, Math.floor(ns.getServerMaxRam(host) / ram))) };
+    }
+
+    const securityDelta = Math.max(0, ns.getServerSecurityLevel(target) - ns.getServerMinSecurityLevel(target));
+    if (securityDelta > SECURITY_READY_DELTA) {
+        const weakenPerThread = Math.max(0.000001, ns.weakenAnalyze(1, 1));
+        return { ok: true, action: "WEAKEN", script: WORKER_SCRIPTS.WEAKEN, requestedThreads: Math.max(1, Math.ceil((securityDelta - SECURITY_READY_DELTA) / weakenPerThread)) };
+    }
+    return { ok: false };
 }
 
 function foreignProcessesOnHost(ns, hostname) { return ns.ps(hostname).length > 0; }
