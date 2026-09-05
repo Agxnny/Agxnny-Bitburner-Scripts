@@ -1,178 +1,148 @@
 # Development Roadmap
 
-This roadmap is ordered by dependency and risk, not by novelty. Correctness of the single-batch path comes before higher throughput.
+This roadmap is dependency/risk ordered. The current focus is proving and then safely consuming heterogeneous same-target overlap evidence.
 
-## Stage A — current: single automatic HWGW correctness
+## Completed foundations
 
-Status: **in progress**.
+### Core automation
+- remote-only H/G/W execution pool;
+- planner, economic target selector, tactical planner, telemetry, rooting/deployment;
+- controller modes STANDBY/HGW/BATCH/PIPELINE/MULTI;
+- safe-boundary mode transitions;
+- manual target override and persistent savings/spending lock.
 
-Already implemented:
+### Batch correctness and observability
+- synchronized serialized HWGW;
+- corrected grow-security compensation;
+- whole-batch host/time reservation;
+- timing events with planned/actual landing data;
+- recovery/order/missing/drift/spacing safety checks;
+- Port 15 latest completion and Port 19 rolling real history.
 
-- timing-capable H/G/W workers;
-- one-shot synchronized HWGW batch runner;
-- whole-batch RAM pre-reservation;
-- Port 12 batch state;
-- controller `HGW` / `BATCH` runtime modes;
-- GUI execution-mode selector;
-- automatic batch foundation prep;
-- full-batch strategic review barrier;
-- batch-associated hack telemetry ignored until full completion;
-- safety correction prep when a completed batch leaves money/security off baseline.
+### Pipeline
+- real continuous same-target depth-2 executor;
+- central Port 14 routing by batch id;
+- safe drain on mode switch;
+- controller integration and GUI telemetry.
 
-Current blocker:
+### Multi-target
+- shared global host/time calendar;
+- planning-only one-shot allocator and persistent simulator;
+- real finite multi-target executor with configurable global depth;
+- controller-managed repeated finite waves;
+- MONEY/BALANCED/XP profiles;
+- prep-aware progressive global stress test;
+- durable global stress evidence.
 
-- security compensation can be under-calculated. Latest automatic `sigma-cosmetics` batch used `25H / 1W / 298G / 1W` and ended at `+1.13` security.
+### Preparation
+- adaptive distributed prepper;
+- full eligible-target scans;
+- bounded multi-host reserve;
+- money-first GROW then security cleanup;
+- adaptive concentration vs spread;
+- same-target multi-host prep;
+- full-prep ETA telemetry and GUI card.
 
-Exit criteria:
+### Target-local overlap validation
+- durable V2 evidence keyed by target and depth;
+- depth ladder 2–12;
+- legacy depth-2 qualification;
+- configurable real depth-N validator;
+- individual automatic full-depth climb;
+- sequential PROVEN2+ set full-depth climb;
+- Validation tab with live/evidence visibility.
 
-- several consecutive automatic batches recover money and security without standalone correction phases;
-- predicted security effects agree with observed recovery;
-- batch failure states remain safe.
+### GUI and stock research
+- modular seven-tab main dashboard with Netscript-free React callbacks;
+- diagnostics health/test controls;
+- separate stock Market Lab;
+- all-new stock history retained with wall-clock timestamps/gaps;
+- true 5m/15m/30m/1h/4h candlesticks plus full-history line view;
+- stock trading remains disabled.
 
-## Stage B — batch observability and calibration
+## Current stage — runtime prove heterogeneous depth
 
-After security math is fixed:
+Run individual and PROVEN2+ set full-depth validation across representative prepared targets. Confirm:
 
-- publish predicted final money/security alongside actual final state;
-- record per-stage predicted security contributions;
-- capture planned vs actual landing timing if practical;
-- expose batch health/recovery clearly in GUI;
-- add batch history or rolling aggregate telemetry if useful without bloating persistent RAM;
-- classify failures: target not prepared, RAM insufficient, launch failure, recovery drift, timing drift.
+- depth evidence persists independently;
+- higher failure preserves lower proof;
+- RAM ceiling is neutral rather than destructive;
+- timing/recovery failure is classified correctly;
+- set coordinator continues across targets where appropriate;
+- GUI process/telemetry state remains accurate.
 
-Goal: make batch behavior explainable before increasing concurrency.
+Exit condition: enough representative runtime evidence to trust the depth-N validator as the admission authority for the next production experiment.
 
-## Stage C — adaptive timing
+## Next — target-stream trajectory validation
 
-Current fixed landing gap: 200 ms.
+Deep production overlap cannot rely only on each batch's final target state because later hacks can land before earlier batches are finalized.
 
-Once measured drift exists:
+Add target-stream validation that checks:
+- complete global/target landing sequence;
+- expected money/security trajectory or steady-state envelope;
+- recovery margin through the stream;
+- missing/order/drift/spacing failures;
+- clean termination and final recovery.
 
-- calculate safe minimum gap from observed timing variance;
-- optionally maintain conservative per-session gap tuning;
-- avoid overfitting to one target or one machine/session;
-- retain a minimum safety floor.
+Exit condition: a validator can safely judge tighter interleaved depth >2 without false failures from legitimate later-batch effects.
 
-Goal: improve throughput without sacrificing stage ordering.
+## Next — heterogeneous production MULTI
 
-## Stage D — overlapping/pipelined batches
+Replace the current production uniqueness guard with evidence-gated target-local admission.
 
-Only start after Stages A–C are stable.
+Requirements:
+- production uses `provenDepth`, never candidate depth;
+- global stress proof remains a separate ceiling;
+- batch opportunities are ranked marginally, not one slot per target;
+- scheduler can produce A×5 + B×2 + C×1 when evidence/value/capacity justify it;
+- target-local failure can pause/fallback that target without unnecessarily erasing other target proof;
+- system-wide reservation/timing corruption still triggers global safety stop.
 
-Required scheduler capabilities:
+## Next — concentrated vs distributed optimization
 
-- multiple batch ids in flight;
-- complete RAM reservation across all in-flight stages;
-- collision-free landing slots;
-- maximum safe batch depth based on RAM and weaken time;
-- no strategic review after each individual batch hack;
-- controlled review boundary after an appropriate production window or scheduler checkpoint;
-- failure cancellation/recovery rules;
-- scheduler visibility in GUI/state.
+Evaluate portfolios such as SINGLE HEAVY, DUAL, and DISTRIBUTED using:
+- expected and realized $/sec;
+- $/RAM-second;
+- global in-flight slot cost;
+- target-local recovery margin;
+- timing pressure and proof confidence.
 
-The current `batch-runner.js` is a useful correctness primitive, but a pipelined scheduler may eventually become a separate orchestration layer rather than repeatedly spawning isolated runners.
+Repeated batches on a premium target should win only while their marginal efficiency beats opening/adding a lower-value target.
 
-## Stage E — controller / dispatcher split
+## Next — parameter tuning
 
-Persistent home RAM should remain small.
+Add bounded, evidence-aware tuning of:
+- overlap depth;
+- hack fraction;
+- stage gap / batch interval.
 
-High-value refactor:
+Use conservative sweeps/hill-climb around the last proven operating point. Higher failed experiments must fall back to the last proven configuration and enter a cooldown instead of being immediately retried.
 
-```text
-home controller
-    = target/mode/state orchestration
+## Next — continuous refill and AUTOMULTI integration
 
-remote scheduler/dispatcher
-    = ns.exec, RAM reservations, batch timing, worker placement
-```
+Move beyond repeated finite waves toward a continuously filled global calendar. AUTOMULTI becomes the supervisory policy choosing objective and safe learned profiles while the scheduler owns admission/timing mechanics.
 
-Benefits:
+Expose possible/proven/effective target/global settings in the GUI.
 
-- lowers controller RAM on home;
-- centralizes execution reservations;
-- makes service-RAM reservation easier;
-- reduces contention between HGW workers and remote control services such as refresh/cloud buyer;
-- prepares architecture for pipelining and multi-target scheduling.
+## Next — idle prep-reserve validation borrowing
 
-## Stage F — service RAM reservation
+When the prepper has no real work, allow a low-priority auto-validator to borrow unused prep-reserve capacity. Prep has first claim: stop new validation admission when prep demand returns and let already-admitted validation drain safely. Add debounce to avoid thrashing.
 
-Current remote worker pool can consume most free RAM and potentially starve short-lived support services.
+Prioritize valuable prepared/unvalidated targets, then depth promotion, then hack/timing tuning.
 
-Add an explicit remote control-plane reserve or service host policy so these can reliably launch:
+## Later — progression supervisor
 
-- refresh coordinator children;
-- planner/economy jobs;
-- cloud spender;
-- diagnostics launcher;
-- scheduler/batch coordinator.
+Build a supervisory progression graph for backdoors, faction invitations/work, reputation, augmentation money/purchases, and reset/install decisions. Specialized subsystems should execute tasks; progression policy should not be mixed into the hacking scheduler.
 
-This should integrate with the future dispatcher rather than become scattered per-script hacks.
+## Later — stock trading
 
-## Stage G — target/strategy stability and calibration
+Continue collecting pre-4S history. Future stock modules should separate signals, allocation, trading, and supervision; support long/short symmetrically; respect the global savings hierarchy; and only enable autonomous orders after deliberate validation.
 
-Add:
+## Deferred
 
-- target-selection hysteresis;
-- strategy hysteresis;
-- predicted-vs-actual income calibration;
-- predicted-vs-actual prep duration calibration;
-- batch-specific steady-state income model rather than only sequential HGW assumptions.
-
-Goal: prevent unnecessary target thrashing and improve economic decisions with real runtime data.
-
-## Stage H — multi-target optimization
-
-Long-term objective:
-
-- evaluate multiple profitable targets;
-- allocate the whole remote RAM pool across them;
-- schedule independent pipelines without landing collisions;
-- prioritize progression ETA / income rather than simply choosing one best hostname;
-- preserve manual target mode as an explicit override.
-
-This should be built on the dispatcher/reservation layer, not bolted directly into the current controller loop.
-
-## Stage I — progression expansion
-
-The advisor is intentionally structured for future goal types.
-
-Possible future additions:
-
-- more upgrade categories;
-- richer ROI/value scoring;
-- player-progression milestones;
-- tool/program acquisition guidance/automation when capabilities allow;
-- configurable economic priorities.
-
-Keep the distinction:
-
-```text
-advisor selects goal
-executor performs supported action
-```
-
-Do not make individual executors override advisor policy silently.
-
-## Stage J — stock subsystem
-
-Keep stock work separate from hacking control plane.
-
-Future stock work:
-
-- independent terminal strategy/reporting;
-- independent stock GUI;
-- structured stock runtime state;
-- optional integration with global cash/progression planning only when clearly defined.
-
-Do not auto-start unfinished stock systems with the HGW stack.
+- automatic worker watchdog termination until deep scheduler timing is stable;
+- nonessential UI polish that does not improve observability or control safety.
 
 ## Documentation policy
 
-After major changes, update at least:
-
-- `README.md`
-- `docs/HANDOFF.md`
-- `docs/architecture.md`
-- the relevant reference document (`SYSTEM_MAP`, `RUNTIME_STATE`, `TESTING`, or this roadmap).
-
-The purpose is to make a new chat/contributor able to recover the current architecture from the repository itself rather than relying on conversation history.
+After major behavior/architecture changes update the root README, `FEATURES.md`, `HANDOFF.md`, and whichever reference document owns the changed contract. Avoid leaving old milestone text that describes already-completed stages as future work.
