@@ -33,6 +33,7 @@
     "lib/batch-history.js",
     "lib/multi-overlap-evidence.js",
     "lib/multi-overlap-policy.js",
+    "lib/multi-target-tuning.js",
     "lib/overlap-validation-state.js",
     "lib/multi-stress-evidence.js",
     "lib/multi-target-ranking.js",
