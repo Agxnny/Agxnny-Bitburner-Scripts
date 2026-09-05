@@ -21,49 +21,22 @@
 | 13 | Controller requests | Event queue |
 | 14 | Batch timing events | Event queue |
 | 15 | Latest completed batch | Latest-value snapshot |
-| 16 | Pipeline planner/simulation/executor | Latest-value snapshot |
+| 16 | Single-target pipeline planner/simulation/executor | Latest-value snapshot |
+| 17 | Global multi-target allocation planner | Latest-value snapshot |
 
 ## Port 1 — controller state
 
-### `executionMode`
-
-Current mode values are:
+Current execution modes:
 
 ```text
 STANDBY | HGW | BATCH | PIPELINE
 ```
 
-Important fields include:
+Important `executionMode` fields include mode/pending/transition state, serialized and pipeline runner state, pipeline max depth/safety stop, review state, and `lastMessage`. Startup initializes the controller in `STANDBY`.
 
-```text
-mode
-pending
-transitioning
-transitionTarget
-batchGapMs
-batchRunning
-batchRunnerHost
-pipelineRunning
-pipelineRunnerHost
-pipelineMaxDepth
-pipelineSafetyStopped
-awaitingReview
-batchCompletedAt
-lastBatchId
-lastMessage
-```
-
-Startup initializes the controller in `STANDBY`.
-
-`pipelineRunning` means the controller owns a continuous depth-2 pipeline coordinator. `pipelineSafetyStopped` means automatic pipeline admission has been blocked and the target is being/has been prepared for review.
-
-### `execution.activeWorkers`
-
-Standalone/prep H/G/W allocations continue to publish PID, host, threads, action, target, start time, expected duration, and expected finish time. `LATE` remains presentation-only; no watchdog kill is enabled.
+Standalone/prep H/G/W allocations continue to publish PID, host, threads, action, target, start time, expected duration, and expected finish time. GUI `LATE` labels remain presentation-only.
 
 ## Port 13 — controller requests
-
-Current commands:
 
 ```text
 PREP_TARGET
@@ -73,81 +46,64 @@ CLEAR_MANUAL_TARGET
 SET_EXECUTION_MODE STANDBY|HGW|BATCH|PIPELINE
 ```
 
-Mode changes wait for a safe boundary. For PIPELINE, the executor stops admitting later waves and drains the already-admitted wave before the controller applies the new mode.
+Mode changes wait for a safe boundary. For PIPELINE, later wave admission stops and the already-admitted wave drains before the controller applies the new mode.
 
 ## Port 14 — batch timing event queue
 
-Batch workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error.
+Workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error. Serialized BATCH and live PIPELINE remain mutually exclusive. The current real pipeline coordinator owns and routes Port 14 by `batchId` while active.
 
-Serialized BATCH and PIPELINE remain mutually exclusive under controller scheduling. A real pipeline coordinator clears stale Port 14 data once at startup, then routes all subsequent events by `batchId` for the duration of the pipeline session.
+The multi-target allocator on Port 17 is dry-run only and does **not** consume Port 14.
 
 ## Port 15 — latest completed batch
 
-Port 15 accepts compatible serialized and pipeline completion payloads. Pipeline completions use the `PIPELINE_HWGW_DEPTH2_V1` model and include `pipeline: true`, `maxDepth: 2`, `batchIntervalMs`, final target state, and landing telemetry.
+Port 15 accepts compatible serialized and pipeline completion payloads. It remains latest-only, not rolling history.
 
-Port 15 is still latest-only, not rolling history.
+## Port 16 — single-target pipeline state
 
-## Port 16 — pipeline state
-
-### Planner
+Known models:
 
 ```text
 PIPELINE_DRY_RUN_V2_HOST_WINDOWS
-```
-
-### Admission simulation
-
-```text
 PIPELINE_ADMISSION_SIM_V3_DEPTH2
-```
-
-### Real executor
-
-Current executor model:
-
-```text
 PIPELINE_EXECUTOR_DEPTH2_V2
 ```
 
-Key executor fields:
+The real executor publishes continuous/controller-managed flags, target, status/reason, completed and in-flight batches, stage gap, batch interval, recent events, safety state, and drain state.
+
+## Port 17 — global multi-target allocation planner
+
+Published by `hacking/multi-target-scheduler.js` with model:
 
 ```text
-version: 5
-dryRun: false
-simulation: false
-execution: true
-maxDepth: 2
-continuous
-controllerManaged
-target
+MULTI_TARGET_ALLOCATOR_DRY_RUN_V1
+```
+
+Key fields:
+
+```text
+version: 1
+dryRun: true
+launchesWorkers: false
+profile: money | balanced | xp
+targetCount
+requestedHackFraction
+stageGapMs
+globalLandingGapMs
 status
 reason
-requestedBatches
-completedBatches
-stageGapMs
-batchIntervalMs
-inFlight[]
-completedRecent[]
-events[]
-safetyStopped
-safetyReason
-drainRequested
+capacity
+objective
+targets[]
+allocations[]
+hostPeak[]
 updatedAt
 ```
 
-Important statuses include:
+Each `targets[]` entry reports its HWGW thread template, batch RAM/RAM-time, expected cash, money efficiency, XP-proxy efficiency, base score, assigned virtual batch count, allocation share, and whether the target is currently prepared.
 
-```text
-BLOCKED
-RUNNING
-DRAINING_AFTER_STOP
-DRAINING_FOR_MODE_SWITCH
-SAFETY_STOP
-DRAINED_FOR_MODE_SWITCH
-COMPLETE
-```
+`assignedBatches` is intentionally dynamic rather than a fixed per-target depth. `allocations[]` records the virtual global admission order and exact host/stage/thread reservations for inspection.
 
-In controller-managed mode, `continuous: true` and `requestedBatches: 0` mean the executor continues depth-2 waves until a safety stop or controller drain request.
+The current XP metric is explicitly a proxy (`ACTION_THREAD_DIFFICULTY_PROXY_PER_RAM_SECOND`) and must not be treated as exact Bitburner XP.
 
 ## GUI rule
 
