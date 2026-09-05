@@ -1,7 +1,7 @@
 import { publishPrepperState, readPlannerState, readMultiTargetSchedulerState } from "/lib/runtime-state.js";
 import { rankEligibleTargets } from "/lib/targets.js";
 import { isQuiet, positionalArgs } from "/lib/output.js";
-import { choosePrepFocus, prepDemand } from "/hacking/prepper-allocation.js";
+import { choosePrepFocus, estimateFullPrepEta, prepDemand } from "/hacking/prepper-allocation.js";
 
 const MONEY_READY_RATIO = 0.995;
 const SECURITY_READY_DELTA = 0.05;
@@ -89,7 +89,14 @@ export async function main(ns) {
             const remaining = targets
                 .filter((target) => !targetPrepared(ns, target.hostname))
                 .sort((a, b) => priority(b, demand) - priority(a, demand) || a.rank - b.rank);
-            const prepTargets = remaining.map((target, index) => targetProgress(ns, target, activeByTarget.get(target.hostname) ?? [], index, reservations));
+            const prepTargets = remaining.map((target, index) => targetProgress(
+                ns,
+                target,
+                activeByTarget.get(target.hostname) ?? [],
+                index,
+                reservations,
+                lastPlan,
+            ));
             const status = reservations.length === 0 ? "BLOCKED"
                 : prepared.length === targets.length ? "IDLE_PREPARED"
                 : activeJobs.length > 0 ? "RUNNING"
@@ -100,6 +107,7 @@ export async function main(ns) {
                 model: "DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS",
                 enabled: true,
                 policy: "ADAPTIVE_FOCUS_GROW_THEN_WEAKEN",
+                etaModel: "FULL_READY_GROW_PLUS_WEAKEN_V1",
                 status,
                 reason: statusReason(status, targets.length, activeJobs.length),
                 reserveRatio, minReserveGb, maxReserveGb,
@@ -211,7 +219,7 @@ function targetPrepared(ns, hostname) {
         && ns.getServerSecurityLevel(hostname) - ns.getServerMinSecurityLevel(hostname) <= SECURITY_READY_DELTA;
 }
 
-function targetProgress(ns, target, activeJobs, queueIndex, reservations) {
+function targetProgress(ns, target, activeJobs, queueIndex, reservations, lastPlan) {
     const hostname = target.hostname;
     const maxMoney = Math.max(0, ns.getServerMaxMoney(hostname));
     const money = Math.max(0, ns.getServerMoneyAvailable(hostname));
@@ -232,26 +240,25 @@ function targetProgress(ns, target, activeJobs, queueIndex, reservations) {
         activeThreads,
         hosts: activeJobs.map((job) => job.hostname),
         host: activeJobs[0]?.hostname ?? "",
-        etaMs: estimateTargetEta(ns, hostname, demand, activeJobs, queueIndex, reservations),
+        etaMs: estimateTargetEta(ns, hostname, activeJobs, queueIndex, reservations, lastPlan),
     };
 }
 
-function estimateTargetEta(ns, hostname, demand, activeJobs, queueIndex, reservations) {
-    const durationMs = Math.max(1, Number(demand.durationMs ?? 0));
-    if (activeJobs.length) {
-        const oldest = Math.min(...activeJobs.map((job) => Number(job.startedAt ?? Date.now())));
-        return Math.max(0, oldest + durationMs - Date.now());
-    }
-    const capacities = reservations.map((host) => threadCapacity(ns, host, demand.script)).filter((x) => x > 0);
-    const totalCapacity = capacities.reduce((sum, x) => sum + x, 0);
-    const rounds = totalCapacity > 0 ? Math.max(1, Math.ceil(Number(demand.requestedThreads ?? 0) / totalCapacity)) : 1;
-    return (Math.floor(Math.max(0, queueIndex) / Math.max(1, reservations.length)) + rounds) * durationMs;
-}
+function estimateTargetEta(ns, hostname, activeJobs, queueIndex, reservations, lastPlan) {
+    const ownPrepMs = estimateFullPrepEta(
+        ns,
+        hostname,
+        reservations,
+        activeJobs,
+        MONEY_READY_RATIO,
+        SECURITY_READY_DELTA,
+    );
+    if (activeJobs.length || !Number.isFinite(ownPrepMs)) return ownPrepMs;
 
-function threadCapacity(ns, host, script) {
-    if (!script) return 0;
-    const ram = Math.max(0.001, ns.getScriptRam(script, "home"));
-    return Math.max(0, Math.floor(Number(host.maxRam ?? 0) / ram));
+    const width = Math.max(1, Number(lastPlan?.focusWidth ?? 1));
+    const makespan = Math.max(0, Number(lastPlan?.estimatedMakespanMs ?? 0));
+    const queueWaves = Math.floor(Math.max(0, queueIndex) / width);
+    return ownPrepMs + queueWaves * makespan;
 }
 
 function foreignProcessesOnHost(ns, hostname) { return ns.ps(hostname).length > 0; }
