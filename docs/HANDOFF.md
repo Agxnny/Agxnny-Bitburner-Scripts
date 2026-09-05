@@ -5,23 +5,23 @@ GitHub `main` is the source of truth. Read this file first, then fetch the curre
 ## Current control modes
 
 ```text
-STANDBY   control plane online; no target-side worker/coordinator launches
+STANDBY   production controller parked
 HGW       normal sequential automation
 BATCH     serialized one-batch-at-a-time HWGW
 PIPELINE  continuous controller-managed depth-2 HWGW
 ```
 
-`startup.js` defaults the controller to **STANDBY**. Planner/economy/controller/UI processes still run, but target-side execution does not begin until the user chooses a mode or explicitly requests prep.
+`startup.js` defaults the production controller to **STANDBY**. The dedicated prepper is now a separate background maintenance service, so STANDBY means no production hacking/batch/pipeline work; the reserved prep host may still run grow/weaken maintenance to keep eligible targets prepared.
 
 ## Latest live pipeline state
 
 The standalone depth-2 executor completed four consecutive overlapping `phantasy` batches with 100% money recovery, +0.000 security, correct H → W1 → G → W2 order, and a stable ~6262 ms sustainable cadence in the then-current pool.
 
-The same executor is now controller-integrated in PIPELINE mode and runs its coordinator on **home** while H/G/W workers remain remote. Live depth remains hard-capped at 2 during integration validation. Keep the intra-batch stage gap at 200 ms until rolling timing history exists.
+The same executor is controller-integrated in PIPELINE mode and runs its coordinator on **home** while H/G/W workers remain remote. Live depth remains hard-capped at 2 during integration validation. Keep the intra-batch stage gap at 200 ms until rolling timing history exists.
 
-## New multi-target allocator scaffold
+## Multi-target allocator scaffold
 
-`hacking/multi-target-scheduler.js` is the first planning-only global allocator for the eventual multi-target system.
+`hacking/multi-target-scheduler.js` is the planning-only global allocator for the eventual multi-target system.
 
 Usage:
 
@@ -31,53 +31,93 @@ run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
 run hacking/multi-target-scheduler.js xp 4 0.10 200 64
 ```
 
-It launches **no workers**. It:
+It launches **no workers**. It considers several targets at once, scores MONEY/BALANCED/XP candidates, uses one shared host/time reservation calendar, enforces global landing spacing, applies diminishing-return fairness, and produces dynamic per-target depth rather than `2 per target`. Full state is published to **Port 17**.
 
-- considers several eligible targets at once;
-- builds a prepared-baseline HWGW template for each;
-- scores candidates for MONEY / BALANCED / XP;
-- uses one shared host/time RAM reservation calendar;
-- protects a global landing spacing floor between batches from different targets;
-- repeatedly admits the highest-value feasible virtual batch;
-- applies a diminishing-returns fairness penalty so a dominant target can receive more depth without trivially starving every secondary target;
-- produces **dynamic per-target depth** rather than a fixed `2 per target` split;
-- publishes the full snapshot to **Port 17** so it does not overwrite the live single-target pipeline state on Port 16.
+Observed dry-run allocation on the current pool:
 
-Current XP scoring is deliberately labelled a proxy (`ACTION_THREAD_DIFFICULTY_PROXY_PER_RAM_SECOND`), not exact Bitburner XP. It is enough to validate resource allocation behavior before implementing a dedicated XP executor/Formula-based score.
+```text
+MONEY:    phantasy 16 | joesguns 4 | sigma-cosmetics 2
+BALANCED: phantasy 11 | joesguns 4 | sigma-cosmetics 1 | foodnstuff 1
+XP:       joesguns 3  | foodnstuff 2 | sigma-cosmetics 1 | phantasy 1
+```
 
-## Runtime batching state
+The profile objective is therefore materially changing allocation as intended. XP remains an explicit proxy metric, not exact Formula-based XP optimization.
+
+## Dedicated target prepper
+
+`hacking/prepper.js` is now a persistent background service started by `kickstart.js`.
+
+Behavior:
+
+- reserves exactly one remote RAM host while alive;
+- default host selection chooses the smallest rooted execution host with at least 32 GB, falling back to the largest available host if none meet that floor;
+- publishes a heartbeat/state snapshot to **Port 18**;
+- `lib/execution.js` automatically excludes the fresh Port 18 reserved host from HGW/BATCH/PIPELINE/multi-target production capacity;
+- existing production work already on the newly reserved host is allowed to drain naturally;
+- round-robins all currently eligible money targets;
+- performs one grow or weaken wave per visit so one difficult target cannot monopolize prep forever;
+- targets full money (>=99.5%) and near-minimum security (<=+0.05);
+- never hacks and does not write Port 14 batch timing events.
+
+Manual usage remains available:
+
+```text
+run hacking/prepper.js
+run hacking/prepper.js <hostname> 32
+```
+
+The prepper is specifically intended to prevent a future multi-target allocator from stalling because a desirable target has never been prepared.
+
+## Git pull change markers
+
+`gitpull.js` still performs a destructive clean pull, but it now captures each old file's text before deletion and compares it with the freshly downloaded version.
+
+Output semantics:
+
+```text
+UPDATED    file.js              contents actually changed
+REPLACED   file.js (unchanged)  clean-pulled but byte/text-identical
+ADDED      file.js              did not exist locally before pull
+STALE RM   file.js              managed file removed because it left the manifest
+```
+
+The final pull summary includes an `UPDATED` count plus the list of changed files. `gitpull-self-update.js` performs the same comparison for `gitpull.js` during handoff.
+
+## Runtime batching / scheduler state
 
 - Port 12: serialized batch snapshot.
 - Port 14: live batch timing-event queue.
 - Port 15: latest completed serialized/pipeline batch.
 - Port 16: current single-target pipeline planner/simulator/executor.
 - Port 17: global multi-target allocation planner.
+- Port 18: dedicated prepper/reserved-host state.
 
-The current live PIPELINE executor still owns Port 14 while active. The new multi-target allocator is dry-run only and does not consume Port 14.
+The current live PIPELINE executor still owns Port 14 while active. The multi-target allocator is dry-run only and does not consume Port 14. The prepper also does not consume or emit Port 14 timing events.
 
 ## Current important limitations
 
 - Live PIPELINE depth is still fixed at 2.
 - Multi-target allocation is simulation/planning only.
-- Multi-target candidate templates assume production from a prepared baseline; `preparedNow` is reported separately.
+- Multi-target candidate templates still assume production from a prepared baseline; `preparedNow` is reported separately. The new prepper is intended to keep that assumption true over time.
 - Port 15 is latest-only; rolling landing/recovery history is still missing.
 - Timing adaptation still uses latest matching completion rather than several samples.
 - XP scoring is a proxy, not exact hacking XP.
 - Automatic worker watchdog termination remains deferred.
+- Prepper selection/reservation has not yet been surfaced in the GUI.
 
 ## Immediate next development sequence
 
 ```text
-1. Finish continuous PIPELINE + PIPELINE→STANDBY drain validation
-2. Pull/run the multi-target scheduler in MONEY, BALANCED, and XP profiles
-3. Inspect whether dynamic allocation gives dominant targets more depth while retaining viable secondary targets
-4. Tune fairness/global landing spacing from the dry-run results
-5. Add rolling per-target landing/recovery history
-6. Extract/reuse shared batch-template + host-reservation code to prevent planner/executor divergence
-7. Build a persistent multi-target admission simulation using Port 17
-8. First real multi-target test: global live depth 2, per-target depth 1, two targets
-9. Evolve to dynamic per-target depth with one global RAM/time calendar
-10. Keep automatic worker killing deferred until multi-target timing is stable
+1. Pull/start and validate the prepper reserves one remote host on Port 18
+2. Confirm production Remote RAM excludes that host while prepper heartbeat is fresh
+3. Confirm prepper round-robins targets and eventually reports all eligible targets prepared
+4. Re-run MONEY/BALANCED/XP multi-target dry runs with the prepper active
+5. Finish continuous PIPELINE + PIPELINE→STANDBY drain validation
+6. Add rolling per-target landing/recovery history
+7. Extract/reuse shared batch-template + host-reservation code
+8. Build persistent multi-target admission simulation using Port 17
+9. First real multi-target test with conservative global depth
+10. Evolve to dynamic per-target depth with one global RAM/time calendar
 ```
 
 ## Useful commands
@@ -85,6 +125,7 @@ The current live PIPELINE executor still owns Port 14 while active. The new mult
 ```text
 run startup.js
 run diagnostics/mem-audit.js
+run hacking/prepper.js
 run hacking/batch-scheduler.js phantasy 0.10 200
 run hacking/multi-target-scheduler.js money 4 0.10 200 64
 run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
