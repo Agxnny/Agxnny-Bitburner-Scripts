@@ -10,16 +10,9 @@ const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
 const PREPPER_SCRIPT = "/hacking/prepper.js";
 const BATCH_HISTORY_SCRIPT = "/hacking/batch-history.js";
 const STOCK_HISTORY_SCRIPT = "/stocks/history-keeper.js";
+const STOCK_TRADER_SCRIPT = "/stocks/pre4s-trader.js";
 
-/**
- * Prepare the automation stack after a clean pull or before a test run.
- *
- * Stage 0 restores the persisted manual money-goal lock. Stage 2 starts the
- * dedicated background prepper, rolling real batch-history collector, and
- * observation-only stock price recorder before handing off to the controller.
- *
- * @param {NS} ns
- */
+/** Prepare the automation stack after a clean pull or before a test run. @param {NS} ns */
 export async function main(ns) {
     if (ns.getHostname() !== "home") {
         tprint(ns, "ERROR: Run kickstart.js from home.");
@@ -50,7 +43,6 @@ export async function main(ns) {
 
         const deadline = Date.now() + ECONOMIC_TARGET_WAIT_MS;
         let freshEconomicTarget = false;
-
         while (Date.now() < deadline) {
             const economic = readEconomyTargetState(ns);
             const economicPlannerTime = Number(economic?.plannerUpdatedAt ?? 0);
@@ -61,40 +53,37 @@ export async function main(ns) {
             await ns.sleep(100);
         }
 
-        if (!ns.isRunning(PREPPER_SCRIPT, "home")) {
-            const prepperPid = ns.run(PREPPER_SCRIPT, 1, ...inheritedQuiet);
-            if (prepperPid > 0) tprint(ns, "Dedicated prepper started; one remote host will be reserved for target maintenance.");
-            else tprint(ns, "WARNING: Could not start dedicated prepper; production will continue without reserved prep capacity.");
-        }
-
-        if (!ns.isRunning(BATCH_HISTORY_SCRIPT, "home")) {
-            const historyPid = ns.run(BATCH_HISTORY_SCRIPT, 1, ...inheritedQuiet);
-            if (historyPid > 0) tprint(ns, "Rolling real batch-history collector started on Port 19.");
-            else tprint(ns, "WARNING: Could not start batch-history collector; conservative multi-target safety learning will remain unproven.");
-        }
-
-        if (!ns.isRunning(STOCK_HISTORY_SCRIPT, "home")) {
-            const stockHistoryPid = ns.run(STOCK_HISTORY_SCRIPT, 1, ...inheritedQuiet);
-            if (stockHistoryPid > 0) tprint(ns, "Stock history recorder started; observation-only price baseline will persist on home.");
-            else tprint(ns, "WARNING: Could not start stock history recorder; stock baseline collection is offline.");
-        }
+        startBackground(ns, PREPPER_SCRIPT, inheritedQuiet,
+            "Dedicated prepper started; remote reserve is available for target maintenance.",
+            "WARNING: Could not start dedicated prepper; production will continue without reserved prep capacity.");
+        startBackground(ns, BATCH_HISTORY_SCRIPT, inheritedQuiet,
+            "Rolling real batch-history collector started on Port 19.",
+            "WARNING: Could not start batch-history collector; conservative multi-target safety learning will remain unproven.");
+        startBackground(ns, STOCK_HISTORY_SCRIPT, inheritedQuiet,
+            "Stock history recorder started; price history will persist on home.",
+            "WARNING: Could not start stock history recorder; stock baseline collection is offline.");
+        startBackground(ns, STOCK_TRADER_SCRIPT, inheritedQuiet,
+            "Pre-4S trader started with persisted Market Lab risk controls.",
+            "WARNING: Could not start pre-4S trader; Market Lab trading is offline.");
 
         const selected = readPlannerState(ns)?.selectedTarget?.hostname ?? "unknown";
-        if (freshEconomicTarget) {
-            tprint(ns, `Economic target ready: ${selected}. Starting controller...`);
-        } else {
-            tprint(ns, `WARNING: economic target refresh timed out; starting controller with current target ${selected}.`);
-        }
-
+        tprint(ns, freshEconomicTarget
+            ? `Economic target ready: ${selected}. Starting controller...`
+            : `WARNING: economic target refresh timed out; starting controller with current target ${selected}.`);
         ns.spawn("/hacking/controller.js", spawnOptions, ...inheritedQuiet);
     }
 
     tprint(ns, `ERROR: Unknown kickstart stage ${stage}.`);
 }
 
+function startBackground(ns, script, args, ok, fail) {
+    if (ns.isRunning(script, "home")) return;
+    const pid = ns.run(script, 1, ...args);
+    tprint(ns, pid > 0 ? ok : fail);
+}
+
 function restoreManualMoneyGoal(ns) {
     if (!ns.fileExists(MANUAL_GOAL_CONFIG, "home")) return;
-
     try {
         const state = JSON.parse(String(ns.read(MANUAL_GOAL_CONFIG) || "null"));
         if (!state || typeof state !== "object") return;
