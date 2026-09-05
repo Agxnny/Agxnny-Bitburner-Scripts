@@ -170,6 +170,29 @@ The first operational refinement pass is now committed:
 
 React callbacks still only enqueue plain-JS actions. The Netscript loop in `ui/actions.js` performs `ns.run`, PID tracking, and completion polling. Do not move Netscript calls into React callbacks.
 
+### Overview control cleanup
+
+The Overview tab is being treated as a status/control summary rather than a duplicate control surface.
+
+Removed from Overview:
+
+```text
+BATCH launch button
+PIPELINE launch button
+MULTI launch button
+manual Prep + hold button
+```
+
+Overview now keeps only the generic controller actions that are still useful everywhere:
+
+```text
+Standby
+HGW
+Resume safety
+```
+
+MULTI configuration/start remains on the Batch tab. Background prepper operation is automatic and no longer needs a duplicate manual Prep + hold button on Overview. BATCH/PIPELINE backend modes are still present for compatibility/testing; only their redundant Overview buttons were removed. Do not delete backend mode support until it has been explicitly reviewed and proven obsolete.
+
 ### Targets prep-progress card
 
 The Targets tab contains `Servers below max money` using Port 18 prep telemetry. It shows server, money %, active/queued GROW or WEAKEN state, advisory ETA, and current host/security information.
@@ -228,14 +251,14 @@ See `docs/RUNTIME_STATE.md` for the current contract.
 
 ```text
 1. run gitpull.js
-2. restart startup/dashboard so updated ui/actions.js, ui/styles.js, and ui/views/diagnostics.js load
+2. restart startup/dashboard so current UI modules reload
 3. rapidly switch all six tabs repeatedly and confirm the dashboard remains alive/snappy
 4. confirm larger typography is readable without making Batch/Diagnostics unmanageably tall
-5. open Diagnostics and confirm the top verdict is HEALTHY under normal fresh state
-6. click Memory audit and confirm it launches, shows RUNNING + PID, then COMPLETE
-7. click Income / Economy targets / Progression / Target ranking and confirm each launches once and reports completion
-8. confirm clicking another direct diagnostic while one is running reports Busy rather than launching duplicate tracked work
-9. confirm stale State Ages rows change to amber/red as expected if a service is stopped
+5. confirm Overview now shows only Standby / HGW / Resume safety controls
+6. open Diagnostics and confirm the top verdict is HEALTHY under normal fresh state
+7. click Memory audit and confirm it launches, shows RUNNING + PID, then COMPLETE
+8. click Income / Economy targets / Progression / Target ranking and confirm each launches once and reports completion
+9. confirm clicking another direct diagnostic while one is running reports Busy rather than launching duplicate tracked work
 10. confirm prepper V3 remains active and no GUI changes disturb production/prep state
 ```
 
