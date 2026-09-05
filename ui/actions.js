@@ -162,11 +162,13 @@ function launchValidationRun(ns, request) {
     if (!parsed.ok) return fail(parsed.reason);
     const v = parsed.value;
     const mixed = v.target === "mixed";
-    const pid = mixed
-        ? ns.run(OVERLAP_MIXED, 1, v.waves, v.hackPercent / 100, v.stageGapMs)
-        : ns.run(OVERLAP_VALIDATOR, 1, v.target, v.waves, v.hackPercent / 100, v.stageGapMs);
+    const all = v.target === "all";
+    const pid = mixed || all
+        ? ns.run(OVERLAP_MIXED, 1, all ? "all" : "validate2", v.waves, v.hackPercent / 100, v.stageGapMs, "--quiet")
+        : ns.run(OVERLAP_VALIDATOR, 1, v.target, v.waves, v.hackPercent / 100, v.stageGapMs, "--allow-unqualified", "--quiet");
     if (pid <= 0) return { ok: false, message: "Launch failed · not enough home RAM or validator unavailable" };
-    return { ok: true, message: `${mixed ? "Mixed" : v.target} overlap validation started · ${v.waves} wave(s) · PID ${pid}` };
+    const label = mixed ? "Mixed VALIDATE2" : all ? "All prepared" : v.target;
+    return { ok: true, message: `${label} overlap validation started quietly · ${v.waves} wave(s) · PID ${pid}` };
 }
 
 function validateValidationRequest(request) {
