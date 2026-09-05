@@ -8,14 +8,14 @@ import { positionalArgs, quietArgs, tprint } from "/lib/output.js";
 const ECONOMIC_TARGET_WAIT_MS = 30_000;
 const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
 const PREPPER_SCRIPT = "/hacking/prepper.js";
+const BATCH_HISTORY_SCRIPT = "/hacking/batch-history.js";
 
 /**
  * Prepare the automation stack after a clean pull or before a test run.
  *
  * Stage 0 restores the persisted manual money-goal lock. Stage 2 starts the
- * dedicated background prepper before handing off to the controller. The
- * prepper reserves one remote host exclusively and maintains eligible targets
- * near full money/minimum security while production uses the remaining pool.
+ * dedicated background prepper and rolling real batch-history collector before
+ * handing off to the controller.
  *
  * @param {NS} ns
  */
@@ -64,6 +64,12 @@ export async function main(ns) {
             const prepperPid = ns.run(PREPPER_SCRIPT, 1, ...inheritedQuiet);
             if (prepperPid > 0) tprint(ns, "Dedicated prepper started; one remote host will be reserved for target maintenance.");
             else tprint(ns, "WARNING: Could not start dedicated prepper; production will continue without reserved prep capacity.");
+        }
+
+        if (!ns.isRunning(BATCH_HISTORY_SCRIPT, "home")) {
+            const historyPid = ns.run(BATCH_HISTORY_SCRIPT, 1, ...inheritedQuiet);
+            if (historyPid > 0) tprint(ns, "Rolling real batch-history collector started on Port 19.");
+            else tprint(ns, "WARNING: Could not start batch-history collector; conservative multi-target safety learning will remain unproven.");
         }
 
         const selected = readPlannerState(ns)?.selectedTarget?.hostname ?? "unknown";
