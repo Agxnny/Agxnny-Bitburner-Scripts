@@ -14,18 +14,10 @@ const HEARTBEAT_MS = 1_000;
 
 /**
  * Distributed background target prepper.
+ * Periodically scans every rooted/hackable money target and reserves a bounded
+ * slice of remote RAM. Multiple reserved hosts may prep different targets.
  *
- * Periodically re-discovers/ranks every rooted, currently hackable money target
- * through the shared target layer. A bounded slice of remote RAM is reserved by
- * selecting small execution hosts until the requested reserve is met. Those
- * hosts are excluded from production by lib/execution.js and may prep different
- * targets concurrently. Active MULTI targets are prioritized, then normal rank.
- *
- * Usage:
- *   run hacking/prepper.js
- *   run hacking/prepper.js 0.125 64 1024
- *
- * args: reserveRatio minReserveGb maxReserveGb
+ * Usage: run hacking/prepper.js [reserveRatio] [minReserveGb] [maxReserveGb]
  * @param {NS} ns
  */
 export async function main(ns) {
@@ -45,7 +37,7 @@ export async function main(ns) {
     let targetRefreshAt = 0;
     let reservations = [];
     let reservationSignature = "";
-    let active = new Map();
+    const active = new Map();
     let completedWaves = 0;
     let sequence = 0;
     let lastHeartbeat = 0;
@@ -55,13 +47,10 @@ export async function main(ns) {
         const planner = readPlannerState(ns);
         const nextReservations = chooseReservations(ns, planner, reserveRatio, minReserveGb, maxReserveGb);
         const nextSignature = nextReservations.map((x) => x.hostname).join("|");
-        if (nextSignature !== reservationSignature) {
-            // Never move the reservation out from underneath prep work already running.
-            if (active.size === 0) {
-                reservations = nextReservations;
-                reservationSignature = nextSignature;
-                if (!quiet) ns.tprint(`[PREPPER] Reserved ${formatRam(sumRam(reservations))} across ${reservations.length} host(s) for distributed prep.`);
-            }
+        if (nextSignature !== reservationSignature && active.size === 0) {
+            reservations = nextReservations;
+            reservationSignature = nextSignature;
+            if (!quiet) ns.tprint(`[PREPPER] Reserved ${formatRam(sumRam(reservations))} across ${reservations.length} host(s) for distributed prep.`);
         }
 
         if (now >= targetRefreshAt || targets.length === 0) {
@@ -69,7 +58,6 @@ export async function main(ns) {
             targetRefreshAt = now + TARGET_REFRESH_MS;
         }
 
-        // Reap finished prep jobs.
         for (const [host, job] of [...active.entries()]) {
             if (!ns.isRunning(job.pid, host)) {
                 active.delete(host);
@@ -84,7 +72,6 @@ export async function main(ns) {
             .filter((target) => !targetPrepared(ns, target.hostname) && !busyTargets.has(target.hostname))
             .sort((a, b) => priority(b, demand) - priority(a, demand) || a.rank - b.rank);
 
-        // One prep job per reserved host; different targets can progress concurrently.
         for (const reservation of reservations) {
             if (active.has(reservation.hostname) || needsPrep.length === 0) continue;
             if (foreignProcessesOnHost(ns, reservation.hostname)) continue;
@@ -104,6 +91,11 @@ export async function main(ns) {
             lastHeartbeat = now;
             const reservedRamGb = sumRam(reservations);
             const activeJobs = [...active.entries()].map(([hostname, job]) => ({ hostname, ...job }));
+            const activeByTarget = new Map(activeJobs.map((job) => [job.target, job]));
+            const remaining = targets
+                .filter((target) => !targetPrepared(ns, target.hostname))
+                .sort((a, b) => priority(b, demand) - priority(a, demand) || a.rank - b.rank);
+            const prepTargets = remaining.map((target, index) => targetProgress(ns, target, activeByTarget.get(target.hostname), index, reservations));
             const status = reservations.length === 0 ? "BLOCKED"
                 : prepared.length === targets.length ? "IDLE_PREPARED"
                 : activeJobs.length > 0 ? "RUNNING"
@@ -117,19 +109,17 @@ export async function main(ns) {
                     : status === "IDLE_PREPARED" ? `All ${targets.length} eligible target(s) prepared`
                     : status === "RUNNING" ? `Preparing ${activeJobs.length} target(s) across reserved RAM pool`
                     : "Reserved prep hosts are draining or waiting for work",
-                reserveRatio,
-                minReserveGb,
-                maxReserveGb,
-                reservedRamGb,
+                reserveRatio, minReserveGb, maxReserveGb, reservedRamGb,
                 reservedHost: reservations[0]?.hostname ?? "",
                 reservedHosts: reservations,
                 targetCount: targets.length,
                 preparedCount: prepared.length,
-                needsPrepCount: Math.max(0, targets.length - prepared.length),
+                needsPrepCount: remaining.length,
                 activeCount: activeJobs.length,
                 activeJobs,
+                prepTargets,
                 demandTargets: [...demand],
-                nextTargets: needsPrep.slice(0, 8).map((target) => target.hostname),
+                nextTargets: remaining.slice(0, 8).map((target) => target.hostname),
                 completedWaves,
                 targetRefreshAt,
                 updatedAt: now,
@@ -162,11 +152,10 @@ function currentDemand(ns) {
     const state = readMultiTargetSchedulerState(ns);
     const fresh = Number(state?.updatedAt ?? 0) > Date.now() - 10_000;
     if (!fresh) return new Set();
-    const names = [
+    return new Set([
         ...(Array.isArray(state?.admittedTargets) ? state.admittedTargets : []),
         ...(Array.isArray(state?.inFlight) ? state.inFlight.map((entry) => entry?.target) : []),
-    ].map(String).filter(Boolean);
-    return new Set(names);
+    ].map(String).filter(Boolean));
 }
 
 function priority(target, demand) {
@@ -178,6 +167,51 @@ function targetPrepared(ns, hostname) {
     if (!(maxMoney > 0)) return true;
     return ns.getServerMoneyAvailable(hostname) / maxMoney >= MONEY_READY_RATIO
         && ns.getServerSecurityLevel(hostname) - ns.getServerMinSecurityLevel(hostname) <= SECURITY_READY_DELTA;
+}
+
+function targetProgress(ns, target, activeJob, queueIndex, reservations) {
+    const hostname = target.hostname;
+    const maxMoney = Math.max(0, ns.getServerMaxMoney(hostname));
+    const money = Math.max(0, ns.getServerMoneyAvailable(hostname));
+    const moneyRatio = maxMoney > 0 ? money / maxMoney : 1;
+    const securityDelta = Math.max(0, ns.getServerSecurityLevel(hostname) - ns.getServerMinSecurityLevel(hostname));
+    const action = activeJob?.action ?? (securityDelta > SECURITY_READY_DELTA ? "WEAKEN" : "GROW");
+    const etaMs = estimatePrepEtaMs(ns, hostname, money, maxMoney, securityDelta, activeJob, queueIndex, reservations);
+    return {
+        hostname,
+        rank: Number(target.rank ?? 0),
+        money,
+        maxMoney,
+        moneyRatio,
+        securityDelta,
+        action,
+        active: Boolean(activeJob),
+        host: activeJob?.hostname ?? "",
+        etaMs,
+    };
+}
+
+function estimatePrepEtaMs(ns, target, money, maxMoney, securityDelta, activeJob, queueIndex, reservations) {
+    const hostCount = Math.max(1, reservations.length);
+    const queueRounds = activeJob ? 0 : Math.floor(Math.max(0, queueIndex) / hostCount);
+    const growTime = Math.max(1, ns.getGrowTime(target));
+    const weakenTime = Math.max(1, ns.getWeakenTime(target));
+    let workMs = 0;
+    if (securityDelta > SECURITY_READY_DELTA) workMs += weakenTime;
+    if (maxMoney > 0 && money / maxMoney < MONEY_READY_RATIO) {
+        let growThreads = 1;
+        try { growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, maxMoney / Math.max(1, money), 1))); } catch { growThreads = 1; }
+        const growRam = Math.max(0.001, ns.getScriptRam(WORKER_SCRIPTS.GROW, "home"));
+        const bestCapacity = Math.max(1, ...reservations.map((host) => Math.floor(Number(host.maxRam ?? 0) / growRam)));
+        workMs += Math.max(1, Math.ceil(growThreads / bestCapacity)) * growTime;
+    }
+    const queueUnit = Math.max(growTime, weakenTime);
+    let eta = workMs + queueRounds * queueUnit;
+    if (activeJob) {
+        const actionTime = activeJob.action === "WEAKEN" ? weakenTime : growTime;
+        eta = Math.max(0, Number(activeJob.startedAt ?? Date.now()) + actionTime - Date.now()) + Math.max(0, workMs - actionTime);
+    }
+    return Math.max(0, eta);
 }
 
 function choosePrepWave(ns, host, target) {
