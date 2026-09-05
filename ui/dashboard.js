@@ -8,10 +8,11 @@ import { overviewView, modeLabel } from "/ui/views/overview.js";
 import { targetsView } from "/ui/views/targets.js";
 import { economyView } from "/ui/views/economy.js";
 import { batchView } from "/ui/views/batch.js";
+import { validationView } from "/ui/views/validation.js";
 import { networkView } from "/ui/views/network.js";
 import { diagnosticsView } from "/ui/views/diagnostics.js";
 
-const TABS = Object.freeze(["Overview", "Targets", "Economy", "Batch", "Network", "Diagnostics"]);
+const TABS = Object.freeze(["Overview", "Targets", "Economy", "Batch", "Validation", "Network", "Diagnostics"]);
 const UI_SYNC_MS = 100;
 const MAIN_TICK_MS = 25;
 const DATA_REFRESH_MS = 1000;
@@ -69,6 +70,7 @@ function header(s) {
     const pending = c.executionMode?.pending;
     const pipeline = freshPipelineState(s);
     const multi = isFreshMultiExecution(s.multiScheduler) ? s.multiScheduler : null;
+    const validation = freshValidationState(s.overlapValidation);
     return el("div", { style: styles.header },
         el("div", null,
             el("div", { style: styles.eyebrow }, "AGXNNY AUTOMATION"),
@@ -80,6 +82,7 @@ function header(s) {
             badge(pending ? `SWITCH → ${pending}` : modeBadge(mode), pending ? "warn" : mode === "STANDBY" ? "dim" : "accent"),
             pipeline ? badge(`PIPE ${pipeline.status ?? "RUN"}`, pipeline.safetyStopped ? "warn" : "good") : null,
             multi ? badge(`MULTI ${multi.status ?? "RUN"}`, multi.status === "SAFETY_STOP" || multi.status === "BLOCKED" ? "warn" : "good") : null,
+            validation ? badge(`VALID ${validation.status}`, validation.status === "FAILED" || validation.status === "ABORTED" ? "warn" : "accent") : null,
             c.prep?.hold ? badge("PREP HOLD", "good") : null,
             c.executionMode?.pipelineSafetyStopped ? badge("PIPE STOP", "warn") : null,
             c.executionMode?.multiSafetyStopped ? badge("MULTI STOP", "warn") : null,
@@ -100,6 +103,7 @@ function activeView(s, tab) {
     if (tab === "Targets") return targetsView(s);
     if (tab === "Economy") return economyView(s);
     if (tab === "Batch") return batchView(s);
+    if (tab === "Validation") return validationView(s);
     if (tab === "Network") return networkView(s);
     if (tab === "Diagnostics") return diagnosticsView(s);
     return overviewView(s);
@@ -119,4 +123,9 @@ function freshPipelineState(s) {
 
 function isFreshMultiExecution(state) {
     return Boolean(state?.model?.startsWith("MULTI_TARGET_EXECUTOR")) && Date.now() - Number(state?.updatedAt ?? 0) < 5000;
+}
+
+function freshValidationState(state) {
+    if (!state || Date.now() - Number(state.updatedAt ?? 0) >= 5000) return null;
+    return ["STARTING", "RUNNING", "BETWEEN_WAVES", "MIXED_NEXT"].includes(String(state.status ?? "")) ? state : null;
 }
