@@ -1,10 +1,12 @@
-import { appendStockSample, emptyStockHistory, readStockHistory, writeStockHistory, writeStockMarketState } from "/lib/stock-history.js";
+import { appendStockSample, emptyStockHistory, readStockHistory, readStockMarketState, writeStockHistory, writeStockMarketState } from "/lib/stock-history.js";
 import { isQuiet, tprint } from "/lib/output.js";
 
-const SAMPLE_MS = 6_000;
-const MAX_SAMPLES = 1_800;
+const POLL_MS = 200;
+const HEARTBEAT_MS = 1000;
+const EXPECTED_MARKET_TICK_MS = 6000;
+const MAX_SAMPLES = 0;
 
-/** Persistent stock price recorder. No trading. @param {NS} ns */
+/** Persistent stock price recorder. Observation only; no trading. @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
     const quiet = isQuiet(ns);
@@ -12,32 +14,56 @@ export async function main(ns) {
         tprint(ns, "ERROR: Run stocks/history-keeper.js from home.");
         return;
     }
+
+    const previousMarket = readStockMarketState(ns);
     if (!hasTix(ns)) {
         await publishUnavailable(ns, "TIX API unavailable");
         tprint(ns, "[STOCK-HISTORY] TIX API unavailable; recorder parked.");
-        while (!hasTix(ns)) await ns.sleep(10_000);
+        while (!hasTix(ns)) await ns.sleep(1000);
     }
 
     let history = readStockHistory(ns);
     if (history.model !== "STOCK_HISTORY_V1_COMPACT") history = emptyStockHistory();
-    if (!quiet) ns.tprint(`[STOCK-HISTORY] Recording every ${SAMPLE_MS / 1000}s · rolling ${MAX_SAMPLES} samples (~${(MAX_SAMPLES * SAMPLE_MS / 3600000).toFixed(1)}h)`);
+    history.maxSamples = 0;
+    history.retention = "ALL";
+    history.intervalMs = Math.max(1, Number(history.intervalMs ?? EXPECTED_MARKET_TICK_MS));
+
+    let priorFingerprint = "";
+    let lastPersistAt = 0;
+    let firstSample = true;
+    const staleHeartbeat = Number(previousMarket?.heartbeatAt ?? previousMarket?.updatedAt ?? 0);
+
+    if (!quiet) ns.tprint(`[STOCK-HISTORY] Polling TIX every ${POLL_MS}ms · persisting actual price updates · retention ALL`);
 
     while (true) {
         const startedAt = Date.now();
         if (!hasTix(ns)) {
             await publishUnavailable(ns, "TIX API unavailable");
-            await ns.sleep(SAMPLE_MS);
+            await ns.sleep(1000);
             continue;
         }
 
         const snapshot = collectSnapshot(ns);
-        history = appendStockSample(history, { at: snapshot.updatedAt, prices: Object.fromEntries(snapshot.symbols.map((row) => [row.symbol, row.price])) }, MAX_SAMPLES);
-        history.intervalMs = SAMPLE_MS;
-        await writeStockHistory(ns, history);
-        await writeStockMarketState(ns, snapshot);
+        const fingerprint = priceFingerprint(snapshot.symbols);
+        const changed = fingerprint !== priorFingerprint;
+        const now = snapshot.updatedAt;
 
-        const delay = Math.max(250, SAMPLE_MS - (Date.now() - startedAt));
-        await ns.sleep(delay);
+        if (changed) {
+            const prices = Object.fromEntries(snapshot.symbols.map((row) => [row.symbol, row.price]));
+            const gapFrom = firstSample && staleHeartbeat > 0 ? staleHeartbeat : 0;
+            history = appendStockSample(history, { at: now, prices, gapFrom, suppressGap: !firstSample }, MAX_SAMPLES);
+            history.intervalMs = observedInterval(history, EXPECTED_MARKET_TICK_MS);
+            await writeStockHistory(ns, history);
+            priorFingerprint = fingerprint;
+            firstSample = false;
+            await writeStockMarketState(ns, snapshot);
+            lastPersistAt = now;
+        } else if (now - lastPersistAt >= HEARTBEAT_MS) {
+            await writeStockMarketState(ns, snapshot);
+            lastPersistAt = now;
+        }
+
+        await ns.sleep(Math.max(25, POLL_MS - (Date.now() - startedAt)));
     }
 }
 
@@ -79,6 +105,23 @@ function position(ns, symbol) {
         shortShares: number(raw?.[2]),
         shortAverage: number(raw?.[3]),
     };
+}
+
+function observedInterval(history, fallback) {
+    const values = history?.timestamps ?? [];
+    if (values.length < 3) return Number(history?.intervalMs ?? fallback);
+    const deltas = [];
+    for (let i = Math.max(1, values.length - 20); i < values.length; i++) {
+        const delta = Number(values[i]) - Number(values[i - 1]);
+        if (delta > 500 && delta < 30000) deltas.push(delta);
+    }
+    if (!deltas.length) return Number(history?.intervalMs ?? fallback);
+    deltas.sort((a, b) => a - b);
+    return deltas[Math.floor(deltas.length / 2)];
+}
+
+function priceFingerprint(rows) {
+    return rows.map((row) => `${row.symbol}:${Number(row.price).toFixed(6)}`).join("|");
 }
 
 async function publishUnavailable(ns, reason) {
