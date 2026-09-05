@@ -9,85 +9,66 @@ Prefer small focused modules over monoliths. Ordinary modules aim <=300 lines, r
 `STANDBY`, `HGW`, `BATCH`, `PIPELINE`, `MULTI`. Startup defaults STANDBY; prepper runs independently.
 
 ## Dynamic MULTI redesign — ACTIVE WORK
-User wants production to learn per-target overlap depth beyond 2, dynamically tune hack fraction/timing, compare deep premium targets against distributed targets, and eventually borrow idle prep-reserve RAM for validation.
+Safety invariants: global concurrency proof and target-local overlap proof remain separate; RAM never grants unproven depth; production uses proven depth only; failed higher validation preserves lower proof; prep owns its reserve when actual prep exists.
 
-Safety invariants:
-- global concurrency proof and per-target overlap proof remain separate;
-- RAM availability never grants unproven overlap depth;
-- production uses proven depth only; validation may probe higher;
-- failed higher-depth validation preserves lower proven levels;
-- prep owns its reserve whenever real prep demand exists.
+### Dynamic overlap evidence / validation
+`lib/multi-overlap-evidence.js` model `MULTI_TARGET_OVERLAP_EVIDENCE_V2_DYNAMIC_DEPTH` stores independent depth evidence per target. Two consecutive clean dedicated waves prove a tested depth. `lib/multi-target-tuning.js` ladder is depths 2..12, hack 5/7.5/10/12.5/15/20%, timing 100/125/150/175/200/250ms.
 
-### Dynamic overlap evidence — IMPLEMENTED
-`lib/multi-overlap-evidence.js` model `MULTI_TARGET_OVERLAP_EVIDENCE_V2_DYNAMIC_DEPTH` stores independent records under each target's `depths` map: clean/failed/consecutive waves, proof, drift, spacing, hack fraction, stage gap, batch interval, status/reason and timestamps. Two consecutive clean dedicated waves prove a tested depth. V1 depth-2 evidence migrates in memory and persists on the next write. Do not delete `/data/multi-overlap-evidence.txt`.
+`diagnostics/multi-depth-validate.js` performs real configurable same-target depth validation. `diagnostics/multi-full-depth-test.js` climbs one target through its remaining depth ladder. `diagnostics/multi-full-depth-set.js` sequentially full-depth tests planner targets already PROVEN2+. Validation UI exposes individual and `PROVEN2+ SET · full-depth each` modes.
 
-`lib/multi-target-tuning.js` exposes depth ladder `2,3,4,5,6,7,8,9,10,11,12`, hack candidates `5,7.5,10,12.5,15,20%`, and timing candidates `100,125,150,175,200,250ms`. Evidence can therefore retain target A proven depth 5 while target B remains proven depth 2.
+Current depth-N validation is conservative serialized landing-stream proof. Target-stream trajectory/steady-state validation is still required before tighter interleaved production overlap. Current production `hacking/multi-target-runner.js` remains per-target depth 1; do not remove uniqueness guard until runtime proof supports the next scheduler.
 
-### Configurable/full-depth validation — IMPLEMENTED, RUNTIME PROOF REQUIRED
-`diagnostics/multi-depth-validate.js` is a real configurable same-target validator:
+## Pre-4S stock trading pilot — NEW
+Goal is to earn while hacking validation occupies STANDBY and accelerate the $25b 4S forecast API purchase.
+
+`stocks/history-keeper.js` remains the source price recorder. `stocks/signals.js` adds a price-only pre-4S signal using 5m/15m/30m momentum, regression trend, tick-direction bias, agreement and realized volatility. It requires multi-window history and returns a bounded signed score/confidence; it does not pretend to know the hidden 4S forecast.
+
+`stocks/pre4s-trader.js` is a conservative LIVE pilot. It is deliberately NOT started automatically yet. Defaults:
+- 15% total portfolio capital ceiling;
+- 4% equity ceiling per symbol;
+- $100m cash floor;
+- $5m minimum trade value;
+- score >=0.62 and confidence >=0.60 to enter;
+- score <0.22 to exit a long;
+- longs only by default;
+- optional `--short` enables symmetric shorts;
+- accounts for $100k commission in sizing/realized-cycle estimates;
+- state written to `/data/pre4s-trader-state.txt`.
+
+Launch after pull with:
 ```text
-run diagnostics/multi-depth-validate.js TARGET DEPTH WAVES HACK_FRACTION STAGE_GAP_MS [--quiet]
+run stocks/pre4s-trader.js 0.15
 ```
-It builds DEPTH HWGW batches in a conservative non-crossing landing stream, reserves the whole calendar before launch, owns Port 14 during the test, validates timing events/order/spacing/drift/final recovery, and records the result at that exact target/depth in V2 evidence. RAM reservation ceiling is BLOCKED/neutral rather than destructive failure.
+Do NOT enable `--short` for the first runtime pilot. This is an inferred-signal strategy and profitability is not guaranteed; review positions/P&L before increasing allocation. It can operate while hacking validation is running because it uses the stock API/cash rather than hacking worker RAM or Port 14.
 
-`diagnostics/multi-full-depth-test.js` automatically climbs one individual target from the next depth above its durable proven ceiling through depth 12. Default two waves/depth. It stops on RAM ceiling, timing/recovery failure, or controller leaving STANDBY. Every clean level remains independently retained.
-
-`diagnostics/multi-full-depth-set.js` snapshots current planner targets with durable `provenDepth >= 2` and sequentially runs the individual full-depth climb for each target. It deliberately runs one target at a time so Port 14 remains single-owner. One target reaching its own failure/resource ceiling does not erase evidence or prevent later set members from being attempted; controller-leave-STANDBY aborts the set. This produces heterogeneous evidence such as target A depth 5 and target B depth 2.
-
-Validation target selector now includes `PROVEN2+ SET · full-depth each`. Selecting it changes the action to `FULL DEPTH · PROVEN2+ SET`; individual target full-depth testing remains available. Set progress is exposed through validation state/runtime. `START VALIDATION` is disabled for the set selector because the set path is specifically full-depth.
-
-Important: depth-N validation still uses conservative serialized batch landing streams and final stream recovery. It is proof-stage evidence before tighter production interleaving. Runtime validation across multiple targets is required before production consumes depth >1.
-
-### Still to implement
-1. Runtime-test individual and PROVEN2+ set full-depth validation and inspect failure/ceiling semantics.
-2. Add target-stream trajectory/steady-state recovery validation for tighter deep overlap, beyond final recovery alone.
-3. Extend real `hacking/multi-target-runner.js` to consume target-local proven depth and rank marginal batch opportunities rather than enforcing distinct targets.
-4. Compare concentrated vs distributed portfolios using realized/expected $/sec and RAM-second under proof/timing constraints.
-5. Add bounded hack/timing hill-climb with cooldown after failed experiments.
-6. Add low-priority auto-validator borrowing only idle prep reserve, yielding admission when prep returns.
-7. Feed learned profiles into AUTOMULTI and expose effective/proven/candidate settings.
-
-Current production `hacking/multi-target-runner.js` is STILL per-target depth 1. Do not remove its uniqueness guard until the new validator has runtime proof.
-
-## Concurrency evidence dimensions
-Historical global stress was clean through distinct depth 5, but durable global proof is separate in `/data/multi-stress-evidence.txt`. Target-local proof never overrides this global ceiling.
-
-## AUTOMULTI
-`lib/automulti-decision.js`, `lib/automulti-live.js`, `lib/multi-target-ranking.js`, and `hacking/automulti-controller.js` provide the existing supervisory AUTO foundation. Production must never exceed relevant proven ceilings.
-
-## Existing depth-2 rollout
-Legacy `diagnostics/multi-overlap-validate.js` and `diagnostics/multi-overlap-mixed.js` remain for depth-2 qualification/mixed flows. Latest user runtime evidence before depth-N rollout: joesguns validated cleanly; screenshot showed phantasy, sigma-cosmetics, and joesguns `PROVEN2`, with mixed validation continuing through other candidates.
+Future stock work: durable trade ledger/performance statistics, Market Lab signal/position/P&L panel, adaptive thresholds from observed results, then 4S forecast/volatility integration once purchased.
 
 ## Stock research baseline
-Observation/history only; no autonomous trading yet. `lib/stock-history.js` retains all history going forward with `Date.now()` timestamps and explicit recorder gaps. `stocks/history-keeper.js` polls TIX every 200ms and persists only price-vector changes.
+`lib/stock-history.js` retains all history going forward with `Date.now()` timestamps and recorder gaps. `stocks/history-keeper.js` polls TIX every 200ms and persists actual price-vector changes. Market Lab CANDLES uses 5m/15m/30m/1h/4h lookbacks; HISTORY · LINE provides 15m/1h/3h/6h/12h/24h/ALL. Startup launches recorder/dashboard, but not the live trader.
 
-`stocks/dashboard.js` CANDLES uses true wall-clock lookback windows `5m/15m/30m/1h/4h` (1m removed). Mapping is approximately 5m→30s OHLC, 15m→1m, 30m→1m, 1h→1m, 4h→2m, so longer views naturally contain more candles. HISTORY · LINE provides `15m/1h/3h/6h/12h/24h/ALL`. Chart gap markers only render when a retained gap intersects the visible time window. Inactive chart/timeframe buttons use black borders; active uses blue accent.
-
-Startup launches both main and stock dashboards.
-
-### Startup GUI admission/parser fix
-`startup.js` delegates GUI startup to low-RAM `/ui/dashboard-launcher.js`, which retries dashboard admission and reports required/free/max RAM on failure. A subsequent runtime report of `need 0.00 GB` revealed the actual issue was a parser error in `ui/views/validation.js` line 70. The nested landing-stream expression was rewritten into smaller `landingStream`/`landingBatch` functions in commit `391a58b19a2bf2ce814db2d9cf843fe611b3f7b4`. Runtime parser recheck is required after pulling.
+## AUTOMULTI
+`lib/automulti-decision.js`, `lib/automulti-live.js`, `lib/multi-target-ranking.js`, and `hacking/automulti-controller.js` provide the supervisory AUTO foundation. Production must not exceed relevant proof ceilings.
 
 ## Prepper
-`hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM. Automatic validation borrowing is NOT implemented yet.
+`hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM. Automatic validation borrowing is not implemented yet.
 
 ## Runtime ports
-12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap/validation and stock research state are file-based.
+12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap validation and stocks use files.
 
-## Immediate runtime test
-Pull, confirm `run ui/dashboard.js` parses/opens, put controller fully STANDBY, then in Validation choose `PROVEN2+ SET · full-depth each`, leave Waves=2 / Hack=10% / Gap=200ms, and press `FULL DEPTH · PROVEN2+ SET`. Send final Validation screenshot/output or the first abnormal result. Do not manually rerun a failed depth before inspection.
+## Immediate runtime work
+Allow the currently-running full-depth validation set to finish naturally. The pre-4S trader can be started independently after pull without changing controller mode. First live pilot should be long-only at 15% allocation. Report trader errors, unexpected positions, or cash drawdown before raising risk.
 
 ## Priority
 ```text
 DONE dynamic per-target arbitrary-depth evidence foundation
-DONE configurable depth-N validator + individual FULL DEPTH TEST
-DONE sequential PROVEN2+ SET full-depth coordinator + UI
-NEXT runtime prove full-depth climb/set on representative targets
-NEXT target-stream trajectory validation for tighter overlap
+DONE configurable depth-N + individual/set full-depth validation
+DONE pre-4S price signal engine + conservative manual live trader pilot
+NOW collect validation evidence and pre-4S trading results in parallel
+NEXT target-stream trajectory validation
 NEXT real MULTI marginal allocator using proven per-target depth
+NEXT durable stock trade ledger/performance + Market Lab signals
 NEXT concentrated-vs-distributed selection + hack/timing tuner
 NEXT idle prep-reserve auto-validation borrowing
 NEXT feed learned profiles into AUTOMULTI + GUI
-PARALLEL collect pre-4S stock history
-LATER progression supervisor, stock trading, watchdog/UI refinements
+LATER 4S integration, progression supervisor, watchdog refinements
 ```
