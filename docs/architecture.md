@@ -2,101 +2,137 @@
 
 ## Source of truth
 
-GitHub `main` is the source of truth. Read `docs/HANDOFF.md` first, then fetch current files before editing.
+GitHub `main` is the source of truth. Read `HANDOFF.md` for active work and `FEATURES.md` for implemented behavior, then fetch current files before editing.
 
-## Core principle
+## Control plane vs execution plane
 
-Home is the control/UI plane. Rooted and cloud servers are the remote execution plane. The GUI consumes published state and sends commands; it does not own hacking logic. React callbacks remain Netscript-free.
-
-## Startup and controller modes
-
-`startup.js → dashboard → kickstart → planner/deploy/economy → controller`
-
-The controller starts in **STANDBY**. Current modes are STANDBY, HGW, serialized BATCH, and controller-managed single-target PIPELINE. Mode changes are safe-boundary scheduling barriers.
-
-## Single-target pipeline
-
-`hacking/pipeline-runner.js` is the current live synchronized executor. Its coordinator runs on home; H/G/W workers run remotely. It uses just-in-time stage launches, host/time RAM reservations, one Port 14 timing-event consumer routed by `batchId`, Port 15 completion telemetry, and Port 16 live state.
-
-Live depth remains fixed at 2 while integration is validated. Two manual `phantasy` runs completed four overlapping batches with 100% money recovery, +0.000 security, correct H → W1 → G → W2 order, and ~6262 ms cadence under the then-current pool.
-
-## Global multi-target direction
-
-The intended end-state is **one global scheduler**, not one independent runner per target:
+Home is the control/UI plane. Rooted, purchased, and cloud servers form the remote execution plane. Normal H/G/W workers remain remote; home coordinates planning, state, GUIs, schedulers, and validation.
 
 ```text
-controller
-   ↓
-global scheduler on home
-   ├── target context A
-   ├── target context B
-   └── target context C...
+home
+├─ Control Plane GUI
+├─ stock Market Lab
+├─ controller / planners / prepper
+├─ synchronized coordinators
+└─ runtime ports + durable evidence
+        │
+        ▼
+remote execution pool
+└─ minimal hack / grow / weaken workers
+```
+
+The persistent controller should orchestrate rather than absorb expensive analysis. Tactical/thread math and specialized planning remain in focused modules.
+
+## Startup
+
+```text
+startup.js
+├─ ui/dashboard-launcher.js
+│  ├─ ui/dashboard.js
+│  └─ stocks/dashboard.js
+└─ kickstart.js
+   ├─ restore manual savings lock
+   ├─ planner
+   ├─ deployment
+   ├─ wait for economic target
+   ├─ prepper + batch history + stock history
+   └─ controller (starts STANDBY)
+```
+
+The deferred dashboard launcher exists so startup can release its own RAM before GUI admission retries.
+
+## Controller modes
+
+`STANDBY | HGW | BATCH | PIPELINE | MULTI`
+
+Mode changes are admission barriers. Existing synchronized work drains to a safe boundary before the transition is applied. The prepper is independent of production mode.
+
+## Scheduling layers
+
+### Sequential HGW
+
+The controller uses short-lived tactical planning and remote workers for ordinary sequential H/G/W automation.
+
+### Serialized batch
+
+`hacking/batch-runner.js` reserves and launches one synchronized H → W1 → G → W2 batch. Port 12 is current serialized state.
+
+### Single-target pipeline
+
+`hacking/pipeline-runner.js` is the real continuous same-target executor. Live depth remains hard-capped at 2. It owns Port 14 while active, routes timing events by batch id, publishes latest completion on Port 15, and live pipeline state on Port 16.
+
+### Real MULTI
+
+`hacking/multi-target-runner.js` is a real finite-wave multi-target executor. It uses one shared host/time reservation calendar, JIT dispatch, central Port 14 routing, and configurable global live depth 2–12. Controller MULTI repeats finite waves.
+
+Current production safety boundary: only distinct prepared targets are admitted, so same-target production depth remains 1 even when validation has proven a higher target-local depth.
+
+## Two independent concurrency dimensions
+
+The dynamic scheduler must respect both:
+
+```text
+global proof       = how many real batches/targets the whole system has safely carried
+local proof        = how many overlapping batches a specific target has safely carried
+```
+
+Global evidence lives in `/data/multi-stress-evidence.txt`. Target/depth evidence lives in `/data/multi-overlap-evidence.txt`. Neither proof dimension overrides the other, and available RAM is never permission to exceed proof.
+
+## Target-local depth learning
+
+The depth-N validator currently uses conservative batch landing streams and records each tested depth independently. Two consecutive clean dedicated waves prove that tested depth. Higher failure preserves lower proof.
+
+`multi-full-depth-test.js` climbs one target; `multi-full-depth-set.js` sequentially climbs every planner target already PROVEN2+. This can learn heterogeneous ceilings such as A×5, B×3, C×2.
+
+The next safety step before production consumes those depths is target-stream trajectory/steady-state validation suitable for tighter interleaving. Per-batch "ended at full money" is not sufficient once later overlapping hacks may land before an earlier batch is finalized.
+
+## Future dynamic MULTI allocator
+
+The intended production scheduler ranks **batch opportunities**, not just hostnames. A target can therefore win several marginal slots when that is better than opening a weaker target.
+
+```text
+proven target profiles
+        +
+global concurrency proof
+        +
+prepared targets / shared RAM calendar
         ↓
-shared host/time reservation calendar
+score next batch opportunity
         ↓
-remote H/G/W workers
-        ↑
-central Port 14 router by target + batchId
+compare concentrated vs distributed portfolio
+        ↓
+admit best safe complete batch
+        ↓
+continuous refill as capacity opens
 ```
 
-Target depth will be dynamic. A high-value target may receive many concurrent batches while secondary targets still receive work when their marginal value and reservation fit justify it. RAM percentages are not permanently partitioned; every new complete batch competes for the next feasible global reservation.
+The allocator should optimize realized/expected money rate and RAM-seconds while rejecting recovery/order/missing/drift/spacing failures.
 
-## Multi-target allocator scaffold
+## Prep architecture
 
-`hacking/multi-target-scheduler.js` is the first **dry-run-only** implementation of this model. It considers several targets simultaneously and repeatedly admits the highest-value feasible virtual HWGW batch into one shared host/time calendar.
+The distributed prepper owns a bounded remote reserve and scans the full eligible target universe. It prioritizes money restoration, may concentrate multiple hosts on one target, and publishes Port 18 telemetry. Production capacity excludes fresh prep reservations.
 
-Profiles:
+Future validation borrowing is lower priority than real prep demand: production > actual prep > validator borrowing unused prep reserve.
 
-```text
-MONEY     normalized cash efficiency per reserved RAM-time
-BALANCED  70% money + 30% XP proxy
-XP        action-thread/difficulty proxy per reserved RAM-time
-```
+## Economy/progression architecture
 
-A diminishing-returns fairness penalty is applied after each target admission. This intentionally allows stronger targets to receive greater depth without defaulting to total starvation of all secondary targets.
+Economic target selection, progression advice, and spending execution are separate responsibilities. The advisor chooses the goal; the spender executes only supported selected actions and independently respects the manual savings lock.
 
-The planner also applies a global landing spacing floor between target pipelines, so cross-target events are modeled as one timing stream rather than independent clocks.
+## GUI architecture
 
-It publishes to **Port 17**, leaving Port 16 free for the active single-target pipeline. It launches no workers and does not consume Port 14.
+The main GUI is a single React tree. React callbacks are Netscript-free: they only update/queue plain JavaScript requests. The async Netscript loop reads ports/files/processes and performs actions. This boundary is required for responsive/stable tab switching.
 
-## Future multi-target safety model
+Stock research is a separate dashboard and data model so future trading logic does not bloat the hacking control plane.
 
-Failures should be classified as target-local versus global:
+## Safety invariants
 
-```text
-target-local: bad recovery/order/prep → pause/repair that target
-system-wide: reservation corruption / shared timing failure → stop global admissions
-```
-
-The first real multi-target test should remain conservative: two targets, global live depth 2, per-target depth 1. Dynamic higher per-target depth comes only after rolling timing history and shared planner/executor code are in place.
-
-## Runtime ports
-
-| Port | Purpose |
-| --- | --- |
-| 1 | controller snapshot |
-| 2 | planner / selected strategy |
-| 3 | tactical plan |
-| 4 | hack completion event queue |
-| 5 | income telemetry |
-| 6 | diagnostic request queue |
-| 7 | progression/economy state |
-| 8 | economic target state |
-| 9 | root/tool state |
-| 10 | cloud capacity automation state |
-| 11 | manual money goal / spending lock |
-| 12 | current serialized batch state |
-| 13 | controller command queue |
-| 14 | batch landing-timing event queue |
-| 15 | latest completed serialized/pipeline batch |
-| 16 | single-target pipeline planner/simulation/executor |
-| 17 | global multi-target allocation planner |
-
-## Current limitations
-
-- Live single-target pipeline depth is fixed at 2.
-- Multi-target scheduling is planning-only.
-- Port 15 is latest-only, not rolling history.
-- Multi-target XP is currently a proxy metric, not exact XP.
-- Batch-template/reservation math is still duplicated and should be extracted before real multi-target execution.
-- Automatic worker watchdog termination remains deferred.
+- one real synchronized Port 14 consumer at a time;
+- workers remain minimal and remote;
+- production uses proven concurrency only;
+- global and target-local proof remain separate;
+- higher failed validation does not erase lower proof;
+- fresh prep reservations are excluded from production;
+- manual savings lock overrides automated spending;
+- React callbacks never call Netscript;
+- stock trading remains disabled until deliberately implemented;
+- automatic worker watchdog killing remains deferred while scheduler timing is still evolving.
