@@ -1,6 +1,6 @@
 # Testing and Validation Guide
 
-Validate incrementally. Maximum live single-target pipeline depth remains 2; multi-target work is currently dry-run only.
+Validate incrementally. Maximum live single-target pipeline depth remains 2; multi-target production is still dry-run/planning only.
 
 ## After pulling
 
@@ -10,7 +10,36 @@ run startup.js
 run diagnostics/mem-audit.js
 ```
 
-Startup should settle in STANDBY with zero target-side workers/coordinators while planner/economy/UI/controller remain online.
+`gitpull.js` should now distinguish actual content changes from clean replacement:
+
+```text
+UPDATED    file.js
+REPLACED   file.js (unchanged)
+ADDED      file.js
+```
+
+The final summary should include an `UPDATED` count and an `Updated files:` line when changes exist. The self-update handoff should use the same UPDATED/REPLACED distinction for `gitpull.js`.
+
+## Startup / dedicated prepper
+
+Startup still places the production controller in STANDBY, but the dedicated prepper is now independent background maintenance. Therefore a grow/weaken worker may be present on the reserved prep host even while production mode is STANDBY.
+
+Acceptance checks:
+
+```text
+Port 18 model == DEDICATED_TARGET_PREPPER_V1
+Port 18 reservedHost is non-empty
+Port 18 updatedAt stays fresh
+production execution pool excludes reservedHost
+```
+
+The prepper should choose the smallest rooted execution host with at least 32 GB by default, or fall back to the largest available host. Existing work on that host must drain naturally before prep begins.
+
+Observe several prep waves. The prepper should round-robin targets needing work instead of finishing one difficult target before considering every other target. It must only launch GROW/WEAKEN, never HACK, and must not emit Port 14 batch timing events.
+
+A target is considered prepared when money is >=99.5% of maximum and security is <=+0.05 above minimum. Once all currently eligible money targets meet that baseline, Port 18 should report `IDLE_PREPARED`.
+
+If the prepper process is stopped, wait more than five seconds and confirm the previously reserved host returns to the normal production execution pool.
 
 ## Controller-managed PIPELINE
 
@@ -20,11 +49,11 @@ Healthy completions require correct H → W1 → G → W2 order, zero missing ev
 
 ### Safe drain
 
-While a wave is active, switch to Standby. The executor should stop later wave admission, drain the current admitted work, publish `DRAINED_FOR_MODE_SWITCH`, then allow the controller to enter STANDBY.
+While a wave is active, switch to Standby. The executor should stop later wave admission, drain the current admitted work, publish `DRAINED_FOR_MODE_SWITCH`, then allow the controller to enter STANDBY. The independent prepper may continue maintenance on its reserved host.
 
 ## Multi-target allocator dry-run
 
-Run all three profiles after pulling:
+Run all three profiles:
 
 ```text
 run hacking/multi-target-scheduler.js money 4 0.10 200 64
@@ -35,59 +64,29 @@ run hacking/multi-target-scheduler.js xp 4 0.10 200 64
 Acceptance checks:
 
 - the script explicitly reports `workers launched: NO`;
-- no H/G/W PID appears as a result of the run;
 - Port 17 model is `MULTI_TARGET_ALLOCATOR_DRY_RUN_V1`;
-- at least two eligible targets are considered when available;
-- `assignedBatches` is not forcibly equal across targets;
-- the highest-value MONEY target may receive greater depth;
-- secondary viable targets should normally receive some allocations when capacity permits because of the fairness penalty;
-- BALANCED should shift allocation relative to MONEY when XP-proxy rankings differ;
-- XP output is labelled as a proxy, not exact XP;
-- total reservations never exceed a host's usable RAM in overlapping time windows;
-- virtual batches from different targets obey the global landing-spacing floor;
-- Port 17 updates must not disturb live Port 16 single-target pipeline state.
+- dynamic per-target allocation changes by objective;
+- the Port 18 reserved prep host is excluded from Port 17 capacity;
+- reservations never exceed host/time capacity;
+- cross-target landings obey the global spacing floor;
+- Port 17 does not disturb live Port 16 state.
 
-Useful output to capture for tuning:
-
-```text
-profile
-target / assigned depth / allocation share
-base score
-$/RAM-second
-XPproxy/RAM-second
-prepared vs needs prep
-remote RAM / host count
-admitted virtual batch count
-```
-
-If one target receives 100% of allocations while several others have reasonable scores and reservations, inspect the fairness penalty. If allocation is too uniform despite a large value gap, reduce fairness pressure.
-
-## Manual finite pipeline regression
-
-```text
-run hacking/pipeline-runner.js phantasy 0.10 200 2
-```
-
-Use only while the controller is parked at PREPARED HOLD. It must never exceed depth 2.
-
-## Serialized regression
-
-BATCH mode must still produce correct H → W1 → G → W2 order, zero missing timing events, and expected recovery. BATCH and PIPELINE must not run concurrently.
+Current observed profile separation is healthy: MONEY heavily favors `phantasy`, BALANCED gives more relative share to XP-efficient secondary targets, and XP shifts primary allocation to `joesguns`.
 
 ## Regression checklist
 
-- startup settles in STANDBY with no target-side work;
+- gitpull marks actual content changes as UPDATED and identical refreshes as REPLACED (unchanged);
+- startup starts one prepper service and production controller in STANDBY;
+- Port 18 keeps one remote host reserved while prepper is alive;
+- prepper round-robins eligible targets using only grow/weaken;
+- reserved prep host is excluded from normal production scheduling;
 - all six GUI tabs remain responsive;
 - HGW works;
 - serialized BATCH works;
 - PIPELINE auto-preps and runs continuous depth-2 waves;
 - PIPELINE mode changes drain safely;
-- pipeline safety stop holds for review;
-- Prep + hold and Resume work;
-- manual target and money-goal controls still work;
 - Port 15 shows latest serialized/pipeline completion;
 - Port 16 shows single-target pipeline state;
 - Port 17 shows multi-target dry-run allocation state;
-- multi-target planner launches no workers;
-- Port 14 timing remains separate from Port 4 strategic hack telemetry;
+- Port 18 shows prepper/reserved-host state;
 - watchdog termination remains disabled.
