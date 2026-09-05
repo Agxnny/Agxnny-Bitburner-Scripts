@@ -8,8 +8,8 @@ const STALE_MS = 2_000;
 export async function main(ns) {
     ns.disableLog("ALL");
     ns.clearLog();
-    ns.tail();
-    try { ns.resizeTail(760, 640); } catch {}
+    ns.ui.openTail();
+    try { ns.ui.resizeTail(760, 640); } catch {}
     while (true) {
         ns.clearLog();
         render(ns, readOverlapValidationState(ns), readOverlapEvidence(ns));
