@@ -8,6 +8,7 @@
     "hacking/dispatch.js",
     "hacking/batch-runner.js",
     "hacking/batch-scheduler.js",
+    "hacking/pipeline-runner.js",
     "hacking/economy-planner.js",
     "hacking/economy-targets.js",
     "hacking/planner.js",
