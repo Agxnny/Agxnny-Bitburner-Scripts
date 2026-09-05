@@ -1,4 +1,5 @@
 const DEFAULT_MAX_CANDLES = 60;
+const MIN_SAMPLES_PER_CANDLE = 5;
 
 /** Build sampled OHLC candles from recorded price points. */
 export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES) {
@@ -7,7 +8,8 @@ export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES) {
         : [];
     if (points.length === 0) return { candles: [], bucketSize: 0, intervalMs: 0 };
 
-    const bucketSize = Math.max(1, Math.ceil(points.length / Math.max(1, Math.floor(maxCandles))));
+    const target = Math.max(1, Math.floor(maxCandles));
+    const bucketSize = Math.max(MIN_SAMPLES_PER_CANDLE, Math.ceil(points.length / target));
     const candles = [];
     for (let i = 0; i < points.length; i += bucketSize) {
         const bucket = points.slice(i, i + bucketSize);
@@ -30,7 +32,7 @@ export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES) {
     }
     const baseInterval = median(sampleIntervals);
     return {
-        candles,
+        candles: candles.slice(-target),
         bucketSize,
         intervalMs: baseInterval > 0 ? baseInterval * bucketSize : 0,
     };
