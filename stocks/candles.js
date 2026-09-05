@@ -1,8 +1,9 @@
 const DEFAULT_MAX_CANDLES = 60;
 const MIN_SAMPLES_PER_CANDLE = 5;
+const GAP_FACTOR = 2.25;
 
-/** Build sampled OHLC candles from recorded price points. */
-export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES) {
+/** Build sampled OHLC candles from recorded price points without bridging recorder gaps. */
+export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES, expectedIntervalMs = 6000) {
     const points = Array.isArray(series)
         ? series.filter((point) => Number.isFinite(Number(point?.price)) && Number(point.price) > 0 && Number.isFinite(Number(point?.at)))
         : [];
@@ -10,9 +11,13 @@ export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES) {
 
     const target = Math.max(1, Math.floor(maxCandles));
     const bucketSize = Math.max(MIN_SAMPLES_PER_CANDLE, Math.ceil(points.length / target));
+    const gapThreshold = Math.max(1, Number(expectedIntervalMs) || 6000) * GAP_FACTOR;
     const candles = [];
-    for (let i = 0; i < points.length; i += bucketSize) {
-        const bucket = points.slice(i, i + bucketSize);
+    let bucket = [];
+    let gapBefore = false;
+
+    const flush = () => {
+        if (!bucket.length) return;
         const prices = bucket.map((point) => Number(point.price));
         candles.push({
             at: Number(bucket[0].at),
@@ -22,15 +27,23 @@ export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES) {
             low: Math.min(...prices),
             close: prices.at(-1),
             samples: bucket.length,
+            gapBefore,
         });
-    }
+        bucket = [];
+        gapBefore = false;
+    };
 
-    const sampleIntervals = [];
-    for (let i = 1; i < points.length; i++) {
-        const delta = Number(points[i].at) - Number(points[i - 1].at);
-        if (delta > 0) sampleIntervals.push(delta);
+    for (let i = 0; i < points.length; i++) {
+        const point = points[i];
+        const prior = points[i - 1];
+        const isGap = prior && Number(point.at) - Number(prior.at) > gapThreshold;
+        if (isGap || bucket.length >= bucketSize) flush();
+        if (isGap) gapBefore = true;
+        bucket.push(point);
     }
-    const baseInterval = median(sampleIntervals);
+    flush();
+
+    const baseInterval = median(points.slice(1).map((point, index) => Number(point.at) - Number(points[index].at)).filter((delta) => delta > 0 && delta <= gapThreshold));
     return {
         candles: candles.slice(-target),
         bucketSize,
