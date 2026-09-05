@@ -384,6 +384,7 @@ function batchView(s) {
             heroMetric("LAST COMPLETE", last ? age(last.finishedAt) : "none", last?.target ?? "waiting"),
         ),
         card("Multi-target finite wave", multiTargetControls(s, multi), true),
+        card("Multi-target activity", multiTargetActivity(multi), true),
         scheduler ? card("Pipeline", pipelineSummary(scheduler), true) : null,
         current ? card("Current serialized batch", el("div", null,
             el("div", { style: styles.compactGrid },
@@ -454,6 +455,50 @@ function multiTargetControls(s, state) {
         admitted.length ? el("div", { style: styles.pipelineRows }, ...admitted.slice(0, 12).map((target, i) => kv(`#${i + 1}`, target))) : null,
         note(state?.model?.startsWith("MULTI_TARGET_EXECUTOR") ? state.reason ?? multiTargetStatus : multiTargetStatus),
         note("Finite safety test only: increasing Live batches adds distinct prepared targets. Per-target live depth remains 1 until same-target overlap is separately proven."),
+    );
+}
+
+function multiTargetActivity(state) {
+    const isExecutor = Boolean(state?.model?.startsWith("MULTI_TARGET_EXECUTOR"));
+    const inFlight = isExecutor && Array.isArray(state?.inFlight) ? state.inFlight : [];
+    const completed = isExecutor && Array.isArray(state?.completed) ? state.completed : [];
+    if (!isExecutor) return note("No real multi-target executor state yet. Launch a finite wave to populate active targets and timing data.");
+
+    return el("div", null,
+        el("div", { style: styles.compactGrid },
+            kv("Profile", String(state.profile ?? "—").toUpperCase()),
+            kv("Run", state.runId ?? "—"),
+            kv("Active targets", inFlight.length),
+            kv("Completed", completed.length),
+        ),
+        inFlight.length ? el("div", { style: styles.multiActivityRows },
+            ...inFlight.map((batch) => multiTargetActiveRow(batch)),
+        ) : note(state.status === "RUNNING" ? "No batches currently in flight." : "No active targets."),
+        completed.length ? details("Completed target timings", el("div", { style: styles.multiActivityRows },
+            ...completed.slice(-12).reverse().map((entry) => multiTargetCompletedRow(entry)),
+        )) : null,
+    );
+}
+
+function multiTargetActiveRow(batch) {
+    const launched = Array.isArray(batch?.launchedStages) ? batch.launchedStages.map(stageShort).join(" ") : "—";
+    return el("div", { key: batch.id, style: styles.multiActivityRow },
+        el("span", { style: styles.multiTargetName }, batch.target ?? "?"),
+        el("span", { style: styles.goodText }, "ACTIVE"),
+        el("span", { style: styles.right }, `H ${countdownTo(batch.firstLandingAt)}`),
+        el("span", { style: styles.right }, `W2 ${countdownTo(batch.finalLandingAt)}`),
+        el("span", { style: styles.dimText }, launched),
+    );
+}
+
+function multiTargetCompletedRow(entry) {
+    const healthy = Boolean(entry?.healthy);
+    return el("div", { key: entry.batchId, style: styles.multiActivityRow },
+        el("span", { style: styles.multiTargetName }, entry.target ?? "?"),
+        el("span", { style: healthy ? styles.goodText : styles.warnText }, healthy ? "CLEAN" : "CHECK"),
+        el("span", { style: styles.right }, `${pctFine(entry.moneyPercent)} · sec ${signedNum(entry.securityDelta, 3)}`),
+        el("span", { style: styles.right }, `drift ${msFmt(entry.maxAbsLandingErrorMs)}`),
+        el("span", { style: styles.dimText }, `spacing ${msFmt(entry.minimumSpacingMs)} · ${entry.orderCorrect ? "ORDER OK" : "ORDER BAD"}`),
     );
 }
 
@@ -669,8 +714,31 @@ function actionEtaText(action) {
     return remaining >= 0 ? `${action?.action ?? "WORK"} · ${compactMs(remaining)}` : `${action?.action ?? "WORK"} · finishing`;
 }
 
-function heroMetric(label, value, sub) { return el("div", { style: styles.heroCard }, el("div", { style: styles.heroLabel }, label), el("div", { style: styles.heroValue }, value), el("div", { style: styles.heroSub }, sub)); }
-function card(title, content, wide = false) { return el("div", { style: { ...styles.card, ...(wide ? styles.wide : {}) } }, el("div", { style: styles.cardTitle }, title), content); }
+function CollapsibleCard({ title, content, wide = false }) {
+    const [open, setOpen] = React.useState(true);
+    return el("div", { style: { ...styles.card, ...(wide ? styles.wide : {}) } },
+        el("button", { onClick: () => setOpen((value) => !value), style: styles.cardHeaderButton },
+            el("span", { style: styles.cardTitle }, title),
+            el("span", { style: styles.collapseGlyph }, open ? "−" : "+"),
+        ),
+        open ? content : null,
+    );
+}
+
+function CollapsibleHero({ label, value, sub }) {
+    const [open, setOpen] = React.useState(true);
+    return el("div", { style: styles.heroCard },
+        el("button", { onClick: () => setOpen((current) => !current), style: styles.heroHeaderButton },
+            el("span", { style: styles.heroLabel }, label),
+            el("span", { style: styles.collapseGlyph }, open ? "−" : "+"),
+        ),
+        el("div", { style: styles.heroValue }, value),
+        open ? el("div", { style: styles.heroSub }, sub) : null,
+    );
+}
+
+function heroMetric(label, value, sub) { return el(CollapsibleHero, { label, value, sub }); }
+function card(title, content, wide = false) { return el(CollapsibleCard, { title, content, wide }); }
 function grid(...children) { return el("div", { style: styles.grid }, ...children); }
 function kv(k, v) { return el("div", { style: styles.kv }, el("span", { style: styles.key }, k), el("span", { style: styles.value }, String(v))); }
 function note(v) { return el("div", { style: styles.note }, String(v)); }
@@ -717,13 +785,16 @@ const styles = {
     content: { paddingTop: "1px" },
     heroGrid: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: "7px", marginBottom: "7px" },
     heroCard: { background: "#10161d", border: "1px solid #242f3a", borderRadius: "6px", padding: "9px" },
+    heroHeaderButton: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: 0, border: 0, background: "transparent", color: "inherit", cursor: "pointer", fontFamily: "monospace" },
     heroLabel: { fontSize: "8px", color: "#708090", letterSpacing: "1px" },
     heroValue: { fontSize: "16px", color: "#f1f5f9", marginTop: "3px", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
     heroSub: { fontSize: "9px", color: "#7d8b99", marginTop: "3px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
     grid: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0,1fr))", gap: "7px" },
     card: { background: "#10161d", border: "1px solid #242f3a", borderRadius: "6px", padding: "10px", minWidth: 0 },
     wide: { gridColumn: "1 / -1", marginBottom: "7px" },
-    cardTitle: { color: "#91a8bb", fontSize: "9px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase", marginBottom: "6px" },
+    cardHeaderButton: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", padding: 0, marginBottom: "6px", border: 0, background: "transparent", color: "inherit", cursor: "pointer", fontFamily: "monospace", textAlign: "left" },
+    cardTitle: { color: "#91a8bb", fontSize: "9px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase" },
+    collapseGlyph: { color: "#6f8ca2", fontSize: "13px", lineHeight: 1, fontWeight: 700 },
     kv: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "10px", padding: "3px 0", borderBottom: "1px solid #18212a" },
     key: { color: "#758595", fontSize: "9px", flex: "0 0 105px" },
     value: { color: "#d8e1e9", fontSize: "9px", textAlign: "right", overflowWrap: "anywhere" },
@@ -743,6 +814,9 @@ const styles = {
     controlField: { display: "flex", flexDirection: "column", gap: "3px", minWidth: 0 },
     controlLabel: { color: "#708090", fontSize: "8px", textTransform: "uppercase", letterSpacing: "0.4px" },
     multiLaunch: { display: "flex", alignItems: "flex-end", paddingBottom: "1px" },
+    multiActivityRows: { marginTop: "7px" },
+    multiActivityRow: { display: "grid", gridTemplateColumns: "1.2fr 66px 1fr 1fr 1.35fr", gap: "8px", alignItems: "center", padding: "5px 3px", borderBottom: "1px solid #1a232c", fontSize: "9px" },
+    multiTargetName: { color: "#dbe5ee", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
     input: { minWidth: 0, fontFamily: "monospace", color: "#d8e1e9", background: "#0b1117", border: "1px solid #2b3945", borderRadius: "4px", padding: "6px 7px", fontSize: "9px" },
     primaryButton: { fontFamily: "monospace", padding: "6px 8px", borderRadius: "4px", border: "1px solid #2e5c7d", background: "#12304a", color: "#bfe4ff", cursor: "pointer", whiteSpace: "nowrap", fontSize: "9px" },
     clearButton: { fontFamily: "monospace", padding: "6px 8px", borderRadius: "4px", border: "1px solid #5b4930", background: "#271e11", color: "#f0cf91", cursor: "pointer", whiteSpace: "nowrap", fontSize: "9px" },
