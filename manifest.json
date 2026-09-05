@@ -10,6 +10,7 @@
     "hacking/batch-scheduler.js",
     "hacking/multi-target-scheduler.js",
     "hacking/pipeline-runner.js",
+    "hacking/prepper.js",
     "hacking/economy-planner.js",
     "hacking/economy-targets.js",
     "hacking/planner.js",
