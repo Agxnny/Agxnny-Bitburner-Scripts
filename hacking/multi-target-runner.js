@@ -19,6 +19,7 @@ import {
 import { isQuiet, positionalArgs } from "/lib/output.js";
 
 const SCRIPT = "/hacking/multi-target-runner.js";
+const CONTROLLER_FLAG = "--controller";
 const DEFAULT_PROFILE = "money";
 const DEFAULT_TARGET_COUNT = 4;
 const DEFAULT_HACK_FRACTION = 0.10;
@@ -51,7 +52,7 @@ const PROFILE_WEIGHTS = Object.freeze({
  * - only already-prepared targets are admitted;
  * - one coordinator owns Port 14 and routes timing events by batchId;
  * - unique batch IDs on every invocation;
- * - controller must be fully parked in STANDBY;
+ * - manual runs require STANDBY; controller-owned runs require MULTI mode;
  * - no dynamic Port 19 live-depth promotion yet.
  *
  * Usage:
@@ -62,7 +63,9 @@ const PROFILE_WEIGHTS = Object.freeze({
 export async function main(ns) {
     ns.disableLog("ALL");
     const quiet = isQuiet(ns);
-    const parsed = parseRunArgs(positionalArgs(ns));
+    const controllerOwned = ns.args.some((arg) => String(arg).toLowerCase() === CONTROLLER_FLAG);
+    const args = positionalArgs(ns).filter((arg) => String(arg).toLowerCase() !== CONTROLLER_FLAG);
+    const parsed = parseRunArgs(args);
     if (!parsed.ok) {
         if (!quiet) {
             ns.tprint(`[MULTI-REAL] BLOCKED: ${parsed.reason}`);
@@ -80,9 +83,9 @@ export async function main(ns) {
         return;
     }
 
-    const preflight = preflightCheck(ns);
+    const preflight = preflightCheck(ns, controllerOwned);
     if (!preflight.ok) {
-        publishState(ns, profile, globalLiveDepth, "BLOCKED", preflight.reason, [], [], runId);
+        publishState(ns, profile, globalLiveDepth, "BLOCKED", preflight.reason, [], [], runId, controllerOwned);
         if (!quiet) ns.tprint(`[MULTI-REAL] BLOCKED: ${preflight.reason}`);
         return;
     }
@@ -100,14 +103,14 @@ export async function main(ns) {
     const prepared = templates.filter((target) => target.preparedNow);
     if (prepared.length < globalLiveDepth) {
         const reason = `Need ${globalLiveDepth} prepared candidate targets; found ${prepared.length} within top ${targetCount}`;
-        publishState(ns, profile, globalLiveDepth, "BLOCKED", reason, [], [], runId);
+        publishState(ns, profile, globalLiveDepth, "BLOCKED", reason, [], [], runId, controllerOwned);
         if (!quiet) ns.tprint(`[MULTI-REAL] BLOCKED: ${reason}`);
         return;
     }
 
     const plan = buildConservativePlan(ns, pool, prepared, globalLiveDepth, runId);
     if (!plan.ok) {
-        publishState(ns, profile, globalLiveDepth, "BLOCKED", plan.reason, [], [], runId);
+        publishState(ns, profile, globalLiveDepth, "BLOCKED", plan.reason, [], [], runId, controllerOwned);
         if (!quiet) ns.tprint(`[MULTI-REAL] BLOCKED: ${plan.reason}`);
         return;
     }
@@ -120,7 +123,7 @@ export async function main(ns) {
         for (const batch of live) ns.tprint(`[MULTI-REAL] ADMIT ${batch.target} | ${batch.id}`);
     }
 
-    publishState(ns, profile, globalLiveDepth, "RUNNING", `${live.length} real batch(es) admitted`, live, [], runId);
+    publishState(ns, profile, globalLiveDepth, "RUNNING", `${live.length} real batch(es) admitted`, live, [], runId, controllerOwned);
     let safetyStop = "";
     const completed = [];
 
@@ -177,14 +180,14 @@ export async function main(ns) {
             }
         }
 
-        publishState(ns, profile, globalLiveDepth, safetyStop ? "SAFETY_STOP" : "RUNNING", safetyStop || `${live.filter((batch) => !batch.done).length} batch(es) in flight`, live, completed, runId);
+        publishState(ns, profile, globalLiveDepth, safetyStop ? "SAFETY_STOP" : "RUNNING", safetyStop || `${live.filter((batch) => !batch.done).length} batch(es) in flight`, live, completed, runId, controllerOwned);
         if (safetyStop) break;
         await ns.sleep(LOOP_MS);
     }
 
     const status = safetyStop ? "SAFETY_STOP" : "COMPLETE";
     const reason = safetyStop || `Completed ${completed.length}/${live.length} conservative real multi-target batch(es)`;
-    publishState(ns, profile, globalLiveDepth, status, reason, live, completed, runId);
+    publishState(ns, profile, globalLiveDepth, status, reason, live, completed, runId, controllerOwned);
     if (!quiet) {
         ns.tprint(`[MULTI-REAL] ${status} | completed ${completed.length}/${live.length}`);
         if (safetyStop) ns.tprint(`[MULTI-REAL] ${safetyStop}`);
@@ -396,12 +399,13 @@ function validateComplete(complete) {
     return { ok: true, reason: "" };
 }
 
-function preflightCheck(ns) {
+function preflightCheck(ns, controllerOwned) {
     const controller = readControllerState(ns);
     if (!controller) return { ok: false, reason: "Controller state unavailable" };
     const mode = String(controller.executionMode?.mode ?? "STANDBY").toUpperCase();
     const pending = String(controller.executionMode?.pending ?? "").trim();
-    if (mode !== "STANDBY" || pending) return { ok: false, reason: `Controller must be fully parked in STANDBY; current ${pending ? `${mode} -> ${pending}` : mode}` };
+    const requiredMode = controllerOwned ? "MULTI" : "STANDBY";
+    if (mode !== requiredMode || pending) return { ok: false, reason: `${controllerOwned ? "Controller-owned" : "Manual"} multi-target run requires ${requiredMode}; current ${pending ? `${mode} -> ${pending}` : mode}` };
     if (Number(controller.execution?.activeJobs ?? 0) > 0) return { ok: false, reason: "Controller still has active standalone workers" };
 
     if (ns.scriptRunning("/hacking/pipeline-runner.js", "home")) return { ok: false, reason: "Single-target pipeline-runner is active on home" };
@@ -425,7 +429,7 @@ function preflightCheck(ns) {
     return { ok: true, reason: "" };
 }
 
-function publishState(ns, profile, globalLiveDepth, status, reason, batches, completed, runId) {
+function publishState(ns, profile, globalLiveDepth, status, reason, batches, completed, runId, controllerOwned) {
     publishMultiTargetSchedulerState(ns, {
         version: 2,
         model: "MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE",
@@ -433,6 +437,7 @@ function publishState(ns, profile, globalLiveDepth, status, reason, batches, com
         launchesWorkers: true,
         consumesBatchTimingPort: true,
         finite: true,
+        controllerOwned,
         runId,
         profile,
         status,
