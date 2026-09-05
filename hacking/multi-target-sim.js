@@ -1,5 +1,7 @@
 import { getExecutionPool } from "/lib/execution.js";
-import { getTargetBatchSafety } from "/lib/batch-history.js";
+import { readOverlapEvidence } from "/lib/multi-overlap-evidence.js";
+import { targetOverlapPolicy } from "/lib/multi-overlap-policy.js";
+import { multiTargetRankings } from "/lib/multi-target-ranking.js";
 import {
     buildPreparedBatchTemplate,
     commitReservation,
@@ -39,17 +41,13 @@ const PROFILE_WEIGHTS = Object.freeze({
 /**
  * Persistent planning-only multi-target admission simulation.
  *
- * It repeatedly frees expired virtual reservations, refreshes target readiness,
- * and admits the highest-value feasible prepared target into one shared global
- * RAM/time calendar. It launches no workers and never consumes Port 14.
- *
- * Real Port 19 pipeline history now acts as a hard per-target simulated depth
- * ceiling. Targets with no trustworthy real pipeline history remain capped at
- * depth 1, while proven targets may earn higher virtual depth.
+ * Candidate overlap depth comes from the same policy used by diagnostics and
+ * future real MULTI. Pipeline history can simulate a depth-2 validation
+ * candidate, while dedicated evidence is published separately as production
+ * proof. This script launches no workers and never consumes Port 14.
  *
  * Usage:
  *   run hacking/multi-target-sim.js [money|balanced|xp] [targetCount] [hackFraction] [stageGapMs] [maxInFlight]
- *
  * @param {NS} ns
  */
 export async function main(ns) {
@@ -85,9 +83,9 @@ export async function main(ns) {
     const lifetimeByTarget = new Map();
 
     if (!quiet) {
-        ns.tprint("=== MULTI-TARGET ADMISSION SIM · PERSISTENT ===");
+        ns.tprint("=== MULTI-TARGET ADMISSION SIM · SHARED OVERLAP POLICY ===");
         ns.tprint(`Profile ${profile.toUpperCase()} | workers launched: NO | Port 17 live state`);
-        ns.tprint("Prepared targets are additionally capped by rolling real Port 19 pipeline evidence.");
+        ns.tprint("Candidate depth and dedicated production proof are shown separately.");
     }
 
     while (true) {
@@ -95,6 +93,7 @@ export async function main(ns) {
         const planner = readPlannerState(ns);
         const economic = readEconomyTargetState(ns);
         const batchHistory = readBatchHistoryState(ns);
+        const overlapEvidence = readOverlapEvidence(ns);
         const pool = getExecutionPool(ns, planner);
         const newHostSetKey = pool.map((host) => host.hostname).sort().join("|");
 
@@ -108,28 +107,24 @@ export async function main(ns) {
         hosts = createHostCalendar(pool, hosts, now);
 
         const justCompleted = inFlight.filter((batch) => batch.finalLandingAt <= now);
-        if (justCompleted.length > 0) {
-            for (const batch of justCompleted) {
-                totalCompleted += 1;
-                completions.push({ target: batch.target, completedAt: now, expectedCash: batch.expectedCash });
-                const life = getLife(lifetimeByTarget, batch.target);
-                life.completed += 1;
-                life.expectedCashCompleted += batch.expectedCash;
-            }
-            inFlight = inFlight.filter((batch) => batch.finalLandingAt > now);
+        for (const batch of justCompleted) {
+            totalCompleted += 1;
+            completions.push({ target: batch.target, completedAt: now, expectedCash: batch.expectedCash });
+            const life = getLife(lifetimeByTarget, batch.target);
+            life.completed += 1;
+            life.expectedCashCompleted += batch.expectedCash;
         }
+        if (justCompleted.length) inFlight = inFlight.filter((batch) => batch.finalLandingAt > now);
         completions = completions.filter((entry) => entry.completedAt >= now - RECENT_COMPLETION_WINDOW_MS);
 
         if (now >= targetRefreshAt) {
-            templates = sourceRankings(planner, economic, profile)
+            templates = multiTargetRankings(planner, economic, profile)
                 .slice(0, targetCount)
                 .map((entry) => buildPreparedBatchTemplate(ns, entry, hackFraction, stageGapMs))
                 .filter((entry) => entry.ok);
             normalizeObjectiveScores(templates, weights);
             for (const target of templates) {
-                if (!nextLandingByTarget.has(target.hostname)) {
-                    nextLandingByTarget.set(target.hostname, now + target.firstLandingDelayMs);
-                }
+                if (!nextLandingByTarget.has(target.hostname)) nextLandingByTarget.set(target.hostname, now + target.firstLandingDelayMs);
             }
             targetRefreshAt = now + TARGET_REFRESH_MS;
         }
@@ -142,8 +137,8 @@ export async function main(ns) {
             for (const target of templates) {
                 if (!target.preparedNow) continue;
                 const targetDepth = inFlight.filter((batch) => batch.target === target.hostname).length;
-                const safety = getTargetBatchSafety(batchHistory, target.hostname);
-                const depthCap = clampInt(Number(safety.recommendedDepth ?? 1), 1, 64);
+                const policy = targetOverlapPolicy(batchHistory, target.hostname, overlapEvidence);
+                const depthCap = clampInt(Number(policy.candidateDepth ?? 1), 1, 2);
                 if (targetDepth >= depthCap) continue;
 
                 const earliest = Number(nextLandingByTarget.get(target.hostname) ?? now + target.firstLandingDelayMs);
@@ -153,10 +148,10 @@ export async function main(ns) {
                 if (!reservation.ok) continue;
 
                 const adjustedScore = target.baseScore / (1 + FAIRNESS_PENALTY * targetDepth);
-                candidates.push({ target, batch, reservation, adjustedScore, targetDepth, depthCap, safety });
+                candidates.push({ target, batch, reservation, adjustedScore, targetDepth, depthCap, policy });
             }
 
-            if (candidates.length === 0) {
+            if (!candidates.length) {
                 blockedTicks += 1;
                 break;
             }
@@ -171,7 +166,7 @@ export async function main(ns) {
             landingTimes.sort((a, b) => a - b);
             nextLandingByTarget.set(chosen.target.hostname, chosen.batch.firstLandingAt + chosen.target.localBatchIntervalMs);
 
-            const virtual = {
+            inFlight.push({
                 id: chosen.batch.id,
                 target: chosen.target.hostname,
                 admittedAt: now,
@@ -181,11 +176,11 @@ export async function main(ns) {
                 score: chosen.adjustedScore,
                 expectedCash: chosen.target.expectedCash,
                 ramTimeGbSec: chosen.target.ramTimeGbSec,
-                safetyDepthCap: chosen.depthCap,
-                safetyConfidence: String(chosen.safety?.confidence ?? "UNPROVEN"),
+                candidateDepthCap: chosen.depthCap,
+                productionProvenDepth: Number(chosen.policy.provenDepth ?? 1),
+                overlapSource: String(chosen.policy.source ?? "UNPROVEN"),
                 allocations: chosen.reservation.allocations,
-            };
-            inFlight.push(virtual);
+            });
             admittedThisTick += 1;
             totalAdmitted += 1;
             const life = getLife(lifetimeByTarget, chosen.target.hostname);
@@ -199,14 +194,14 @@ export async function main(ns) {
             const active = inFlight.filter((batch) => batch.target === target.hostname);
             const recentCompleted = completions.filter((entry) => entry.target === target.hostname).length;
             const life = getLife(lifetimeByTarget, target.hostname);
-            const safety = getTargetBatchSafety(batchHistory, target.hostname);
-            const safetyDepthCap = clampInt(Number(safety.recommendedDepth ?? 1), 1, 64);
-            const capReached = target.preparedNow && active.length >= safetyDepthCap;
+            const policy = targetOverlapPolicy(batchHistory, target.hostname, overlapEvidence);
+            const candidateDepthCap = clampInt(Number(policy.candidateDepth ?? 1), 1, 2);
+            const capReached = target.preparedNow && active.length >= candidateDepthCap;
             return {
                 hostname: target.hostname,
                 preparedNow: target.preparedNow,
                 schedulerState: target.preparedNow
-                    ? (active.length > 0 ? (capReached ? "AT_SAFETY_CAP" : "RUNNING") : "READY")
+                    ? (active.length > 0 ? (capReached ? "AT_CANDIDATE_CAP" : "RUNNING") : "READY")
                     : "WAITING_PREP",
                 moneyRatio: target.moneyRatio,
                 securityDelta: target.securityDelta,
@@ -214,12 +209,12 @@ export async function main(ns) {
                 moneyEfficiency: target.moneyEfficiency,
                 xpProxyEfficiency: target.xpProxyEfficiency,
                 activeDepth: active.length,
-                safetyDepthCap,
-                safetyConfidence: String(safety.confidence ?? "UNPROVEN"),
-                pipelineEvidence: Number(safety.pipelineSampleCount ?? 0),
-                consecutiveCleanPipeline: Number(safety.consecutiveClean ?? 0),
-                latestPipelineHealthy: Boolean(safety.latestHealthy),
-                safetyReason: String(safety.reason ?? ""),
+                candidateDepthCap,
+                productionProvenDepth: Number(policy.provenDepth ?? 1),
+                eligibleForValidation: Boolean(policy.eligibleForValidation),
+                eligibleForOverlap: Boolean(policy.eligibleForOverlap),
+                overlapSource: String(policy.source ?? "UNPROVEN"),
+                overlapReason: String(policy.reason ?? ""),
                 recentCompleted,
                 lifetimeAdmitted: life.admitted,
                 lifetimeCompleted: life.completed,
@@ -233,13 +228,12 @@ export async function main(ns) {
         }).sort((a, b) => b.activeDepth - a.activeDepth || b.baseScore - a.baseScore);
 
         const state = {
-            version: 3,
-            model: "MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED",
+            version: 4,
+            model: "MULTI_TARGET_ADMISSION_SIM_V4_SHARED_OVERLAP_POLICY",
             dryRun: true,
             persistent: true,
             launchesWorkers: false,
             consumesBatchTimingPort: false,
-            enforcesBatchHistoryDepthCap: true,
             profile,
             targetCount,
             requestedHackFraction: hackFraction,
@@ -248,7 +242,7 @@ export async function main(ns) {
             status: pool.length === 0 ? "BLOCKED" : "RUNNING",
             reason: pool.length === 0
                 ? "No remote production RAM available"
-                : `${inFlight.length} virtual batch(es) in flight; real Port 19 evidence caps every target independently`,
+                : `${inFlight.length} virtual batch(es) in flight; shared overlap policy caps candidate depth at 1/2`,
             startedAt,
             updatedAt: now,
             runtimeMs: now - startedAt,
@@ -272,16 +266,14 @@ export async function main(ns) {
             },
             prepper: {
                 online: Boolean(prepper && Date.now() - Number(prepper.updatedAt ?? 0) <= 5_000),
-                reservedHost: String(prepper?.reservedHost ?? ""),
                 status: String(prepper?.status ?? "UNKNOWN"),
-                currentTarget: String(prepper?.currentTarget ?? ""),
                 preparedCount: Number(prepper?.preparedCount ?? 0),
                 targetCount: Number(prepper?.targetCount ?? 0),
             },
-            batchHistory: {
-                online: Boolean(batchHistory && Date.now() - Number(batchHistory.updatedAt ?? 0) <= 5_000),
-                model: String(batchHistory?.model ?? ""),
-                updatedAt: Number(batchHistory?.updatedAt ?? 0),
+            overlapEvidence: {
+                model: String(overlapEvidence?.model ?? ""),
+                updatedAt: Number(overlapEvidence?.updatedAt ?? 0),
+                targetCount: Object.keys(overlapEvidence?.targets ?? {}).length,
             },
             targets: targetStates,
             inFlight: inFlight.slice(0, 64),
@@ -293,14 +285,11 @@ export async function main(ns) {
                 reservationCount: host.reservations.length,
             })).sort((a, b) => b.peakReservedRam - a.peakReservedRam).slice(0, 16),
             notes: [
-                "Persistent simulation only: no H/G/W workers are launched.",
-                "Expired virtual reservations are freed and new work is admitted continuously.",
-                "Only targets currently at >=99.5% money and <=+0.05 security receive production admissions.",
-                "Each target is hard-capped by Port 19 recommendedDepth; no real pipeline evidence means depth 1.",
-                "Existing virtual work is never killed if a cap falls; new admissions pause until depth drops below the cap.",
-                "Unprepared targets remain WAITING_PREP while the dedicated Port 18 prepper works independently.",
-                "Fairness pressure is based on current virtual depth, so it does not accumulate forever.",
-                "Port 14 remains untouched; this is not yet the real multi-target executor.",
+                "Planning only: no H/G/W workers are launched and Port 14 is untouched.",
+                "Shared overlap policy distinguishes depth-2 validation candidates from dedicated production proof.",
+                "Simulation may model candidate depth 2 before production proof so capacity can be evaluated safely.",
+                "Future real MULTI must use productionProvenDepth, not candidateDepthCap, for admissions.",
+                "Only prepared targets at >=99.5% money and <=+0.05 security receive virtual admissions.",
             ],
         };
         publishMultiTargetSchedulerState(ns, state);
@@ -309,33 +298,20 @@ export async function main(ns) {
             lastTerminalSummaryAt = now;
             printSummary(ns, state);
         }
-
         await ns.sleep(LOOP_MS);
     }
 }
 
-function sourceRankings(planner, economic, profile) {
-    if (profile === "xp") return Array.isArray(planner?.rankings) ? planner.rankings : [];
-    const economicRows = Array.isArray(economic?.rankings) ? economic.rankings : [];
-    if (economicRows.length >= 2) return economicRows;
-    return Array.isArray(planner?.rankings) ? planner.rankings : [];
-}
-
 function getLife(map, hostname) {
-    if (!map.has(hostname)) {
-        map.set(hostname, { admitted: 0, completed: 0, expectedCashAdmitted: 0, expectedCashCompleted: 0 });
-    }
+    if (!map.has(hostname)) map.set(hostname, { admitted: 0, completed: 0, expectedCashAdmitted: 0, expectedCashCompleted: 0 });
     return map.get(hostname);
 }
-
 function printSummary(ns, state) {
     ns.tprint(`[MULTI-SIM] ${state.profile.toUpperCase()} | ${state.capacity.inFlight}/${state.capacity.maxInFlight} in flight | ${state.capacity.totalAdmitted} admitted | ${state.capacity.totalCompleted} completed | ${state.capacity.availableRam.toFixed(1)} GB / ${state.capacity.hostCount} hosts`);
     for (const target of state.targets ?? []) {
-        const evidence = `${target.pipelineEvidence}ev/${target.safetyConfidence}`;
-        ns.tprint(`  ${target.hostname.padEnd(18)} depth ${String(target.activeDepth).padStart(2)}/${String(target.safetyDepthCap).padStart(2)} | ${target.schedulerState.padEnd(13)} | ${evidence.padEnd(10)} | score ${target.baseScore.toFixed(3)} | completed60s ${target.recentCompleted}`);
+        ns.tprint(`  ${target.hostname.padEnd(18)} depth ${String(target.activeDepth).padStart(2)}/${target.candidateDepthCap} candidate · proven ${target.productionProvenDepth} | ${target.schedulerState.padEnd(16)} | ${target.overlapSource}`);
     }
 }
-
 function normalizeProfile(value) {
     const profile = String(value ?? DEFAULT_PROFILE).trim().toLowerCase();
     return PROFILE_WEIGHTS[profile] ? profile : DEFAULT_PROFILE;
