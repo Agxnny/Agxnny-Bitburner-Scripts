@@ -1,14 +1,12 @@
-const GUI_SCRIPT = "/ui/dashboard.js";
-const STOCK_GUI_SCRIPT = "/stocks/dashboard.js";
+const DASHBOARD_LAUNCHER = "/ui/dashboard-launcher.js";
 const KICKSTART_SCRIPT = "/kickstart.js";
 
 /**
  * One-command startup entrypoint.
  *
- * Starts the main control-plane GUI and the separate stock Market Lab dashboard
- * on home, then launches the control-plane stack in quiet mode. The controller
- * initializes in STANDBY, so startup brings planner/economy/controller/UI state
- * online without starting production H/G/W work until the user selects a mode.
+ * Delegates GUI admission to a low-RAM deferred launcher so this script can
+ * release its own RAM before the main dashboard is retried. Then hands off to
+ * the normal quiet kickstart chain. Controller startup remains STANDBY-safe.
  *
  * @param {NS} ns
  */
@@ -20,14 +18,12 @@ export async function main(ns) {
 
     ns.disableLog("ALL");
 
-    launchDashboard(ns, GUI_SCRIPT, "main GUI");
-    launchDashboard(ns, STOCK_GUI_SCRIPT, "stock Market Lab");
+    if (!ns.isRunning(DASHBOARD_LAUNCHER, "home")) {
+        const pid = ns.run(DASHBOARD_LAUNCHER, 1);
+        if (pid <= 0) {
+            ns.tprint("WARNING: Could not start deferred dashboard launcher. Continuing startup.");
+        }
+    }
 
     ns.spawn(KICKSTART_SCRIPT, { threads: 1, spawnDelay: 0 }, "--quiet");
-}
-
-function launchDashboard(ns, script, label) {
-    if (ns.isRunning(script, "home")) return;
-    const pid = ns.run(script, 1);
-    if (pid <= 0) ns.tprint(`WARNING: Could not start the ${label}. Continuing startup.`);
 }
