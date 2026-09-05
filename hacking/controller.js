@@ -2,6 +2,7 @@ import { ActionType, TargetPhase, createTargetState } from "/lib/state.js";
 import {
     RuntimePort,
     publishControllerState,
+    readBatchSchedulerState,
     readBatchState,
     readEconomyTargetState,
     readPlannerState,
@@ -12,14 +13,18 @@ import { isQuiet, positionalArgs, quietArgs } from "/lib/output.js";
 
 const TACTICAL_PLANNER_SCRIPT = "/hacking/tactical-planner.js";
 const BATCH_RUNNER_SCRIPT = "/hacking/batch-runner.js";
+const PIPELINE_RUNNER_SCRIPT = "/hacking/pipeline-runner.js";
 const DEFAULT_BATCH_GAP_MS = 200;
 const BATCH_SECURITY_TOLERANCE = 0.05;
 const BATCH_MONEY_TOLERANCE = 0.995;
 const BATCH_RETRY_MS = 2_000;
+const PIPELINE_RETRY_MS = 2_000;
+const PIPELINE_READY_SETTLE_MS = 1_100;
 const MAX_RECENT_EVENTS = 8;
 const EMPTY_PORT = "NULL PORT DATA";
 const PREP_MONEY_RATIO = 0.999999;
 const PREP_SECURITY_TOLERANCE = 0.001;
+const EXECUTION_MODES = Object.freeze(new Set(["STANDBY", "HGW", "BATCH", "PIPELINE"]));
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -41,7 +46,10 @@ export async function main(ns) {
     let activeOperation = null;
     let tacticalJob = null;
     let batchJob = null;
+    let pipelineJob = null;
     let lastBatchAttemptAt = 0;
+    let lastPipelineAttemptAt = 0;
+    let pipelineReadySince = 0;
     let pendingRequestId = "";
     let requestSequence = 0;
     let jobSequence = 0;
@@ -68,21 +76,28 @@ export async function main(ns) {
             batchJob = null;
             recordFinishedBatch(ns, executionMode, finishedBatchJob);
         }
+        if (pipelineJob && !ns.isRunning(pipelineJob.pid, pipelineJob.hostname)) {
+            const finishedPipelineJob = pipelineJob;
+            pipelineJob = null;
+            recordFinishedPipeline(ns, executionMode, prep, finishedPipelineJob);
+            pipelineReadySince = 0;
+        }
 
-        // A mode request is a scheduling barrier. Tactical analysis is safe to
-        // cancel immediately because it has no target-side effects; already
-        // running H/G/W workers or a batch are allowed to finish naturally.
+        // Mode changes are scheduling barriers. Tactical analysis has no target
+        // side effect and may be cancelled. Target-side workers and admitted batch
+        // or pipeline work drain naturally before the new mode applies.
         if (executionMode.pending && tacticalJob) {
             ns.kill(tacticalJob.pid, tacticalJob.hostname);
             tacticalJob = null;
             pendingRequestId = "";
-            executionMode.lastMessage = `Switching to ${executionMode.pending}; tactical analysis cancelled, waiting for active execution to reach a safe boundary`;
+            executionMode.lastMessage = `Switching to ${executionMode.pending}; tactical analysis cancelled, waiting for target-side work to drain`;
         }
 
-        const controllerIdle = activeJobs.length === 0 && !tacticalJob && !batchJob;
+        const controllerIdle = activeJobs.length === 0 && !tacticalJob && !batchJob && !pipelineJob;
 
         if (executionMode.pending && controllerIdle) {
             applyExecutionModeCommand(executionMode, prep);
+            pipelineReadySince = 0;
             pendingRequestId = "";
         }
 
@@ -90,6 +105,7 @@ export async function main(ns) {
             const result = applyTargetCommand(planner, state, prep, targetControl);
             state = result.state;
             manualTarget = targetControl.manualTarget;
+            pipelineReadySince = 0;
             pendingRequestId = "";
         }
 
@@ -97,19 +113,23 @@ export async function main(ns) {
             const previousTarget = state.hostname;
             const previousMoneyTarget = state.money.desiredPercent;
             state = adoptLatestPlannerTarget(planner, state);
-            if (state.hostname !== previousTarget || state.money.desiredPercent !== previousMoneyTarget) pendingRequestId = "";
+            if (state.hostname !== previousTarget || state.money.desiredPercent !== previousMoneyTarget) {
+                pipelineReadySince = 0;
+                pendingRequestId = "";
+            }
         }
 
         updateObservedState(ns, state);
         const previousPrepStage = prep.stage;
         if (prep.active) choosePrepAction(state, prep);
         else if (prep.hold) choosePrepHoldAction(state, prep);
-        else if (executionMode.mode === "BATCH") chooseBatchFoundationAction(state);
+        else if (executionMode.mode === "STANDBY") chooseStandbyAction(state);
+        else if (executionMode.mode === "BATCH" || executionMode.mode === "PIPELINE") chooseBatchFoundationAction(state);
         else chooseFoundationAction(state);
         if (prep.stage !== previousPrepStage) pendingRequestId = "";
         syncPrepState(state, prep);
         syncTargetControlState(state, targetControl);
-        syncExecutionModeState(state, executionMode, batchJob);
+        syncExecutionModeState(state, executionMode, batchJob, pipelineJob);
         updateExecutionState(ns, state, planner, activeJobs);
 
         if (operationJustFinished) {
@@ -123,25 +143,67 @@ export async function main(ns) {
         }
 
         if (executionMode.pending) {
+            pipelineReadySince = 0;
             pendingRequestId = "";
             state.tactical.status = `SWITCHING_${executionMode.pending}`;
             const blockers = [];
             if (activeJobs.length > 0) blockers.push(`${activeJobs.length} worker job(s)`);
-            if (batchJob) blockers.push("current batch");
+            if (batchJob) blockers.push("serialized batch");
+            if (pipelineJob) blockers.push("pipeline wave");
             state.reason = blockers.length
-                ? `Switching execution mode to ${executionMode.pending}; no new work will be scheduled while waiting for ${blockers.join(" + ")} to finish`
-                : `Switching execution mode to ${executionMode.pending}; waiting for safe boundary`;
+                ? `Switching to ${executionMode.pending}; no new work will be scheduled while waiting for ${blockers.join(" + ")} to finish`
+                : `Switching to ${executionMode.pending}; waiting for safe boundary`;
+        } else if (pipelineJob) {
+            pipelineReadySince = 0;
+            pendingRequestId = "";
+            state.tactical.status = "PIPELINE_RUNNING";
+            state.reason = `Depth-2 HWGW pipeline running on ${pipelineJob.hostname}`;
         } else if (batchJob) {
+            pipelineReadySince = 0;
             pendingRequestId = "";
             state.tactical.status = "BATCH_RUNNING";
-            state.reason = `Synchronized HWGW batch running on ${batchJob.hostname}`;
+            state.reason = `Serialized HWGW batch running on ${batchJob.hostname}`;
         } else if (activeJobs.length > 0) {
+            pipelineReadySince = 0;
             state.tactical.status = prep.active ? `PREP_${prep.stage}_RUNNING` : "WAITING_WORKERS";
             state.reason += ` | waiting for ${activeJobs.length} worker job(s)`;
         } else if (prep.hold) {
+            pipelineReadySince = 0;
             pendingRequestId = "";
             state.tactical.status = "PREPARED_HOLD";
+        } else if (executionMode.mode === "STANDBY") {
+            pipelineReadySince = 0;
+            pendingRequestId = "";
+            state.tactical.status = "STANDBY";
+            state.reason = "Standby: control plane is online; no target-side workers or batch coordinators will be launched";
+        } else if (executionMode.mode === "PIPELINE" && state.action === ActionType.NONE) {
+            pendingRequestId = "";
+            if (executionMode.pipelineSafetyStopped) {
+                pipelineReadySince = 0;
+                state.tactical.status = "PIPELINE_SAFETY_STOP";
+                state.reason = `${executionMode.lastMessage} · use Resume auto to clear the stop after review`;
+            } else if (!(pipelineReadySince > 0)) {
+                pipelineReadySince = Date.now();
+                state.tactical.status = "PIPELINE_READY";
+                state.reason = "Pipeline target prepared; publishing an idle controller snapshot before coordinator launch";
+            } else if (Date.now() - pipelineReadySince < PIPELINE_READY_SETTLE_MS) {
+                state.tactical.status = "PIPELINE_READY";
+                state.reason = "Pipeline target prepared; waiting one control tick before coordinator launch";
+            } else if (Date.now() - lastPipelineAttemptAt >= PIPELINE_RETRY_MS) {
+                lastPipelineAttemptAt = Date.now();
+                const request = launchPipelineRunner(ns, planner, state);
+                if (request.pid > 0) {
+                    pipelineJob = request;
+                    state.tactical.status = "PIPELINE_RUNNING";
+                    state.reason = `Launched continuous depth-2 HWGW pipeline on ${request.hostname}`;
+                    executionMode.lastMessage = `Continuous depth-2 pipeline active on ${state.hostname}`;
+                } else {
+                    state.tactical.status = "PIPELINE_BLOCKED";
+                    state.reason += " | no remote host has enough free RAM for the pipeline coordinator";
+                }
+            }
         } else if (executionMode.mode === "BATCH" && state.action === ActionType.NONE) {
+            pipelineReadySince = 0;
             pendingRequestId = "";
             if (executionMode.awaitingReview) {
                 state.tactical.status = "BATCH_REVIEW";
@@ -162,6 +224,7 @@ export async function main(ns) {
                 }
             }
         } else {
+            pipelineReadySince = 0;
             const tacticalPlan = readTacticalPlanState(ns);
             if (isRequestedPlan(tacticalPlan, state.hostname, pendingRequestId)) {
                 applyTacticalPlan(state, tacticalPlan);
@@ -226,7 +289,7 @@ export async function main(ns) {
 
         syncPrepState(state, prep);
         syncTargetControlState(state, targetControl);
-        syncExecutionModeState(state, executionMode, batchJob);
+        syncExecutionModeState(state, executionMode, batchJob, pipelineJob);
         updateExecutionState(ns, state, planner, activeJobs);
         state.updatedAt = Date.now();
         publishControllerState(ns, state);
@@ -247,7 +310,7 @@ function createPrepMode() {
         target: "",
         requestedAt: 0,
         completedAt: 0,
-        lastMessage: "Automatic HGW",
+        lastMessage: "Standby: select an execution mode or prep a target",
     };
 }
 
@@ -263,12 +326,13 @@ function createTargetControl(manualTarget) {
 
 function createExecutionMode() {
     return {
-        mode: "HGW",
+        mode: "STANDBY",
         pending: "",
         awaitingReview: false,
         batchCompletedAt: 0,
         lastBatchId: "",
-        lastMessage: "Normal sequential HGW mode",
+        pipelineSafetyStopped: false,
+        lastMessage: "Standby mode: control plane online, target-side execution paused",
     };
 }
 
@@ -308,7 +372,14 @@ function consumeControllerRequests(ns, state, prep, targetControl, executionMode
 
         if (action === "RESUME_AUTO") {
             resetPrep(prep);
-            prep.lastMessage = executionMode.mode === "BATCH" ? "Automatic batched HWGW resumed" : "Automatic HGW resumed";
+            if (executionMode.mode === "PIPELINE") executionMode.pipelineSafetyStopped = false;
+            prep.lastMessage = executionMode.mode === "PIPELINE"
+                ? "Continuous depth-2 pipeline resumed"
+                : executionMode.mode === "BATCH"
+                    ? "Automatic serialized HWGW resumed"
+                    : executionMode.mode === "HGW"
+                        ? "Automatic HGW resumed"
+                        : "Standby remains active; choose HGW, Batch, or Pipeline to run target-side work";
             changed = true;
         }
 
@@ -329,9 +400,9 @@ function consumeControllerRequests(ns, state, prep, targetControl, executionMode
 
         if (action === "SET_EXECUTION_MODE") {
             const mode = String(request?.mode ?? "").trim().toUpperCase();
-            if (mode === "HGW" || mode === "BATCH") {
+            if (EXECUTION_MODES.has(mode)) {
                 if (mode === executionMode.mode && !executionMode.pending) {
-                    executionMode.lastMessage = mode === "BATCH" ? "Batched HWGW mode already active" : "Normal sequential HGW mode already active";
+                    executionMode.lastMessage = `${mode} mode already active`;
                 } else {
                     executionMode.pending = mode;
                     executionMode.lastMessage = `Switching execution mode to ${mode}; new work is paused until the current safe boundary`;
@@ -347,14 +418,19 @@ function consumeControllerRequests(ns, state, prep, targetControl, executionMode
 function applyExecutionModeCommand(executionMode, prep) {
     const mode = executionMode.pending;
     executionMode.pending = "";
-    if (mode !== "HGW" && mode !== "BATCH") return;
+    if (!EXECUTION_MODES.has(mode)) return;
     executionMode.mode = mode;
     executionMode.awaitingReview = false;
     executionMode.batchCompletedAt = 0;
+    executionMode.pipelineSafetyStopped = false;
     resetPrep(prep);
-    executionMode.lastMessage = mode === "BATCH"
-        ? "Batched HWGW mode active; controller will prep and launch synchronized batches"
-        : "Normal sequential HGW mode active";
+    executionMode.lastMessage = mode === "PIPELINE"
+        ? "Pipeline mode active; controller will prep the target and run continuous depth-2 HWGW"
+        : mode === "BATCH"
+            ? "Serialized batched HWGW mode active; controller will prep and launch one batch at a time"
+            : mode === "HGW"
+                ? "Normal sequential HGW mode active"
+                : "Standby mode active; no target-side workers or batch coordinators will be launched";
 }
 
 function recordFinishedBatch(ns, executionMode, finishedJob) {
@@ -371,6 +447,36 @@ function recordFinishedBatch(ns, executionMode, finishedJob) {
 
     const status = String(batch?.status ?? "UNKNOWN");
     executionMode.lastMessage = `Batch runner exited with state ${status}; controller will re-evaluate target readiness`;
+}
+
+function recordFinishedPipeline(ns, executionMode, prep, finishedJob) {
+    const pipeline = readBatchSchedulerState(ns);
+    const status = String(pipeline?.status ?? "UNKNOWN");
+    if (status === "DRAINED_FOR_MODE_SWITCH") {
+        executionMode.lastMessage = `Pipeline on ${finishedJob.target} drained safely for controller transition`;
+        return;
+    }
+    if (status === "SAFETY_STOP" || status === "DRAINING_AFTER_STOP") {
+        executionMode.pipelineSafetyStopped = true;
+        beginRecoveryPrep(prep, finishedJob.target, `Pipeline safety stop: ${String(pipeline?.reason ?? status)}`);
+        executionMode.lastMessage = `PIPELINE SAFETY STOP: ${String(pipeline?.reason ?? status)}; target will be prepared and held for review`;
+        return;
+    }
+    if (executionMode.mode === "PIPELINE" && !executionMode.pending) {
+        executionMode.pipelineSafetyStopped = true;
+        beginRecoveryPrep(prep, finishedJob.target, `Pipeline coordinator exited unexpectedly with state ${status}`);
+        executionMode.lastMessage = `Pipeline coordinator exited with ${status}; target will be prepared and held before manual resume`;
+    }
+}
+
+function beginRecoveryPrep(prep, target, message) {
+    prep.active = true;
+    prep.hold = false;
+    prep.stage = "GROW";
+    prep.target = target;
+    prep.requestedAt = Date.now();
+    prep.completedAt = 0;
+    prep.lastMessage = message;
 }
 
 function updateBatchReviewBarrier(ns, executionMode) {
@@ -445,7 +551,7 @@ function syncTargetControlState(state, targetControl) {
     };
 }
 
-function syncExecutionModeState(state, executionMode, batchJob) {
+function syncExecutionModeState(state, executionMode, batchJob, pipelineJob) {
     state.executionMode = {
         mode: executionMode.mode,
         pending: executionMode.pending,
@@ -454,6 +560,10 @@ function syncExecutionModeState(state, executionMode, batchJob) {
         batchGapMs: DEFAULT_BATCH_GAP_MS,
         batchRunning: Boolean(batchJob),
         batchRunnerHost: String(batchJob?.hostname ?? ""),
+        pipelineRunning: Boolean(pipelineJob),
+        pipelineRunnerHost: String(pipelineJob?.hostname ?? ""),
+        pipelineMaxDepth: 2,
+        pipelineSafetyStopped: executionMode.pipelineSafetyStopped,
         awaitingReview: executionMode.awaitingReview,
         batchCompletedAt: executionMode.batchCompletedAt,
         lastBatchId: executionMode.lastBatchId,
@@ -489,7 +599,7 @@ function choosePrepAction(state, prep) {
     prep.hold = true;
     prep.stage = "READY";
     prep.completedAt = Date.now();
-    prep.lastMessage = `${state.hostname} prepared at 100% money and minimum security; holding for batch work`;
+    prep.lastMessage = `${state.hostname} prepared at 100% money and minimum security; holding for review`;
     choosePrepHoldAction(state, prep);
 }
 
@@ -497,7 +607,13 @@ function choosePrepHoldAction(state, prep) {
     state.money.desiredPercent = 1;
     state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.NONE;
-    state.reason = `Prep complete: ${prep.target || state.hostname} is held at 100% money / minimum security until Resume Auto`;
+    state.reason = `Prep complete: ${prep.target || state.hostname} is held at 100% money / minimum security until Resume auto`;
+}
+
+function chooseStandbyAction(state) {
+    state.phase = TargetPhase.PRODUCTION;
+    state.action = ActionType.NONE;
+    state.reason = "Standby: target is observed only; no target-side execution is scheduled";
 }
 
 function chooseBatchFoundationAction(state) {
@@ -507,20 +623,20 @@ function chooseBatchFoundationAction(state) {
     if (securityDelta > BATCH_SECURITY_TOLERANCE) {
         state.phase = TargetPhase.SECURITY_PREP;
         state.action = ActionType.WEAKEN;
-        state.reason = `Batch mode prep: security +${formatNumber(securityDelta)} must be within +${BATCH_SECURITY_TOLERANCE.toFixed(2)}`;
+        state.reason = `Batch/pipeline prep: security +${formatNumber(securityDelta)} must be within +${BATCH_SECURITY_TOLERANCE.toFixed(2)}`;
         return;
     }
 
     if (state.money.max > 0 && state.money.current < desiredMoney * BATCH_MONEY_TOLERANCE) {
         state.phase = TargetPhase.MONEY_PREP;
         state.action = ActionType.GROW;
-        state.reason = `Batch mode prep: money below ${(state.money.desiredPercent * 100).toFixed(0)}% strategy target`;
+        state.reason = `Batch/pipeline prep: money below ${(state.money.desiredPercent * 100).toFixed(0)}% strategy target`;
         return;
     }
 
     state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.NONE;
-    state.reason = `Batch-ready at ${(state.money.desiredPercent * 100).toFixed(0)}% money and near-minimum security`;
+    state.reason = `Batch/pipeline-ready at ${(state.money.desiredPercent * 100).toFixed(0)}% money and near-minimum security`;
 }
 
 function createManualState(hostname, analysis = null) {
@@ -659,6 +775,28 @@ function launchBatchRunner(ns, planner, state) {
     return { pid: 0, hostname: "", scriptRam, target: state.hostname };
 }
 
+function launchPipelineRunner(ns, planner, state) {
+    const scriptRam = ns.getScriptRam(PIPELINE_RUNNER_SCRIPT, "home");
+    if (!(scriptRam > 0)) return { pid: 0, hostname: "", scriptRam, target: state.hostname };
+    const hackFraction = clamp(Number(state.strategy.hackPercent ?? 0.10), 0.001, 0.90);
+
+    for (const host of getExecutionPool(ns, planner, DEFAULT_HOME_RESERVE_GB)) {
+        if (host.usableRam < scriptRam) continue;
+        const pid = ns.exec(
+            PIPELINE_RUNNER_SCRIPT,
+            host.hostname,
+            1,
+            state.hostname,
+            hackFraction,
+            DEFAULT_BATCH_GAP_MS,
+            "continuous",
+            ...quietArgs(ns),
+        );
+        if (pid > 0) return { pid, hostname: host.hostname, scriptRam, target: state.hostname };
+    }
+    return { pid: 0, hostname: "", scriptRam, target: state.hostname };
+}
+
 function launchTacticalPlanner(ns, planner, state, prep, sequence) {
     const scriptRam = ns.getScriptRam(TACTICAL_PLANNER_SCRIPT, "home");
     const requestId = `tactical-${Date.now()}-${sequence}`;
@@ -777,11 +915,11 @@ function getEstimatedActionTimeMs(state, action) {
 function printControllerState(ns, state) {
     ns.print("=== CONTROLLER STATE ===");
     ns.print(`Target:    ${state.hostname} | ${state.phase} | ${state.action}`);
-    ns.print(`Execution: ${state.executionMode?.mode ?? "HGW"}${state.executionMode?.pending ? ` / SWITCHING → ${state.executionMode.pending}` : state.executionMode?.batchRunning ? " / BATCH RUNNING" : state.executionMode?.awaitingReview ? " / REVIEW" : ""}`);
+    ns.print(`Execution: ${state.executionMode?.mode ?? "STANDBY"}${state.executionMode?.pending ? ` / SWITCHING → ${state.executionMode.pending}` : state.executionMode?.pipelineRunning ? " / PIPELINE RUNNING" : state.executionMode?.batchRunning ? " / BATCH RUNNING" : state.executionMode?.awaitingReview ? " / REVIEW" : ""}`);
     ns.print(`Targeting: ${state.targetControl?.mode ?? "AUTO"}${state.targetControl?.manualTarget ? ` / ${state.targetControl.manualTarget}` : ""}`);
     ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%) | desired ${(state.money.desiredPercent * 100).toFixed(0)}%`);
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
-    ns.print(`Threads:   ${state.execution.activeThreads} active | ${state.execution.activeJobs} job(s)`);
+    ns.print(`Threads:   ${state.execution.activeThreads} active | ${state.execution.activeJobs} controller job(s)`);
     ns.print(`Tactical:  ${state.tactical.status}`);
     ns.print(`Prep:      ${state.prep?.mode ?? "AUTO"}${state.prep?.stage ? ` / ${state.prep.stage}` : ""}`);
     ns.print(`Reason:    ${state.reason}`);
