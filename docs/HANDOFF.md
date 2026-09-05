@@ -14,7 +14,7 @@ After a major architectural change, refresh `README.md`, this handoff, `docs/arc
 
 ## Project objective
 
-Build a modular, low-RAM Bitburner automation system that evolves from simple distributed HGW into adaptive, synchronized, eventually pipelined/multi-target HWGW.
+Build a modular, low-RAM Bitburner automation system that evolves from simple distributed HGW into adaptive, synchronized, pipelined, eventually multi-target HWGW.
 
 Core design goals:
 
@@ -23,148 +23,114 @@ Core design goals:
 - H/G/W workers remain minimal and dumb.
 - Important decisions are published as structured runtime state.
 - The GUI consumes state and sends commands; it does not own hacking logic.
-- RAM efficiency is a first-class constraint.
+- RAM efficiency and safe recovery are first-class constraints.
 
-## Current live execution milestone
+## Current execution modes
 
-The controller supports two runtime-selectable modes:
+The controller still supports:
 
 1. **Normal HGW** — sequential tactical weaken/grow/hack.
 2. **Batched HWGW** — automatic synchronized **one-batch-at-a-time** HWGW.
 
-The live production path is still serialized. Do not treat the pipeline scheduler as permission to launch overlapping real batches yet.
+That controller-integrated path remains serialized.
 
-Current live batch lifecycle:
+A new standalone `hacking/pipeline-runner.js` now provides the **first opt-in real overlapping depth-2 test**. It is deliberately not wired into automatic controller mode yet.
+
+## Latest validated background
+
+The original W2 grow-security under-compensation bug is fixed. Corrected batches recover money/security to the intended baseline without standalone repair work.
+
+Recent `phantasy` serialized timing showed a healthy representative sample with correct H → W1 → G → W2 order, about 193 ms minimum spacing from a 200 ms plan, about 10 ms max drift, and all timing events reported. Keep the stage gap at 200 ms until repeated depth-2 data says otherwise.
+
+A host-window capacity run on `phantasy` previously reported roughly:
 
 ```text
-select target + strategy
-        ↓
-prepare target
-        ↓
-launch synchronized H / W1 / G / W2
-        ↓
-wait for full completion
-        ↓
-post-batch strategic review barrier
-        ↓
-repair/review if needed
-        ↓
-next batch
+requested timing interval: 800 ms
+RAM-sustainable interval:  ~6280 ms
+remote RAM:                 ~4196 GB / 59 hosts
+burst depth at 800 ms:      16
 ```
 
-## Latest live validation
+Those values are point-in-time observations, not hard-coded production settings.
 
-The original W2 grow-security under-compensation bug is fixed. Corrected `sigma-cosmetics` batches used approximately:
+## Pipeline components
 
-```text
-25H / 1W / 298–299G / 24W
-money recovery: 100%
-security recovery: minimum
-standalone repair weaken: not required
-```
+### `hacking/batch-scheduler.js`
 
-More recent `phantasy` timing telemetry showed a representative healthy sample with correct H → W1 → G → W2 order, approximately 193 ms minimum spacing from a 200 ms plan, maximum drift around 10 ms, and all timing events reported. Continue collecting samples before reducing the stage gap.
-
-## Current highest-priority work
-
-**Build and validate the pipeline scheduler without enabling live overlapping execution yet.**
-
-`hacking/batch-scheduler.js` now has two non-executing modes:
+Still provides non-executing analysis:
 
 ```text
-snapshot   → host-window capacity/cadence analysis
-admission  → persistent live depth-2 admission simulation
+snapshot   → capacity/cadence planner
+admission  → persistent depth-2 virtual admission simulation
 ```
 
 Both publish to **Port 16**.
 
-### Scheduler timing model
+### `hacking/pipeline-runner.js`
 
-Two independent controls are modeled:
-
-```text
-stage gap      = H → W1 → G → W2 spacing inside a batch
-batch interval = H(N) → H(N+1) spacing across batches
-```
-
-The scheduler must protect both. A safe stage gap does not imply a safe cross-batch cadence.
-
-### V2 host-window model
-
-The scheduler calculates stage durations/RAM, creates a global landing calendar, and reserves RAM host-by-host over each future stage execution window. It reports:
-
-- timing-only requested interval;
-- RAM-sustainable interval;
-- burst depth;
-- steady-state concurrent window;
-- host/stage that blocks a candidate when reservation fails.
-
-A first `phantasy` capacity run reported roughly:
+New first executable pipeline test:
 
 ```text
-stage gap:             200 ms
-requested interval:    800 ms
-sustainable interval:  6280 ms
-remote RAM:             4196 GB / 59 hosts
-burst depth:            16
-batch 17:               blocked at HACK
+run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
 
-Treat these as a point-in-time capacity result, not a permanent configuration.
+Important safety rules:
 
-### V3 depth-2 admission simulator
+- hard real depth cap = **2**;
+- default/recommended first test count = **2 total batches**;
+- controller must already be parked in `PREPARED HOLD` on the same target;
+- no standalone controller workers may still be active;
+- no serialized batch runner may be active;
+- target must be at prepared money/security baseline;
+- stages are launched just-in-time from a host-by-host future reservation plan;
+- the runner clears Port 14 once at startup, then becomes the sole timing-event consumer for the test;
+- Port 14 events are routed by `batchId` to the correct in-flight batch;
+- each completed pipeline result is copied to Port 15 so the existing Batch GUI timing graph continues to work;
+- live pipeline status is published to Port 16;
+- launch failure, wrong order, missing timing events, low recovered money, or excessive security stops new waves;
+- already-launched work is allowed to drain rather than admitting more work.
 
-Run:
+The runner executes in **waves** of at most two overlapping batches. Larger requested counts create later depth-2 waves only after the current pair drains and the target is still prepared. Do not use more than `2` for the first live test.
 
-```text
-run hacking/batch-scheduler.js phantasy 0.10 200 admission
-```
+## GUI simplification
 
-This mode **does not launch workers**. It keeps a virtual in-flight set and applies the admission rules intended for the first executable pipeline:
+`ui/dashboard.js` was compacted to reduce repeated information while preserving operational controls and diagnostics.
 
-- hard maximum depth = 2;
-- first virtual admission requires prepared money/security;
-- second admission waits for the sustainable interval;
-- current live remote RAM is rechecked host-by-host;
-- depth 2 blocks further admissions until the oldest virtual batch reaches planned W2;
-- new matching Port 15 completed-batch telemetry is watched for safety failures;
-- bad order, missing timing events, or material recovery errors trigger `SAFETY_STOP` and block further virtual admissions;
-- existing virtual work is allowed to drain.
+Overview now keeps:
 
-The simulator deliberately does not auto-reset a safety stop. Restart it after investigating.
+- four top metrics;
+- one combined quick-controls card for HGW/BATCH + prep/hold/resume;
+- compact target and health/economy cards;
+- Active Workers only while workers actually exist.
 
-See `docs/BATCH_SCHEDULER.md` for detailed rules.
+The Batch tab now combines pipeline state, serialized batch state, latest recovery/timing, the planned-vs-actual graph, and collapsible stage diagnostics into fewer panels. Port 16 real/simulation state is visible there, so terminal tailing is not required for live scheduler observability.
+
+React callbacks remain Netscript-free; port/file work still happens only in the asynchronous dashboard loop.
 
 ## Runtime telemetry relevant to batching
 
 - Port 12: current serialized batch snapshot.
 - Port 14: batch worker timing event queue.
-- Port 15: latest completed batch snapshot.
-- Port 16: latest pipeline scheduler/admission-simulation snapshot.
+- Port 15: latest completed serialized **or pipeline** batch snapshot.
+- Port 16: latest pipeline planner, admission simulation, or real executor snapshot.
 
-Port 14 is still cleared by the serialized batch runner before launch. This is safe only while one real batch is in flight and **must change before live pipelining**.
-
-## GUI observability
-
-The main GUI has a dedicated **Batch** tab showing current/last completed batch state, planned H/W1/G/W2 countdowns, recovery error, actual order, drift/spread, and planned-vs-actual timing graph.
-
-Overview also publishes standalone/prep worker ETA and an Active Workers panel. Worker `LATE` status is diagnostic only; no automatic termination is enabled yet.
+The serialized runner still clears Port 14 before a serialized batch. Therefore `pipeline-runner.js` may only run while serialized batching is parked. Permanent automatic pipelining still requires a single shared queue owner integrated with controller scheduling.
 
 ## Immediate next development sequence
 
 ```text
-1. Pull and run the new depth-2 admission simulation alongside serialized production
-2. Confirm it never launches workers and remains capped at 2 virtual batches
-3. Observe ADMITTED → DEPTH_CAP → DRAIN behavior
-4. Confirm live RAM changes can produce RAM_BLOCKED instead of unsafe admission
-5. Observe new matching Port 15 completions and validate safety-stop evaluation
-6. Continue collecting repeated single-batch timing/recovery samples
-7. Add rolling timing history instead of relying on one Port 15 sample
-8. Redesign Port 14 as one multi-batch-safe event stream owned/routed by the future scheduler
-9. Reuse host-window reservations as the actual allocation plan
-10. Add atomic real depth-2 launch/rollback
-11. Replace the per-batch strategic-review barrier with pipeline-aware review behavior
-12. Only then perform the first executable depth-2 pipeline test
+1. Pull/restart so the compact GUI and pipeline runner are deployed everywhere
+2. Put the intended test target into PREPARED HOLD from the GUI
+3. Confirm all controller workers are idle and no serialized batch is running
+4. Run exactly two real batches with pipeline-runner.js
+5. Watch the Batch tab Port 16 state and Port 15 completed timing graph
+6. Validate BOTH batches: H→W1→G→W2, missing events=0, positive spacing, low drift, money≥99.5%, security≤+0.05
+7. If healthy, repeat a few two-batch tests before asking for more than 2 total batches
+8. Add rolling timing history across completed pipeline batches
+9. Move Port 14 ownership and pipeline admission into the controller-integrated scheduler
+10. Replace the serialized per-batch strategic-review barrier with pipeline-aware admission/review logic
+11. Only raise maximum live depth after repeated depth-2 validation
+12. Keep watchdog termination deferred until pipeline timing is stable
 ```
 
 ## Important architectural constraints
@@ -173,33 +139,25 @@ Overview also publishes standalone/prep worker ETA and an Active Workers panel. 
 
 H/G/W workers do not use home as fallback capacity.
 
-### One real batch at a time for now
+### Controller must be parked for real pipeline tests
 
-The production batch runner remains serialized. The scheduler's depth-2 mode is simulation only.
+The standalone real runner is a test harness, not a third automatic controller mode. Use `Prep target to 100%` and wait for `PREPARED HOLD` before launching it. Do not resume automatic HGW/BATCH while the real pipeline runner is active.
 
-### Execution-mode changes are scheduling barriers
+### Stage gap and batch interval are independent
 
-When HGW/BATCH switching is pending, no new target-side work is scheduled. Tactical analysis may be cancelled; already-running H/G/W or batch work finishes naturally before the mode changes.
+`stage gap` protects H → W1 → G → W2 inside a batch. `batch interval` protects the global landing stream between batches. The first real runner computes a conservative RAM-sustainable interval rather than assuming the timing-only 800 ms cadence.
 
-### Full-batch strategic boundary
+### Port 14 has one owner during a real test
 
-Batch-associated HACK telemetry must not trigger standalone strategic review. The current serialized controller waits for the full batch completion. This review model must be redesigned before a steady pipeline can admit continuously.
+The depth-2 runner consumes all Port 14 timing events and routes them by `batchId`. Do not run the serialized batch runner concurrently.
 
-### GUI React callbacks remain Netscript-free
+### Port 15 remains latest-only
 
-React callbacks may update plain-JS UI/request state only. Netscript I/O stays in the async dashboard loop.
-
-### Batch timing queue is not pipeline-safe yet
-
-Port 14 cannot be cleared per batch once several real batch IDs overlap. One future scheduler must consume and route the shared event stream by `batchId`.
-
-### Latest-completed state is not timing history
-
-Port 15 retains one completed result. Adaptive timing reduction requires a separate rolling history.
+Port 15 is still a snapshot, not history. Adaptive gap reduction needs a separate rolling history layer.
 
 ### Worker watchdog remains deferred
 
-Do not add automatic worker killing until batch/pipeline timing is stable. Any future watchdog must verify the PID, apply measured grace, and force target recovery after a killed partial operation.
+Do not add automatic worker killing until batch/pipeline timing is stable. Any future watchdog must verify PID state, apply measured grace, and force recovery after a killed partial operation.
 
 ## Useful commands
 
@@ -211,9 +169,9 @@ run diagnostics/income.js
 run diagnostics/progression.js
 run network/inspect.js
 run network/root.js
-run hacking/batch-runner.js n00dles 0.10 200 1
 run hacking/batch-scheduler.js phantasy 0.10 200
 run hacking/batch-scheduler.js phantasy 0.10 200 admission
+run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
 
 For repository updates:
@@ -227,7 +185,7 @@ run startup.js
 
 - `docs/README.md` — documentation index
 - `docs/architecture.md` — architecture and data flow
-- `docs/BATCH_SCHEDULER.md` — pipeline scheduler design and milestones
+- `docs/BATCH_SCHEDULER.md` — pipeline planner/executor design
 - `docs/SYSTEM_MAP.md` — responsibility map by script/module
 - `docs/RUNTIME_STATE.md` — ports/state contracts
 - `docs/TESTING.md` — validation procedures
