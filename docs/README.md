@@ -1,33 +1,43 @@
 # Documentation Index
 
-Start here when continuing development in a new chat.
+The repository documentation is split by purpose so current state, architecture, feature descriptions, and testing do not get mixed together.
 
 ## Recommended reading order
 
-1. [`HANDOFF.md`](HANDOFF.md) — current project state, latest validation, highest-priority known issue, and immediate next steps.
-2. [`architecture.md`](architecture.md) — overall architecture, control/execution-plane design, and major data flows.
-3. [`SYSTEM_MAP.md`](SYSTEM_MAP.md) — which script/module owns each responsibility.
-4. [`RUNTIME_STATE.md`](RUNTIME_STATE.md) — port map, state semantics, and controller command contract.
-5. [`TESTING.md`](TESTING.md) — validation procedures, latest observed automatic batch result, and acceptance criteria.
-6. [`ROADMAP.md`](ROADMAP.md) — prioritized development stages from single-batch correctness through pipelining and multi-target scheduling.
+1. [`FEATURES.md`](FEATURES.md) — readable inventory of implemented features and subsystem functions.
+2. [`HANDOFF.md`](HANDOFF.md) — current development state, latest runtime evidence, immediate test, and next risky change.
+3. [`architecture.md`](architecture.md) — control plane/execution plane architecture and safety boundaries.
+4. [`SYSTEM_MAP.md`](SYSTEM_MAP.md) — which script/module owns each responsibility.
+5. [`RUNTIME_STATE.md`](RUNTIME_STATE.md) — ports, state semantics, durable files, and controller command contract.
+6. [`GUI_ARCHITECTURE.md`](GUI_ARCHITECTURE.md) — React/Netscript separation and current seven-tab layout.
+7. [`BATCH_SCHEDULER.md`](BATCH_SCHEDULER.md) — synchronized batching, real MULTI, evidence dimensions, and dynamic scheduler direction.
+8. [`TESTING.md`](TESTING.md) — current runtime validation procedures and regression checklist.
+9. [`ROADMAP.md`](ROADMAP.md) — completed/current/next work in dependency order.
+
+## Which document should I update?
+
+| Change | Documents |
+| --- | --- |
+| User-visible feature or behavior | `FEATURES.md`, root `README.md` |
+| Current work / latest runtime evidence | `HANDOFF.md` |
+| Architecture or safety invariant | `architecture.md`, `SYSTEM_MAP.md` |
+| Port/state/file contract | `RUNTIME_STATE.md` |
+| GUI module/tab behavior | `GUI_ARCHITECTURE.md` |
+| Batch/MULTI scheduling semantics | `BATCH_SCHEDULER.md` |
+| Test procedure/acceptance criteria | `TESTING.md` |
+| Priority/dependency change | `ROADMAP.md` |
 
 ## New-chat instruction
-
-A useful first prompt for a new development chat is:
 
 ```text
 Continue my Bitburner automation project from GitHub.
 Read docs/HANDOFF.md first, then inspect the current live files before editing anything.
-The GitHub main branch is the source of truth.
+GitHub main is the source of truth.
 Work on the highest-priority known issue documented there, and refresh the docs after major changes.
 ```
 
-## Documentation intent
+## Source-of-truth rule
 
-These files are meant to carry project context that would otherwise be trapped in a long conversation history. They describe architecture and current state, but **current source code always wins if documentation and code disagree**.
+Documentation carries project context, but current source code always wins if documentation and code disagree. Before editing an existing script, fetch the current file from GitHub `main`.
 
-Before modifying an existing script, fetch/read the current file from the repository.
-
-## Maintenance rule
-
-After a major architectural or behavior change, update the relevant docs before considering the change complete. In particular, keep `HANDOFF.md` current enough that a fresh chat can resume work without needing the previous conversation transcript.
+`HANDOFF.md` should stay concise enough to resume development. Long-lived explanations belong in the reference documents rather than being duplicated indefinitely in the handoff.
