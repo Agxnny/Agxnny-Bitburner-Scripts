@@ -5,7 +5,14 @@ import { stockStyles as s } from "/stocks/styles.js";
 const KEEPER = "/stocks/history-keeper.js";
 const REFRESH_MS = 250;
 const FOUR_S_GOAL = 25e9;
-const CANDLE_FRAMES = [["1m", 60000], ["5m", 300000], ["15m", 900000], ["30m", 1800000], ["1h", 3600000], ["4h", 14400000]];
+const CANDLE_VIEWS = [
+    { label: "1m", lookbackMs: 60_000, candleMs: 10_000 },
+    { label: "5m", lookbackMs: 300_000, candleMs: 30_000 },
+    { label: "15m", lookbackMs: 900_000, candleMs: 60_000 },
+    { label: "30m", lookbackMs: 1_800_000, candleMs: 60_000 },
+    { label: "1h", lookbackMs: 3_600_000, candleMs: 60_000 },
+    { label: "4h", lookbackMs: 14_400_000, candleMs: 120_000 },
+];
 const HISTORY_RANGES = [["15m", 900000], ["1h", 3600000], ["3h", 10800000], ["6h", 21600000], ["12h", 43200000], ["24h", 86400000], ["ALL", 0]];
 let cache = { history: null, market: null, keeperRunning: false, updatedAt: 0 };
 let version = 0;
@@ -42,12 +49,12 @@ function App() {
     const symbols = Array.isArray(market.symbols) ? market.symbols : [];
     const [selected, setSelected] = React.useState(symbols[0]?.symbol ?? "");
     const [view, setView] = React.useState("candles");
-    const [frame, setFrame] = React.useState(60000);
+    const [candleView, setCandleView] = React.useState("1m");
     const [range, setRange] = React.useState(0);
     const active = symbols.some((row) => row.symbol === selected) ? selected : symbols[0]?.symbol ?? "";
     return el("div", { style: s.app },
         header(market), hero(market),
-        el("div", { style: s.grid }, chartCard(active, symbols, setSelected, view, setView, frame, setFrame, range, setRange), portfolioCard(market)),
+        el("div", { style: s.grid }, chartCard(active, symbols, setSelected, view, setView, candleView, setCandleView, range, setRange), portfolioCard(market)),
         marketTable(symbols, active, setSelected),
         el("div", { style: s.footer },
             el("span", null, "MARKET LAB · observation only · no trading"),
@@ -63,7 +70,7 @@ function header(market) {
         el("div", null,
             el("div", { style: s.eyebrow }, "AGXNNY STOCK RESEARCH"),
             el("div", { style: s.title }, "Market Lab"),
-            el("div", { style: s.subtitle }, "Fast TIX observation · fixed OHLC timeframes · full-history line view · wall-clock continuity"),
+            el("div", { style: s.subtitle }, "Fast TIX observation · scaled OHLC windows · full-history line view · wall-clock continuity"),
         ),
         el("div", { style: s.badges },
             badge(cache.keeperRunning ? "RECORDER ONLINE" : "RECORDER OFFLINE", cache.keeperRunning ? "good" : "warn"),
@@ -85,11 +92,13 @@ function hero(market) {
     );
 }
 
-function chartCard(symbol, symbols, setSelected, view, setView, frame, setFrame, range, setRange) {
+function chartCard(symbol, symbols, setSelected, view, setView, candleView, setCandleView, range, setRange) {
     const allSeries = symbol ? stockSeries(cache.history, symbol) : [];
     const stats = symbol ? stockSeriesStats(cache.history, symbol) : {};
     const current = symbols.find((row) => row.symbol === symbol);
-    const gap = latestStockGap(cache.history);
+    const candleConfig = CANDLE_VIEWS.find((entry) => entry.label === candleView) ?? CANDLE_VIEWS[0];
+    const visible = view === "candles" ? filterSeriesByRange(allSeries, candleConfig.lookbackMs) : filterSeriesByRange(allSeries, range);
+    const gap = latestGapInSeries(cache.history, visible);
     const jump = Number(gap?.jumps?.[symbol] ?? 0);
     return el("div", { style: s.card },
         el("div", { style: s.titleRow },
@@ -102,32 +111,35 @@ function chartCard(symbol, symbols, setSelected, view, setView, frame, setFrame,
             ),
         ),
         view === "candles"
-            ? candlePanel(allSeries, symbol, current?.price, frame, setFrame)
-            : historyPanel(allSeries, symbol, current?.price, range, setRange),
+            ? candlePanel(visible, symbol, current?.price, candleConfig, candleView, setCandleView)
+            : historyPanel(visible, symbol, current?.price, range, setRange),
         el("div", { style: s.stats },
             stat("Samples", Number(stats.samples ?? 0)), stat("All-history change", signedPct(stats.change)),
             stat("Tick volatility", pct(stats.tickVolatility)), stat("Range", stats.min > 0 ? `${money(stats.min)} – ${money(stats.max)}` : "—"),
         ),
-        continuityNote(stats, gap, jump),
+        continuityNote(gap, jump),
     );
 }
 
-function candlePanel(series, symbol, currentPrice, frame, setFrame) {
+function candlePanel(visible, symbol, currentPrice, config, selected, setSelected) {
     const expected = Number(cache.history?.intervalMs ?? 6000);
-    const visibleRange = frame * 70;
-    const visible = filterSeriesByRange(series, visibleRange);
-    const built = buildCandles(visible, frame, expected);
+    const built = buildCandles(visible, config.candleMs, expected);
     return el(React.Fragment, null,
-        controlStrip(CANDLE_FRAMES, frame, setFrame),
-        candleChart(built.candles, symbol, currentPrice, frame),
+        candleControlStrip(selected, setSelected),
+        candleChart(built.candles, symbol, currentPrice, config),
     );
 }
 
-function historyPanel(series, symbol, currentPrice, range, setRange) {
-    const visible = filterSeriesByRange(series, range);
+function historyPanel(visible, symbol, currentPrice, range, setRange) {
     return el(React.Fragment, null,
         controlStrip(HISTORY_RANGES, range, setRange),
         lineChart(visible, symbol, currentPrice, range === 0),
+    );
+}
+
+function candleControlStrip(value, setter) {
+    return el("div", { style: { display: "flex", gap: "4px", flexWrap: "wrap", marginBottom: "7px" } },
+        ...CANDLE_VIEWS.map((entry) => tabButton(entry.label, value === entry.label, () => setter(entry.label))),
     );
 }
 
@@ -137,8 +149,8 @@ function controlStrip(options, value, setter) {
     );
 }
 
-function candleChart(candles, symbol, currentPrice, frame) {
-    if (!candles.length) return emptyChart(`${symbol || "—"} · collecting ${duration(frame)} candles…`);
+function candleChart(candles, symbol, currentPrice, config) {
+    if (!candles.length) return emptyChart(`${symbol || "—"} · collecting ${config.label} view…`);
     const lows = candles.map((c) => c.low), highs = candles.map((c) => c.high);
     const min = Math.min(...lows), max = Math.max(...highs), priceRange = Math.max(1e-9, max - min);
     const width = 1000, height = 280, padX = 20, padY = 24;
@@ -156,7 +168,7 @@ function candleChart(candles, symbol, currentPrice, frame) {
         elements.push(el("line", { key: `wick-${i}`, x1: x, y1: highY, x2: x, y2: lowY, stroke: color, strokeWidth: 1.4, vectorEffect: "non-scaling-stroke" }));
         elements.push(el("rect", { key: `body-${i}`, x: x - bodyWidth / 2, y: Math.min(openY, closeY), width: bodyWidth, height: Math.max(2, Math.abs(closeY - openY)), fill, stroke: color, strokeWidth: 1.2, vectorEffect: "non-scaling-stroke" }));
     }
-    return chartShell(`${symbol} · ${duration(frame)} OHLC · ${candles.length} candles`, currentPrice ?? candles.at(-1).close, min, max, elements);
+    return chartShell(`${symbol} · ${config.label} window · ${duration(config.candleMs)} OHLC · ${candles.length} candles`, currentPrice ?? candles.at(-1).close, min, max, elements);
 }
 
 function lineChart(series, symbol, currentPrice, allHistory) {
@@ -173,8 +185,7 @@ function lineChart(series, symbol, currentPrice, allHistory) {
         segment = [];
     };
     for (let i = 0; i < series.length; i++) {
-        const point = series[i];
-        const prior = series[i - 1];
+        const point = series[i], prior = series[i - 1];
         if (prior && point.at - prior.at > expected) {
             flush(`seg-${i}`);
             const gx = padX + (i / Math.max(1, series.length - 1)) * (width - padX * 2);
@@ -200,12 +211,19 @@ function chartShell(label, currentPrice, min, max, elements) {
 
 function emptyChart(label) { return el("div", { style: s.chartWrap }, el("div", { style: s.chartLabel }, label)); }
 
-function continuityNote(stats, gap, jump) {
-    if (!gap) return el("div", { style: s.note }, "Wall-clock timestamps preserve continuity. Candles never bridge recorder gaps, and full-history line segments break across missing intervals.");
+function continuityNote(gap, jump) {
+    if (!gap) return el("div", { style: s.note }, "No recorder gap intersects the currently visible chart window. Missing intervals outside this view remain retained in history but are not shown here.");
     return el("div", { style: { ...s.note, borderLeftColor: "#8a6728" } },
-        `Recorder gap: ${duration(gap.durationMs)} from ${clock(gap.from)} to ${clock(gap.to)}. Selected-stock endpoint change: ${signedPct(jump)}. `,
-        `The missing path is intentionally not reconstructed. ${Number(stats.gapCount ?? 0)} gap(s) intersect retained data.`,
+        `Visible recorder gap: ${duration(gap.durationMs)} from ${clock(gap.from)} to ${clock(gap.to)}. Selected-stock endpoint change: ${signedPct(jump)}. `,
+        "The missing path is intentionally not reconstructed.",
     );
+}
+
+function latestGapInSeries(history, series) {
+    if (!Array.isArray(series) || series.length < 2) return null;
+    const from = Number(series[0]?.at ?? 0), to = Number(series.at(-1)?.at ?? 0);
+    const gaps = Array.isArray(history?.gaps) ? history.gaps : [];
+    return [...gaps].reverse().find((gap) => Number(gap?.to ?? 0) >= from && Number(gap?.from ?? 0) <= to) ?? null;
 }
 
 function portfolioCard(market) {
@@ -259,7 +277,7 @@ function portfolioPnl(rows) {
     }
     return { long, short, total: long + short };
 }
-function tabButton(text, active, onClick) { return el("button", { onClick, style: { ...s.badge, ...(active ? s.accent : {}), cursor: "pointer", fontFamily: "monospace" } }, text); }
+function tabButton(text, active, onClick) { return el("button", { onClick, style: { ...s.badge, ...(active ? s.accent : {}), borderColor: active ? (s.accent.borderColor ?? "#285276") : "#000000", cursor: "pointer", fontFamily: "monospace" } }, text); }
 function metric(label, value) { return el("div", { style: s.hero }, el("div", { style: s.heroLabel }, label), el("div", { style: s.heroValue }, value)); }
 function stat(label, value) { return el("div", { style: s.stat }, el("div", { style: s.statLabel }, label), el("div", { style: s.statValue }, String(value))); }
 function badge(text, tone) { return el("span", { style: { ...s.badge, ...(s[tone] ?? {}) } }, text); }
