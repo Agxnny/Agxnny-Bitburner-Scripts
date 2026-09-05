@@ -59,6 +59,7 @@ hacking/prepper-allocation.js
 model: DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS
 state: Port 18
 policy: ADAPTIVE_FOCUS_GROW_THEN_WEAKEN
+etaModel: FULL_READY_GROW_PLUS_WEAKEN_V1
 ```
 
 The prepper still scans the full eligible target universe and reserves a bounded slice of remote RAM, but allocation is now adaptive. `hacking/prepper-allocation.js` compares different focus widths and estimates target-completion throughput. It may spread prep across several targets or concentrate several reserved hosts on the same target when that is projected to finish useful prep work faster.
@@ -109,7 +110,19 @@ focus {
 }
 ```
 
-The focus estimator is advisory. It optimizes current prep-stage throughput using live grow/weaken thread demand, durations, and reserved-host capacities; each finished wave is followed by a fresh calculation from actual server state.
+### Prep ETA semantics
+
+`prepTargets[].etaMs` is now intended to mean estimated time until the target is fully ready, not merely time until the currently running grow/weaken cycle finishes.
+
+For a low-money target the estimator includes:
+
+```text
+remaining time in the active GROW wave
++ any additional projected GROW rounds needed at the reserved-pool capacity
++ projected WEAKEN cleanup caused by current security plus the remaining grow work
+```
+
+For a money-ready/high-security target it includes remaining active WEAKEN time plus any additional weaken rounds. Queued targets also add an advisory delay based on the latest adaptive focus width/makespan. Because the prep allocator recalculates after each wave from live state, queued ETA remains advisory rather than an exact schedule.
 
 ## Modular dashboard refactor
 
@@ -159,7 +172,7 @@ Feature parity retained:
 
 The Targets tab contains `Servers below max money` using Port 18 prep telemetry. It shows server, money %, active/queued GROW or WEAKEN state, advisory ETA, and current host/security information.
 
-The V3 telemetry now exposes multiple hosts/threads per target, but the current card still presents the compatibility `host` field first. A future small UI improvement can render focused host count/thread totals directly.
+The V3 telemetry exposes multiple hosts/threads per target, but the current card still presents the compatibility `host` field first. A future small UI improvement can render focused host count/thread totals directly.
 
 ## GUI runtime model that must not regress
 
@@ -213,14 +226,13 @@ See `docs/RUNTIME_STATE.md` for the current contract.
 
 ```text
 1. run gitpull.js
-2. restart startup/prepper so V3 + prepper-allocation.js are live
-3. run diagnostics/mem-audit.js and confirm no unmanaged files
-4. watch Targets -> Servers below max money
-5. use ps on two or more reserved prep hosts and confirm the same target can appear simultaneously when focus mode concentrates
-6. confirm Port 18 / GUI money percentage jumps faster for focused targets
-7. confirm a focused target is not assigned a second wave until all jobs from its current wave have finished
-8. confirm targets switch from concentrated GROW to WEAKEN only after money reaches >=99.5%
-9. confirm prepared count rises and no prep jobs collide with production hosts
+2. restart startup/prepper so V3 + the full-ready ETA model are live
+3. watch Targets -> Servers below max money
+4. confirm active ETA does not simply count down to the end of the current GROW cycle when additional grow/weaken work remains
+5. confirm low-money targets show ETA covering both growth and later security cleanup
+6. confirm money-ready/high-security targets show weaken-to-ready ETA
+7. confirm same-target parallel jobs remain active across multiple reserved hosts when focus mode chooses concentration
+8. confirm prepared count rises and no prep jobs collide with production hosts
 ```
 
 Because the new `ui/*` support files are ordinary `.js` files outside `lib/`, the current `diagnostics/mem-audit.js` labels them as `script` even though they are imported modules. That audit classification is cosmetic.
