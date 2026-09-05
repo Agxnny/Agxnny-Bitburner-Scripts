@@ -3,6 +3,7 @@ import {
     readControllerState,
     readMultiTargetSchedulerState,
 } from "/lib/runtime-state.js";
+import { recordStressEvidence } from "/lib/multi-stress-evidence.js";
 import { isQuiet, positionalArgs } from "/lib/output.js";
 
 const RUNNER = "/hacking/multi-target-runner.js";
@@ -93,16 +94,7 @@ export async function main(ns) {
                 }
 
                 const launchAt = Date.now();
-                const pid = ns.run(
-                    RUNNER,
-                    1,
-                    profile,
-                    cfg.targetCount,
-                    cfg.hackFraction,
-                    cfg.stageGapMs,
-                    depth,
-                    "--quiet",
-                );
+                const pid = ns.run(RUNNER, 1, profile, cfg.targetCount, cfg.hackFraction, cfg.stageGapMs, depth, "--quiet");
                 if (pid <= 0) {
                     resultStatus = "BLOCKED";
                     resultReason = "Could not launch multi-target runner on home";
@@ -157,11 +149,7 @@ export async function main(ns) {
                 while (progress.results.length > 24) progress.results.shift();
                 for (const target of waveResult.targets) progress.uniqueTargets.add(target);
                 progress.maxObservedDriftMs = Math.max(progress.maxObservedDriftMs, waveResult.maxDriftMs);
-                if (waveResult.minSpacingMs > 0) {
-                    progress.minObservedSpacingMs = progress.minObservedSpacingMs > 0
-                        ? Math.min(progress.minObservedSpacingMs, waveResult.minSpacingMs)
-                        : waveResult.minSpacingMs;
-                }
+                if (waveResult.minSpacingMs > 0) progress.minObservedSpacingMs = progress.minObservedSpacingMs > 0 ? Math.min(progress.minObservedSpacingMs, waveResult.minSpacingMs) : waveResult.minSpacingMs;
 
                 if (!waveResult.clean) {
                     resultStatus = status === "SAFETY_STOP" ? "SAFETY_STOP" : "FAILED";
@@ -174,9 +162,7 @@ export async function main(ns) {
                 progress.waveStatus = "CLEAN";
                 progress.reason = `Depth ${depth} wave ${wave}/${cfg.wavesPerDepth} clean across ${waveResult.targets.length} target(s)`;
                 publish(ns, cfg, "RUNNING", progress.reason, progress);
-                if (!quiet) {
-                    ns.tprint(`[MULTI-STRESS] CLEAN depth ${depth} · ${profile.toUpperCase()} · targets ${waveResult.targets.join(", ")} · drift ${waveResult.maxDriftMs.toFixed(0)}ms · spacing ${waveResult.minSpacingMs.toFixed(0)}ms`);
-                }
+                if (!quiet) ns.tprint(`[MULTI-STRESS] CLEAN depth ${depth} · ${profile.toUpperCase()} · targets ${waveResult.targets.join(", ")} · drift ${waveResult.maxDriftMs.toFixed(0)}ms · spacing ${waveResult.minSpacingMs.toFixed(0)}ms`);
                 break;
             }
         }
@@ -193,10 +179,13 @@ export async function main(ns) {
     if (resultStatus === "PASS") resultReason = `Stress test passed through depth ${progress.highestCleanDepth}`;
     progress.waveStatus = resultStatus;
     progress.reason = resultReason;
-    publish(ns, cfg, resultStatus, resultReason, progress);
+    const finalState = stressState(cfg, resultStatus, resultReason, progress);
+    publishMultiTargetStressState(ns, finalState);
+    const evidence = await recordStressEvidence(ns, finalState);
 
     ns.tprint(`[MULTI-STRESS] ${resultStatus} | highest clean depth ${progress.highestCleanDepth} | clean waves ${progress.totalCleanWaves} | unique targets ${progress.uniqueTargets.size}`);
     ns.tprint(`[MULTI-STRESS] drift max ${progress.maxObservedDriftMs.toFixed(0)}ms | spacing min ${progress.minObservedSpacingMs > 0 ? progress.minObservedSpacingMs.toFixed(0) : "—"}ms`);
+    ns.tprint(`[MULTI-STRESS] evidence proven depth ${evidence.provenDepth} · ${evidence.uniqueTargets.length} unique target(s)`);
     ns.tprint(`[MULTI-STRESS] ${resultReason}`);
 }
 
@@ -209,7 +198,6 @@ function parseArgs(args) {
     const hackFraction = optionalNumber(args[4], 0.10);
     const stageGapMs = optionalInteger(args[5], 200);
     const prepWaitMinutes = optionalNumber(args[6], 10);
-
     if (!["mixed", ...PROFILES].includes(profileMode)) return { ok: false, reason: "profile must be mixed, money, balanced, or xp" };
     if (!Number.isInteger(maxDepth) || maxDepth < 2 || maxDepth > 12) return { ok: false, reason: "maxDepth must be 2-12" };
     if (!Number.isInteger(wavesPerDepth) || wavesPerDepth < 1 || wavesPerDepth > 10) return { ok: false, reason: "wavesPerDepth must be 1-10" };
@@ -218,7 +206,6 @@ function parseArgs(args) {
     if (!Number.isFinite(hackFraction) || hackFraction < 0.001 || hackFraction > 0.90) return { ok: false, reason: "hackFraction must be 0.001-0.90" };
     if (!Number.isInteger(stageGapMs) || stageGapMs < 75 || stageGapMs > 5000) return { ok: false, reason: "stageGapMs must be 75-5000" };
     if (!Number.isFinite(prepWaitMinutes) || prepWaitMinutes < 0 || prepWaitMinutes > 60) return { ok: false, reason: "prepWaitMinutes must be 0-60" };
-
     return { ok: true, value: { profileMode, maxDepth, wavesPerDepth, targetCount, hackFraction, stageGapMs, prepWaitMinutes } };
 }
 
@@ -242,81 +229,17 @@ function summarizeWave(state, depth, wave, profile, blockedAttempts) {
     const healthy = completed.length === depth && completed.every((entry) => entry?.healthy === true);
     const status = String(state?.status ?? "UNKNOWN");
     const clean = status === "COMPLETE" && healthy && targets.length === depth;
-    return {
-        at: Date.now(),
-        depth,
-        wave,
-        profile,
-        status,
-        clean,
-        reason: clean ? "clean" : String(state?.reason ?? `${status}; completed ${completed.length}/${depth}`),
-        targets,
-        completed: completed.length,
-        maxDriftMs,
-        minSpacingMs,
-        blockedAttempts,
-        runId: String(state?.runId ?? ""),
-    };
+    return { at: Date.now(), depth, wave, profile, status, clean, reason: clean ? "clean" : String(state?.reason ?? `${status}; completed ${completed.length}/${depth}`), targets, completed: completed.length, maxDriftMs, minSpacingMs, blockedAttempts, runId: String(state?.runId ?? "") };
 }
 
 function createProgress() {
-    return {
-        startedAt: 0,
-        finishedAt: 0,
-        currentDepth: 2,
-        currentWave: 0,
-        currentProfile: "",
-        runnerPid: 0,
-        waveStatus: "IDLE",
-        reason: "",
-        highestCleanDepth: 1,
-        depthCleanWaves: 0,
-        totalCleanWaves: 0,
-        blockedRetries: 0,
-        maxObservedDriftMs: 0,
-        minObservedSpacingMs: 0,
-        uniqueTargets: new Set(),
-        results: [],
-    };
+    return { startedAt: 0, finishedAt: 0, currentDepth: 2, currentWave: 0, currentProfile: "", runnerPid: 0, waveStatus: "IDLE", reason: "", highestCleanDepth: 1, depthCleanWaves: 0, totalCleanWaves: 0, blockedRetries: 0, maxObservedDriftMs: 0, minObservedSpacingMs: 0, uniqueTargets: new Set(), results: [] };
 }
 
-function publish(ns, cfg, status, reason, progress) {
-    publishMultiTargetStressState(ns, {
-        version: 1,
-        model: MODEL,
-        status,
-        reason,
-        config: cfg,
-        startedAt: progress.startedAt,
-        finishedAt: progress.finishedAt,
-        currentDepth: progress.currentDepth,
-        currentWave: progress.currentWave,
-        currentProfile: progress.currentProfile,
-        runnerPid: progress.runnerPid,
-        waveStatus: progress.waveStatus,
-        highestCleanDepth: progress.highestCleanDepth,
-        depthCleanWaves: progress.depthCleanWaves,
-        totalCleanWaves: progress.totalCleanWaves,
-        blockedRetries: progress.blockedRetries,
-        maxObservedDriftMs: progress.maxObservedDriftMs,
-        minObservedSpacingMs: progress.minObservedSpacingMs,
-        uniqueTargets: [...progress.uniqueTargets],
-        results: progress.results,
-        updatedAt: Date.now(),
-    });
+function stressState(cfg, status, reason, progress) {
+    return { version: 1, model: MODEL, status, reason, config: cfg, startedAt: progress.startedAt, finishedAt: progress.finishedAt, currentDepth: progress.currentDepth, currentWave: progress.currentWave, currentProfile: progress.currentProfile, runnerPid: progress.runnerPid, waveStatus: progress.waveStatus, highestCleanDepth: progress.highestCleanDepth, depthCleanWaves: progress.depthCleanWaves, totalCleanWaves: progress.totalCleanWaves, blockedRetries: progress.blockedRetries, maxObservedDriftMs: progress.maxObservedDriftMs, minObservedSpacingMs: progress.minObservedSpacingMs, uniqueTargets: [...progress.uniqueTargets], results: progress.results, updatedAt: Date.now() };
 }
-
-function chooseProfile(mode, index) {
-    if (mode !== "mixed") return mode;
-    return PROFILES[index % PROFILES.length];
-}
-
-function optionalNumber(value, fallback) {
-    if (value === undefined || value === null || String(value).trim() === "") return fallback;
-    return Number(value);
-}
-
-function optionalInteger(value, fallback) {
-    const number = optionalNumber(value, fallback);
-    return Number.isFinite(number) ? Math.floor(number) : NaN;
-}
+function publish(ns, cfg, status, reason, progress) { publishMultiTargetStressState(ns, stressState(cfg, status, reason, progress)); }
+function chooseProfile(mode, index) { return mode !== "mixed" ? mode : PROFILES[index % PROFILES.length]; }
+function optionalNumber(value, fallback) { return value === undefined || value === null || String(value).trim() === "" ? fallback : Number(value); }
+function optionalInteger(value, fallback) { const number = optionalNumber(value, fallback); return Number.isFinite(number) ? Math.floor(number) : NaN; }
