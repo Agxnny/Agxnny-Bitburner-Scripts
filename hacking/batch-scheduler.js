@@ -10,17 +10,25 @@ const MIN_TIMING_MARGIN_MS = 25;
 const START_LEAD_MS = 150;
 const MAX_DEPTH_SEARCH = 64;
 const MAX_STEADY_BATCHES = 512;
+const ADMISSION_MAX_DEPTH = 2;
+const ADMISSION_REFRESH_MS = 2_000;
+const BATCH_SECURITY_TOLERANCE = 0.05;
+const BATCH_MONEY_TOLERANCE = 0.995;
+const RECOVERY_MONEY_ERROR_TOLERANCE = 0.005;
+const RECOVERY_SECURITY_ERROR_TOLERANCE = 0.05;
+const MAX_ADMISSION_EVENTS = 10;
 
 /**
- * Dry-run planner for future pipelined HWGW scheduling.
+ * Dry-run planner and live admission simulator for future pipelined HWGW.
  *
- * This script does NOT launch workers. It models a global landing calendar,
- * estimates safe intra-batch stage spacing and inter-batch admission spacing,
- * and simulates host-by-host RAM occupancy over time using the current remote
- * execution pool.
+ * Default mode performs one planning snapshot. Passing `admission` as the fourth
+ * positional argument keeps the script alive and simulates a depth-2 admission
+ * controller against live RAM/target/telemetry state. Neither mode launches any
+ * H/G/W workers.
  *
  * Usage:
  *   run hacking/batch-scheduler.js <target> [hackFraction] [stageGapMs]
+ *   run hacking/batch-scheduler.js <target> [hackFraction] [stageGapMs] admission
  *
  * @param {NS} ns
  */
@@ -30,10 +38,18 @@ export async function main(ns) {
     const target = String(args[0] ?? "");
     const requestedHackFraction = clamp(Number(args[1] ?? DEFAULT_HACK_FRACTION), 0.001, 0.90);
     const requestedStageGapMs = Math.max(MIN_STAGE_GAP_MS, Math.floor(Number(args[2] ?? DEFAULT_STAGE_GAP_MS)));
+    const mode = String(args[3] ?? "snapshot").trim().toLowerCase();
     const quiet = isQuiet(ns);
 
     if (!target) {
-        if (!quiet) ns.tprint("Usage: run hacking/batch-scheduler.js <target> [hackFraction] [stageGapMs]");
+        if (!quiet) {
+            ns.tprint("Usage: run hacking/batch-scheduler.js <target> [hackFraction] [stageGapMs] [admission]");
+        }
+        return;
+    }
+
+    if (mode === "admission" || mode === "watch") {
+        await runAdmissionSimulation(ns, target, requestedHackFraction, requestedStageGapMs, quiet);
         return;
     }
 
@@ -43,6 +59,152 @@ export async function main(ns) {
     publishBatchSchedulerState(ns, analysis);
 
     if (!quiet) printAnalysis(ns, analysis);
+}
+
+async function runAdmissionSimulation(ns, target, requestedHackFraction, requestedStageGapMs, quiet) {
+    const virtualBatches = [];
+    const events = [];
+    let sequence = 0;
+    let pipelineOpened = false;
+    let safetyStopped = false;
+    let safetyReason = "";
+    let lastObservedBatchId = "";
+    let nextAdmissionAt = 0;
+
+    if (!quiet) ns.tprint(`[PIPELINE-SIM] Started depth-${ADMISSION_MAX_DEPTH} admission simulation for ${target}; no workers will be launched`);
+
+    while (true) {
+        const now = Date.now();
+        const planner = readPlannerState(ns);
+        const last = readLastCompletedBatchState(ns);
+        const analysis = analyzeScheduler(ns, planner, last, target, requestedHackFraction, requestedStageGapMs);
+
+        for (let i = virtualBatches.length - 1; i >= 0; i -= 1) {
+            if (virtualBatches[i].finalLandingAt <= now) {
+                const finished = virtualBatches.splice(i, 1)[0];
+                pushAdmissionEvent(events, {
+                    at: now,
+                    type: "DRAIN",
+                    message: `${finished.id} reached planned W2 landing and left the simulated in-flight set`,
+                });
+            }
+        }
+
+        const safety = inspectCompletedBatch(last, target, lastObservedBatchId);
+        if (safety.observedBatchId) lastObservedBatchId = safety.observedBatchId;
+        if (safety.stop && !safetyStopped) {
+            safetyStopped = true;
+            safetyReason = safety.reason;
+            pushAdmissionEvent(events, { at: now, type: "STOP", message: safetyReason });
+        }
+
+        let admissionDecision = {
+            status: "WAITING",
+            reason: "Waiting for scheduler readiness",
+            candidateFirstLandingAt: 0,
+            candidateFinalLandingAt: 0,
+        };
+
+        if (analysis.status !== "READY") {
+            admissionDecision = { ...admissionDecision, status: "BLOCKED", reason: analysis.reason };
+        } else if (safetyStopped) {
+            admissionDecision = { ...admissionDecision, status: "SAFETY_STOP", reason: safetyReason };
+        } else if (!pipelineOpened && !targetReadyForPipeline(analysis.currentTarget)) {
+            admissionDecision = {
+                ...admissionDecision,
+                status: "WAITING_PREP",
+                reason: `Initial target baseline not ready: money ${(Number(analysis.currentTarget?.moneyPercent ?? 0) * 100).toFixed(1)}%, security +${Number(analysis.currentTarget?.securityDelta ?? 0).toFixed(2)}`,
+            };
+        } else if (virtualBatches.length >= ADMISSION_MAX_DEPTH) {
+            admissionDecision = {
+                ...admissionDecision,
+                status: "DEPTH_CAP",
+                reason: `Hard simulation depth cap ${ADMISSION_MAX_DEPTH} reached; waiting for oldest virtual batch to drain`,
+            };
+        } else if (nextAdmissionAt > now) {
+            admissionDecision = {
+                ...admissionDecision,
+                status: "INTERVAL_WAIT",
+                reason: `Next admission window opens in ${formatDuration(nextAdmissionAt - now)}`,
+            };
+        } else {
+            const intervalMs = Number(analysis.timing?.tunedBatchIntervalMs ?? 0);
+            const leadMs = Number(analysis.timing?.firstLandingDelayMs ?? 0);
+            const lastVirtual = virtualBatches.length ? virtualBatches[virtualBatches.length - 1] : null;
+            const firstLandingAt = Math.max(
+                now + leadMs,
+                lastVirtual ? lastVirtual.firstLandingAt + intervalMs : 0,
+            );
+            const candidate = makeBatches(analysis.stageTemplate, 1, firstLandingAt, intervalMs)[0];
+            candidate.id = `virtual-${target}-${++sequence}`;
+            candidate.finalLandingAt = Math.max(...candidate.stages.map((stage) => stage.landingAt));
+            admissionDecision.candidateFirstLandingAt = firstLandingAt;
+            admissionDecision.candidateFinalLandingAt = candidate.finalLandingAt;
+
+            const combined = [...virtualBatches, candidate].map((batch, index) => ({
+                ...batch,
+                index: index + 1,
+                stages: batch.stages.map((stage) => ({ ...stage, batch: index + 1 })),
+            }));
+            const livePool = getExecutionPool(ns, planner);
+            const reservation = reserveHostWindows(livePool, combined);
+
+            if (!reservation.ok) {
+                admissionDecision = {
+                    ...admissionDecision,
+                    status: "RAM_BLOCKED",
+                    reason: `Candidate blocked at ${reservation.blockedStage || "stage"}; short ${Number(reservation.missingThreads ?? 0)} thread(s)`,
+                };
+            } else {
+                virtualBatches.push(candidate);
+                pipelineOpened = true;
+                nextAdmissionAt = now + intervalMs;
+                admissionDecision = {
+                    ...admissionDecision,
+                    status: "ADMITTED",
+                    reason: `${candidate.id} admitted to virtual depth ${virtualBatches.length}/${ADMISSION_MAX_DEPTH}`,
+                };
+                pushAdmissionEvent(events, { at: now, type: "ADMIT", message: admissionDecision.reason });
+            }
+        }
+
+        const state = {
+            ...analysis,
+            version: 3,
+            model: "PIPELINE_ADMISSION_SIM_V3_DEPTH2",
+            dryRun: true,
+            simulation: true,
+            updatedAt: now,
+            admission: {
+                enabled: true,
+                launchesWorkers: false,
+                maxDepth: ADMISSION_MAX_DEPTH,
+                pipelineOpened,
+                safetyStopped,
+                safetyReason,
+                inFlight: virtualBatches.length,
+                nextAdmissionAt,
+                decision: admissionDecision,
+                batches: virtualBatches.map((batch) => ({
+                    id: batch.id,
+                    firstLandingAt: batch.firstLandingAt,
+                    finalLandingAt: batch.finalLandingAt,
+                    stages: batch.stages.map((stage) => ({
+                        name: stage.name,
+                        startAt: stage.startAt,
+                        landingAt: stage.landingAt,
+                        threads: stage.threads,
+                        ram: stage.ram,
+                    })),
+                })),
+                events: [...events],
+            },
+        };
+        publishBatchSchedulerState(ns, state);
+
+        if (!quiet) printAdmissionSimulation(ns, state);
+        await ns.sleep(ADMISSION_REFRESH_MS);
+    }
 }
 
 function analyzeScheduler(ns, planner, last, target, requestedHackFraction, requestedStageGapMs) {
@@ -415,6 +577,65 @@ function peakRamUsage(batches) {
     return { peakRam, peakAt };
 }
 
+function targetReadyForPipeline(target) {
+    return Number(target?.moneyPercent ?? 0) >= BATCH_MONEY_TOLERANCE
+        && Number(target?.securityDelta ?? Infinity) <= BATCH_SECURITY_TOLERANCE;
+}
+
+function inspectCompletedBatch(last, target, previousBatchId) {
+    if (!last || String(last.target ?? "") !== target || last.status !== "COMPLETE") {
+        return { stop: false, observedBatchId: "", reason: "" };
+    }
+    const batchId = String(last.batchId ?? "");
+    if (!batchId || batchId === previousBatchId) {
+        return { stop: false, observedBatchId: batchId, reason: "" };
+    }
+
+    const landing = last.landing ?? {};
+    const comparison = last.comparison ?? {};
+    const final = last.final ?? {};
+    const failures = [];
+    if (!landing.orderCorrect) failures.push("landing order incorrect");
+    if (Number(landing.missingJobs ?? 0) > 0) failures.push(`${Number(landing.missingJobs)} timing event(s) missing`);
+    if (Math.abs(Number(comparison.moneyPercentError ?? 0)) > RECOVERY_MONEY_ERROR_TOLERANCE) failures.push("money recovery error exceeded tolerance");
+    if (Math.abs(Number(comparison.securityDeltaError ?? 0)) > RECOVERY_SECURITY_ERROR_TOLERANCE) failures.push("security recovery error exceeded tolerance");
+    if (Number(final.moneyPercent ?? 0) < BATCH_MONEY_TOLERANCE) failures.push("final money below prepared tolerance");
+    if (Number(final.securityDelta ?? 0) > BATCH_SECURITY_TOLERANCE) failures.push("final security above prepared tolerance");
+
+    return {
+        stop: failures.length > 0,
+        observedBatchId: batchId,
+        reason: failures.length ? `Observed ${batchId}: ${failures.join("; ")}` : `Observed healthy completed batch ${batchId}`,
+    };
+}
+
+function pushAdmissionEvent(events, event) {
+    events.push(event);
+    while (events.length > MAX_ADMISSION_EVENTS) events.shift();
+}
+
+function printAdmissionSimulation(ns, state) {
+    const admission = state.admission ?? {};
+    const decision = admission.decision ?? {};
+    ns.clearLog();
+    ns.print("=== PIPELINE ADMISSION SIMULATION ===");
+    ns.print(`Target:       ${state.target}`);
+    ns.print(`Mode:         DRY RUN / DEPTH ${admission.maxDepth}`);
+    ns.print(`Stage gap:    ${state.timing?.tunedStageGapMs ?? 0} ms`);
+    ns.print(`Batch cadence:${state.timing?.tunedBatchIntervalMs ?? 0} ms sustainable`);
+    ns.print(`In flight:    ${admission.inFlight}/${admission.maxDepth}`);
+    ns.print(`Decision:     ${decision.status} | ${decision.reason}`);
+    ns.print(`Safety stop:  ${admission.safetyStopped ? admission.safetyReason : "no"}`);
+    for (const batch of admission.batches ?? []) {
+        ns.print(`  ${batch.id} | H ${formatEta(batch.firstLandingAt)} | W2 ${formatEta(batch.finalLandingAt)}`);
+    }
+    if ((admission.events ?? []).length) {
+        ns.print("");
+        ns.print("Recent simulation events:");
+        for (const event of admission.events) ns.print(`  ${event.type}: ${event.message}`);
+    }
+}
+
 function printAnalysis(ns, state) {
     ns.tprint(`[PIPELINE] ${state.status} ${state.target} | ${state.reason}`);
     if (!state.timing || !state.ram) return;
@@ -428,6 +649,19 @@ function printAnalysis(ns, state) {
         const block = row.fits ? "FIT" : `BLOCKED${row.blockedStage ? ` at batch ${row.blockedBatch} ${row.blockedStage}` : ""}`;
         ns.tprint(`[PIPELINE] depth ${row.depth}: peak ${row.peakRam.toFixed(2)} GB ${block}`);
     }
+}
+
+function formatEta(timestamp) {
+    const remaining = Number(timestamp ?? 0) - Date.now();
+    return remaining <= 0 ? "due" : `${formatDuration(remaining)} remaining`;
+}
+
+function formatDuration(milliseconds) {
+    const seconds = Math.max(0, Number(milliseconds) || 0) / 1000;
+    if (seconds < 60) return `${seconds.toFixed(0)}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds - minutes * 60;
+    return `${minutes}m ${remainder.toFixed(0)}s`;
 }
 
 function finiteCeil(value) {
