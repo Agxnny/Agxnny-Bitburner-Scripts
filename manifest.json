@@ -49,6 +49,7 @@
     "diagnostics/economy-targets.js",
     "diagnostics/income.js",
     "diagnostics/mem-audit.js",
+    "diagnostics/multi-target-stress.js",
     "diagnostics/progression.js",
     "diagnostics/test.js",
     "diagnostics/test-launcher.js",
