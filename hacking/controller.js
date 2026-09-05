@@ -5,6 +5,7 @@ import {
     readBatchSchedulerState,
     readBatchState,
     readEconomyTargetState,
+    readMultiTargetSchedulerState,
     readPlannerState,
     readTacticalPlanState,
 } from "/lib/runtime-state.js";
@@ -14,17 +15,20 @@ import { isQuiet, positionalArgs, quietArgs } from "/lib/output.js";
 const TACTICAL_PLANNER_SCRIPT = "/hacking/tactical-planner.js";
 const BATCH_RUNNER_SCRIPT = "/hacking/batch-runner.js";
 const PIPELINE_RUNNER_SCRIPT = "/hacking/pipeline-runner.js";
+const MULTI_TARGET_RUNNER_SCRIPT = "/hacking/multi-target-runner.js";
 const DEFAULT_BATCH_GAP_MS = 200;
 const BATCH_SECURITY_TOLERANCE = 0.05;
 const BATCH_MONEY_TOLERANCE = 0.995;
 const BATCH_RETRY_MS = 2_000;
 const PIPELINE_RETRY_MS = 2_000;
+const MULTI_RETRY_MS = 2_000;
 const PIPELINE_READY_SETTLE_MS = 1_100;
 const MAX_RECENT_EVENTS = 8;
 const EMPTY_PORT = "NULL PORT DATA";
 const PREP_MONEY_RATIO = 0.999999;
 const PREP_SECURITY_TOLERANCE = 0.001;
-const EXECUTION_MODES = Object.freeze(new Set(["STANDBY", "HGW", "BATCH", "PIPELINE"]));
+const EXECUTION_MODES = Object.freeze(new Set(["STANDBY", "HGW", "BATCH", "PIPELINE", "MULTI"]));
+const DEFAULT_MULTI_CONFIG = Object.freeze({ profile: "money", targetCount: 6, globalDepth: 3, hackFraction: 0.10, stageGapMs: 200 });
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -47,8 +51,10 @@ export async function main(ns) {
     let tacticalJob = null;
     let batchJob = null;
     let pipelineJob = null;
+    let multiJob = null;
     let lastBatchAttemptAt = 0;
     let lastPipelineAttemptAt = 0;
+    let lastMultiAttemptAt = 0;
     let pipelineReadySince = 0;
     let pendingRequestId = "";
     let requestSequence = 0;
@@ -82,6 +88,11 @@ export async function main(ns) {
             recordFinishedPipeline(ns, executionMode, prep, finishedPipelineJob);
             pipelineReadySince = 0;
         }
+        if (multiJob && !ns.isRunning(multiJob.pid, multiJob.hostname)) {
+            const finishedMultiJob = multiJob;
+            multiJob = null;
+            recordFinishedMulti(ns, executionMode, finishedMultiJob);
+        }
 
         if (executionMode.pending && tacticalJob) {
             ns.kill(tacticalJob.pid, tacticalJob.hostname);
@@ -90,7 +101,7 @@ export async function main(ns) {
             executionMode.lastMessage = `Switching to ${executionMode.pending}; tactical analysis cancelled, waiting for target-side work to drain`;
         }
 
-        const controllerIdle = activeJobs.length === 0 && !tacticalJob && !batchJob && !pipelineJob;
+        const controllerIdle = activeJobs.length === 0 && !tacticalJob && !batchJob && !pipelineJob && !multiJob;
 
         if (executionMode.pending && controllerIdle) {
             applyExecutionModeCommand(executionMode, prep);
@@ -120,13 +131,13 @@ export async function main(ns) {
         const previousPrepStage = prep.stage;
         if (prep.active) choosePrepAction(state, prep);
         else if (prep.hold) choosePrepHoldAction(state, prep);
-        else if (executionMode.mode === "STANDBY") chooseStandbyAction(state);
+        else if (executionMode.mode === "STANDBY" || executionMode.mode === "MULTI") chooseStandbyAction(state);
         else if (executionMode.mode === "BATCH" || executionMode.mode === "PIPELINE") chooseBatchFoundationAction(state);
         else chooseFoundationAction(state);
         if (prep.stage !== previousPrepStage) pendingRequestId = "";
         syncPrepState(state, prep);
         syncTargetControlState(state, targetControl);
-        syncExecutionModeState(state, executionMode, batchJob, pipelineJob);
+        syncExecutionModeState(state, executionMode, batchJob, pipelineJob, multiJob);
         updateExecutionState(ns, state, planner, activeJobs);
 
         if (operationJustFinished) {
@@ -147,9 +158,15 @@ export async function main(ns) {
             if (activeJobs.length > 0) blockers.push(`${activeJobs.length} worker job(s)`);
             if (batchJob) blockers.push("serialized batch");
             if (pipelineJob) blockers.push("pipeline wave");
+            if (multiJob) blockers.push("multi-target wave");
             state.reason = blockers.length
                 ? `Switching to ${executionMode.pending}; no new work will be scheduled while waiting for ${blockers.join(" + ")} to finish`
                 : `Switching to ${executionMode.pending}; waiting for safe boundary`;
+        } else if (multiJob) {
+            pipelineReadySince = 0;
+            pendingRequestId = "";
+            state.tactical.status = "MULTI_RUNNING";
+            state.reason = `Controller-managed multi-target wave running on ${multiJob.hostname}`;
         } else if (pipelineJob) {
             pipelineReadySince = 0;
             pendingRequestId = "";
@@ -173,6 +190,28 @@ export async function main(ns) {
             pendingRequestId = "";
             state.tactical.status = "STANDBY";
             state.reason = "Standby: control plane is online; no target-side workers or batch coordinators will be launched";
+        } else if (executionMode.mode === "MULTI") {
+            pipelineReadySince = 0;
+            pendingRequestId = "";
+            if (executionMode.multiSafetyStopped) {
+                state.tactical.status = "MULTI_SAFETY_STOP";
+                state.reason = `${executionMode.lastMessage} · use Resume auto to clear the stop after review`;
+            } else if (Date.now() - lastMultiAttemptAt >= MULTI_RETRY_MS) {
+                lastMultiAttemptAt = Date.now();
+                const request = launchMultiTargetRunner(ns, executionMode);
+                if (request.pid > 0) {
+                    multiJob = request;
+                    state.tactical.status = "MULTI_RUNNING";
+                    state.reason = `Launched controller-managed ${executionMode.multi.globalDepth}-target MONEY-style wave on home`;
+                    executionMode.lastMessage = `Multi-target mode active: ${executionMode.multi.profile.toUpperCase()} · ${executionMode.multi.globalDepth} live across top ${executionMode.multi.targetCount}`;
+                } else {
+                    state.tactical.status = "MULTI_BLOCKED";
+                    state.reason = request.reason || "Could not launch multi-target coordinator on home";
+                }
+            } else {
+                state.tactical.status = "MULTI_READY";
+                state.reason = `Waiting to admit the next ${executionMode.multi.globalDepth}-target finite wave`;
+            }
         } else if (executionMode.mode === "PIPELINE" && state.action === ActionType.NONE) {
             pendingRequestId = "";
             if (executionMode.pipelineSafetyStopped) {
@@ -286,7 +325,7 @@ export async function main(ns) {
 
         syncPrepState(state, prep);
         syncTargetControlState(state, targetControl);
-        syncExecutionModeState(state, executionMode, batchJob, pipelineJob);
+        syncExecutionModeState(state, executionMode, batchJob, pipelineJob, multiJob);
         updateExecutionState(ns, state, planner, activeJobs);
         state.updatedAt = Date.now();
         publishControllerState(ns, state);
@@ -329,6 +368,8 @@ function createExecutionMode() {
         batchCompletedAt: 0,
         lastBatchId: "",
         pipelineSafetyStopped: false,
+        multiSafetyStopped: false,
+        multi: { ...DEFAULT_MULTI_CONFIG },
         lastMessage: "Standby mode: control plane online, target-side execution paused",
     };
 }
@@ -370,13 +411,16 @@ function consumeControllerRequests(ns, state, prep, targetControl, executionMode
         if (action === "RESUME_AUTO") {
             resetPrep(prep);
             if (executionMode.mode === "PIPELINE") executionMode.pipelineSafetyStopped = false;
+            if (executionMode.mode === "MULTI") executionMode.multiSafetyStopped = false;
             prep.lastMessage = executionMode.mode === "PIPELINE"
                 ? "Continuous depth-2 pipeline resumed"
-                : executionMode.mode === "BATCH"
-                    ? "Automatic serialized HWGW resumed"
-                    : executionMode.mode === "HGW"
-                        ? "Automatic HGW resumed"
-                        : "Standby remains active; choose HGW, Batch, or Pipeline to run target-side work";
+                : executionMode.mode === "MULTI"
+                    ? "Controller-managed multi-target waves resumed"
+                    : executionMode.mode === "BATCH"
+                        ? "Automatic serialized HWGW resumed"
+                        : executionMode.mode === "HGW"
+                            ? "Automatic HGW resumed"
+                            : "Standby remains active; choose HGW, Batch, Pipeline, or Multi to run target-side work";
             changed = true;
         }
 
@@ -392,6 +436,23 @@ function consumeControllerRequests(ns, state, prep, targetControl, executionMode
         if (action === "CLEAR_MANUAL_TARGET") {
             targetControl.pending = { action, requestedAt: Number(request?.requestedAt ?? Date.now()) };
             targetControl.lastMessage = "Return to automatic target selection queued";
+            changed = true;
+        }
+
+        if (action === "START_MULTI") {
+            const config = parseMultiConfig(request, executionMode.multi);
+            if (config.ok) {
+                executionMode.multi = config.value;
+                executionMode.multiSafetyStopped = false;
+                if (executionMode.mode === "MULTI" && !executionMode.pending) {
+                    executionMode.lastMessage = `Multi config updated: ${config.value.profile.toUpperCase()} · ${config.value.globalDepth} live / top ${config.value.targetCount}`;
+                } else {
+                    executionMode.pending = "MULTI";
+                    executionMode.lastMessage = `Switching to MULTI; ${config.value.profile.toUpperCase()} · ${config.value.globalDepth} live across top ${config.value.targetCount}`;
+                }
+            } else {
+                executionMode.lastMessage = `Multi request rejected: ${config.reason}`;
+            }
             changed = true;
         }
 
@@ -412,6 +473,20 @@ function consumeControllerRequests(ns, state, prep, targetControl, executionMode
     return changed;
 }
 
+function parseMultiConfig(request, current) {
+    const profile = String(request?.profile ?? current.profile ?? "money").trim().toLowerCase();
+    const targetCount = Math.floor(Number(request?.targetCount ?? current.targetCount ?? 6));
+    const globalDepth = Math.floor(Number(request?.globalDepth ?? current.globalDepth ?? 3));
+    const hackPercent = request?.hackPercent !== undefined ? Number(request.hackPercent) : Number(current.hackFraction ?? 0.10) * 100;
+    const stageGapMs = Math.floor(Number(request?.stageGapMs ?? current.stageGapMs ?? 200));
+    if (!["money", "balanced", "xp"].includes(profile)) return { ok: false, reason: "profile must be MONEY, BALANCED, or XP" };
+    if (!Number.isInteger(targetCount) || targetCount < 2 || targetCount > 12) return { ok: false, reason: "target count must be 2-12" };
+    if (!Number.isInteger(globalDepth) || globalDepth < 2 || globalDepth > 12 || globalDepth > targetCount) return { ok: false, reason: "live batches must be 2-12 and no greater than target count" };
+    if (!Number.isFinite(hackPercent) || hackPercent < 0.1 || hackPercent > 90) return { ok: false, reason: "hack percent must be 0.1-90" };
+    if (!Number.isInteger(stageGapMs) || stageGapMs < 75 || stageGapMs > 5000) return { ok: false, reason: "stage gap must be 75-5000 ms" };
+    return { ok: true, value: { profile, targetCount, globalDepth, hackFraction: hackPercent / 100, stageGapMs } };
+}
+
 function applyExecutionModeCommand(executionMode, prep) {
     const mode = executionMode.pending;
     executionMode.pending = "";
@@ -420,14 +495,17 @@ function applyExecutionModeCommand(executionMode, prep) {
     executionMode.awaitingReview = false;
     executionMode.batchCompletedAt = 0;
     executionMode.pipelineSafetyStopped = false;
+    executionMode.multiSafetyStopped = false;
     resetPrep(prep);
-    executionMode.lastMessage = mode === "PIPELINE"
-        ? "Pipeline mode active; controller will prep the target and run continuous depth-2 HWGW"
-        : mode === "BATCH"
-            ? "Serialized batched HWGW mode active; controller will prep and launch one batch at a time"
-            : mode === "HGW"
-                ? "Normal sequential HGW mode active"
-                : "Standby mode active; no target-side workers or batch coordinators will be launched";
+    executionMode.lastMessage = mode === "MULTI"
+        ? `Multi-target mode active; controller will repeat ${executionMode.multi.globalDepth}-target finite waves (${executionMode.multi.profile.toUpperCase()})`
+        : mode === "PIPELINE"
+            ? "Pipeline mode active; controller will prep the target and run continuous depth-2 HWGW"
+            : mode === "BATCH"
+                ? "Serialized batched HWGW mode active; controller will prep and launch one batch at a time"
+                : mode === "HGW"
+                    ? "Normal sequential HGW mode active"
+                    : "Standby mode active; no target-side workers or batch coordinators will be launched";
 }
 
 function recordFinishedBatch(ns, executionMode, finishedJob) {
@@ -463,6 +541,30 @@ function recordFinishedPipeline(ns, executionMode, prep, finishedJob) {
         executionMode.pipelineSafetyStopped = true;
         beginRecoveryPrep(prep, finishedJob.target, `Pipeline coordinator exited unexpectedly with state ${status}`);
         executionMode.lastMessage = `Pipeline coordinator exited with ${status}; target will be prepared and held before manual resume`;
+    }
+}
+
+function recordFinishedMulti(ns, executionMode, finishedJob) {
+    const multi = readMultiTargetSchedulerState(ns);
+    const status = String(multi?.status ?? "UNKNOWN");
+    const reason = String(multi?.reason ?? status);
+    if (status === "COMPLETE") {
+        const completed = Array.isArray(multi?.completed) ? multi.completed.length : 0;
+        executionMode.lastMessage = `Multi wave ${String(multi?.runId ?? finishedJob.pid)} complete: ${completed}/${finishedJob.globalDepth} target batch(es); next wave will be re-evaluated`;
+        return;
+    }
+    if (status === "BLOCKED") {
+        executionMode.lastMessage = `Multi wave waiting: ${reason}`;
+        return;
+    }
+    if (status === "SAFETY_STOP") {
+        executionMode.multiSafetyStopped = true;
+        executionMode.lastMessage = `MULTI SAFETY STOP: ${reason}`;
+        return;
+    }
+    if (executionMode.mode === "MULTI" && !executionMode.pending) {
+        executionMode.multiSafetyStopped = true;
+        executionMode.lastMessage = `Multi-target coordinator exited unexpectedly with ${status}; admissions stopped for review`;
     }
 }
 
@@ -548,7 +650,7 @@ function syncTargetControlState(state, targetControl) {
     };
 }
 
-function syncExecutionModeState(state, executionMode, batchJob, pipelineJob) {
+function syncExecutionModeState(state, executionMode, batchJob, pipelineJob, multiJob) {
     state.executionMode = {
         mode: executionMode.mode,
         pending: executionMode.pending,
@@ -561,6 +663,10 @@ function syncExecutionModeState(state, executionMode, batchJob, pipelineJob) {
         pipelineRunnerHost: String(pipelineJob?.hostname ?? ""),
         pipelineMaxDepth: 2,
         pipelineSafetyStopped: executionMode.pipelineSafetyStopped,
+        multiRunning: Boolean(multiJob),
+        multiRunnerHost: String(multiJob?.hostname ?? ""),
+        multiSafetyStopped: executionMode.multiSafetyStopped,
+        multiConfig: { ...executionMode.multi },
         awaitingReview: executionMode.awaitingReview,
         batchCompletedAt: executionMode.batchCompletedAt,
         lastBatchId: executionMode.lastBatchId,
@@ -610,7 +716,7 @@ function choosePrepHoldAction(state, prep) {
 function chooseStandbyAction(state) {
     state.phase = TargetPhase.PRODUCTION;
     state.action = ActionType.NONE;
-    state.reason = "Standby: target is observed only; no target-side execution is scheduled";
+    state.reason = "Control target is observed only; no single-target execution is scheduled";
 }
 
 function chooseBatchFoundationAction(state) {
@@ -776,10 +882,6 @@ function launchPipelineRunner(ns, planner, state) {
     const scriptRam = ns.getScriptRam(PIPELINE_RUNNER_SCRIPT, "home");
     if (!(scriptRam > 0)) return { pid: 0, hostname: "home", scriptRam, target: state.hostname, reason: "pipeline-runner.js RAM could not be determined" };
 
-    // The pipeline runner is a coordinator/control-plane service, not an H/G/W worker.
-    // Keep it on home so a 10+ GB coordinator does not depend on any one remote host
-    // having a large contiguous free block. The runner itself still reserves and
-    // launches all target-side H/G/W work exclusively on remote execution hosts.
     const homeFreeRam = Math.max(0, ns.getServerMaxRam("home") - ns.getServerUsedRam("home"));
     if (homeFreeRam < scriptRam) {
         return {
@@ -803,6 +905,27 @@ function launchPipelineRunner(ns, planner, state) {
     );
     if (pid > 0) return { pid, hostname: "home", scriptRam, target: state.hostname };
     return { pid: 0, hostname: "home", scriptRam, target: state.hostname, reason: "ns.run failed to start pipeline coordinator on home" };
+}
+
+function launchMultiTargetRunner(ns, executionMode) {
+    const config = executionMode.multi;
+    const scriptRam = ns.getScriptRam(MULTI_TARGET_RUNNER_SCRIPT, "home");
+    if (!(scriptRam > 0)) return { pid: 0, hostname: "home", scriptRam, globalDepth: config.globalDepth, reason: "multi-target-runner.js RAM could not be determined" };
+    const homeFreeRam = Math.max(0, ns.getServerMaxRam("home") - ns.getServerUsedRam("home"));
+    if (homeFreeRam < scriptRam) return { pid: 0, hostname: "home", scriptRam, globalDepth: config.globalDepth, reason: `home needs ${scriptRam.toFixed(2)} GB for multi-target coordinator but only ${homeFreeRam.toFixed(2)} GB is free` };
+    const pid = ns.run(
+        MULTI_TARGET_RUNNER_SCRIPT,
+        1,
+        config.profile,
+        config.targetCount,
+        config.hackFraction,
+        config.stageGapMs,
+        config.globalDepth,
+        "--controller",
+        ...quietArgs(ns),
+    );
+    if (pid > 0) return { pid, hostname: "home", scriptRam, globalDepth: config.globalDepth };
+    return { pid: 0, hostname: "home", scriptRam, globalDepth: config.globalDepth, reason: "ns.run failed to start multi-target coordinator on home" };
 }
 
 function launchTacticalPlanner(ns, planner, state, prep, sequence) {
@@ -923,7 +1046,7 @@ function getEstimatedActionTimeMs(state, action) {
 function printControllerState(ns, state) {
     ns.print("=== CONTROLLER STATE ===");
     ns.print(`Target:    ${state.hostname} | ${state.phase} | ${state.action}`);
-    ns.print(`Execution: ${state.executionMode?.mode ?? "STANDBY"}${state.executionMode?.pending ? ` / SWITCHING → ${state.executionMode.pending}` : state.executionMode?.pipelineRunning ? " / PIPELINE RUNNING" : state.executionMode?.batchRunning ? " / BATCH RUNNING" : state.executionMode?.awaitingReview ? " / REVIEW" : ""}`);
+    ns.print(`Execution: ${state.executionMode?.mode ?? "STANDBY"}${state.executionMode?.pending ? ` / SWITCHING → ${state.executionMode.pending}` : state.executionMode?.multiRunning ? " / MULTI RUNNING" : state.executionMode?.pipelineRunning ? " / PIPELINE RUNNING" : state.executionMode?.batchRunning ? " / BATCH RUNNING" : state.executionMode?.awaitingReview ? " / REVIEW" : ""}`);
     ns.print(`Targeting: ${state.targetControl?.mode ?? "AUTO"}${state.targetControl?.manualTarget ? ` / ${state.targetControl.manualTarget}` : ""}`);
     ns.print(`Money:     $${ns.format.number(state.money.current, 2)} / $${ns.format.number(state.money.max, 2)} (${moneyPercent(state).toFixed(1)}%) | desired ${(state.money.desiredPercent * 100).toFixed(0)}%`);
     ns.print(`Security:  ${state.security.current.toFixed(2)} / ${state.security.minimum.toFixed(2)} (+${Math.max(0, state.security.current - state.security.minimum).toFixed(2)})`);
