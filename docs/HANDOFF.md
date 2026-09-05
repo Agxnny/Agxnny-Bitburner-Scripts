@@ -34,7 +34,7 @@ The controller still supports:
 
 That controller-integrated path remains serialized.
 
-A new standalone `hacking/pipeline-runner.js` now provides the **first opt-in real overlapping depth-2 test**. It is deliberately not wired into automatic controller mode yet.
+A standalone `hacking/pipeline-runner.js` now provides the **first opt-in real overlapping depth-2 test**. It is deliberately not wired into automatic controller mode yet.
 
 ## Latest validated background
 
@@ -68,7 +68,7 @@ Both publish to **Port 16**.
 
 ### `hacking/pipeline-runner.js`
 
-New first executable pipeline test:
+First executable pipeline test:
 
 ```text
 run hacking/pipeline-runner.js phantasy 0.10 200 2
@@ -80,15 +80,30 @@ Important safety rules:
 - default/recommended first test count = **2 total batches**;
 - controller must already be parked in `PREPARED HOLD` on the same target;
 - no standalone controller workers may still be active;
-- no serialized batch runner may be active;
+- no serialized batch runner process may be active;
 - target must be at prepared money/security baseline;
 - stages are launched just-in-time from a host-by-host future reservation plan;
+- reservation windows include the 100 ms dispatch lead so planned RAM occupancy matches actual process lifetime;
 - the runner clears Port 14 once at startup, then becomes the sole timing-event consumer for the test;
 - Port 14 events are routed by `batchId` to the correct in-flight batch;
 - each completed pipeline result is copied to Port 15 so the existing Batch GUI timing graph continues to work;
 - live pipeline status is published to Port 16;
 - launch failure, wrong order, missing timing events, low recovered money, or excessive security stops new waves;
 - already-launched work is allowed to drain rather than admitting more work.
+
+### Stale Port 12 handling
+
+A real test exposed that Port 12 can retain an old `PLANNING`/`READY`/`RUNNING` snapshot even after the controller is parked in `PREPARED HOLD`. The pipeline preflight no longer treats that snapshot alone as proof of a live serialized batch.
+
+Before ignoring stale Port 12 state, the runner now verifies all of the following:
+
+- controller says `batchRunning === false`;
+- controller has no standalone active workers;
+- controller is in `PREPARED HOLD` on the requested target;
+- target is actually prepared;
+- no `/hacking/batch-runner.js` process is running on home, the remembered runner host, or any current execution host.
+
+If Port 12 still says `RUNNING` but no serialized coordinator process exists, preflight prints an explicit stale-snapshot note and proceeds. This keeps the safety gate process-based rather than snapshot-only.
 
 The runner executes in **waves** of at most two overlapping batches. Larger requested counts create later depth-2 waves only after the current pair drains and the target is still prepared. Do not use more than `2` for the first live test.
 
@@ -109,7 +124,7 @@ React callbacks remain Netscript-free; port/file work still happens only in the 
 
 ## Runtime telemetry relevant to batching
 
-- Port 12: current serialized batch snapshot.
+- Port 12: current serialized batch snapshot; may be stale after a previous run.
 - Port 14: batch worker timing event queue.
 - Port 15: latest completed serialized **or pipeline** batch snapshot.
 - Port 16: latest pipeline planner, admission simulation, or real executor snapshot.
@@ -119,9 +134,9 @@ The serialized runner still clears Port 14 before a serialized batch. Therefore 
 ## Immediate next development sequence
 
 ```text
-1. Pull/restart so the compact GUI and pipeline runner are deployed everywhere
+1. Pull/restart so the compact GUI and latest pipeline runner are deployed everywhere
 2. Put the intended test target into PREPARED HOLD from the GUI
-3. Confirm all controller workers are idle and no serialized batch is running
+3. Confirm all controller workers are idle and no serialized batch-runner process is running
 4. Run exactly two real batches with pipeline-runner.js
 5. Watch the Batch tab Port 16 state and Port 15 completed timing graph
 6. Validate BOTH batches: H→W1→G→W2, missing events=0, positive spacing, low drift, money≥99.5%, security≤+0.05
