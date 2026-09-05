@@ -1,4 +1,5 @@
 import {
+    readBatchHistoryState,
     readBatchSchedulerState,
     readBatchState,
     readCloudPurchaseState,
@@ -13,6 +14,8 @@ import {
     readRootState,
     readTacticalPlanState,
 } from "/lib/runtime-state.js";
+import { readOverlapEvidence } from "/lib/multi-overlap-evidence.js";
+import { readOverlapValidationState } from "/lib/overlap-validation-state.js";
 import { readTelemetryState } from "/lib/telemetry.js";
 
 let cachedState = null;
@@ -35,10 +38,13 @@ export function refreshSnapshot(ns) {
         purchase: readCloudPurchaseState(ns),
         manualGoal: readManualMoneyGoalState(ns),
         batch: readBatchState(ns),
+        batchHistory: readBatchHistoryState(ns),
         lastCompletedBatch: readLastCompletedBatchState(ns),
         scheduler: readBatchSchedulerState(ns),
         multiScheduler: readMultiTargetSchedulerState(ns),
         prepper: readPrepperState(ns),
+        overlapEvidence: readOverlapEvidence(ns),
+        overlapValidation: readOverlapValidationState(ns),
     };
     touchState();
     return cachedState;
