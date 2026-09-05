@@ -1,5 +1,5 @@
 import { isControllerStateStale } from "/lib/runtime-state.js";
-import { currentMultiRequest, queueController, status } from "/ui/actions.js";
+import { queueController, status } from "/ui/actions.js";
 import { button, card, el, grid, healthRow, heroMetric, kv, note, progressBar } from "/ui/components/layout.js";
 import { compactMs, moneyFmt, num, pctFine, ramFmt } from "/ui/components/format.js";
 import { styles } from "/ui/styles.js";
@@ -23,7 +23,7 @@ export function overviewView(s) {
             heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} hosts`),
             heroMetric("EXECUTION", modeLabel(mode), executionSubtext(c)),
         ),
-        card("Quick controls", quickControls(s), true),
+        card("Execution control", executionControls(s), true),
         grid(
             card("Target", el("div", null,
                 kv("Mode", c.targetControl?.mode ?? "AUTO"),
@@ -46,32 +46,38 @@ export function overviewView(s) {
     );
 }
 
-function quickControls(s) {
+function executionControls(s) {
     const c = s.controller ?? {};
     const mode = c.executionMode?.mode ?? "STANDBY";
     const pending = Boolean(c.executionMode?.pending);
-    const target = String(c.hostname ?? "");
     const resumeUseful = Boolean(c.prep?.hold || c.executionMode?.pipelineSafetyStopped || c.executionMode?.multiSafetyStopped);
     return el("div", null,
         el("div", { style: styles.controlGrid },
             el("div", null,
                 kv("Execution", pending ? `SWITCHING → ${c.executionMode.pending}` : modeLabel(mode)),
-                kv("Prep", c.prep?.hold ? "PREPARED HOLD" : c.prep?.active ? `PREP ${c.prep.stage ?? "ACTIVE"}` : "off"),
+                kv("Prepper", prepperStatus(s.prepper)),
                 kv("Pipeline", c.executionMode?.pipelineSafetyStopped ? "SAFETY STOP" : c.executionMode?.pipelineRunning ? "RUNNING · depth 2" : mode === "PIPELINE" ? "ready / preparing" : "off"),
                 kv("Multi", c.executionMode?.multiSafetyStopped ? "SAFETY STOP" : c.executionMode?.multiRunning ? `RUNNING · ${c.executionMode?.multiConfig?.globalDepth ?? "?"} targets` : mode === "MULTI" ? "controller-managed waves" : "off"),
             ),
             el("div", { style: styles.controlActions },
                 modeButton("Standby", "STANDBY", mode, pending, "clear"),
-                modeButton("HGW", "HGW", mode, pending, "clear"),
-                modeButton("Batch", "BATCH", mode, pending, "primary"),
-                modeButton("Pipeline", "PIPELINE", mode, pending, "primary"),
-                button("Multi", () => queueController({ action: "START_MULTI", ...currentMultiRequest() }), pending, "primary"),
-                button("Prep + hold", () => queueController({ action: "PREP_TARGET", target }), !target, "primary"),
-                button("Resume", () => queueController({ action: "RESUME_AUTO" }), !resumeUseful, "clear"),
+                modeButton("HGW", "HGW", mode, pending, "primary"),
+                button("Resume safety", () => queueController({ action: "RESUME_AUTO" }), !resumeUseful, "clear"),
             ),
         ),
         el("div", { style: styles.goalStatus }, c.executionMode?.lastMessage || c.prep?.lastMessage || status("controllerStatus")),
+        note("Specialized BATCH / PIPELINE / MULTI controls are intentionally kept out of Overview. MULTI configuration lives on Batch; background prepper operation is automatic."),
     );
+}
+
+function prepperStatus(prepper) {
+    if (!prepper) return "waiting";
+    const ageMs = Date.now() - Number(prepper.updatedAt ?? 0);
+    if (ageMs > 5000) return "STALE";
+    const active = Number(prepper.activeCount ?? 0);
+    const prepared = Number(prepper.preparedCount ?? 0);
+    const total = Number(prepper.targetCount ?? 0);
+    return active > 0 ? `RUNNING · ${active} jobs · ${prepared}/${total} ready` : `${String(prepper.status ?? "idle")} · ${prepared}/${total} ready`;
 }
 
 function modeButton(label, requestedMode, currentMode, pending, tone) {
