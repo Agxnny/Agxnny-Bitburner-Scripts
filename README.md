@@ -1,6 +1,6 @@
 # Agxnny Bitburner Scripts
 
-A modular Bitburner v3.x automation project built around a control-only home node, remote HGW/HWGW execution, adaptive economic targeting, progression automation, diagnostics, and a compact React control-plane GUI.
+A modular Bitburner v3.x automation stack with a home-based control plane, remote HGW/HWGW execution, adaptive target preparation, real multi-target batching, durable concurrency validation, economy/progression automation, diagnostics, and an observation-only stock Market Lab.
 
 ## Quick start
 
@@ -8,107 +8,75 @@ A modular Bitburner v3.x automation project built around a control-only home nod
 run startup.js
 ```
 
-Startup brings the control plane up in **STANDBY**. Planner/economy/controller/UI state remains available, but the controller does not launch target-side H/G/W workers, serialized batches, or a pipeline coordinator until an execution mode is selected in the GUI.
+Startup launches the main Control Plane and stock Market Lab, restores the manual savings lock, refreshes planning/deployment, starts the prepper/history services, and starts the controller in **STANDBY**. The prepper is independent and may still run GROW/WEAKEN maintenance while production is in STANDBY.
 
-For updates:
+Update from GitHub `main` with:
 
 ```text
 run gitpull.js
 run startup.js
 ```
 
-GitHub `main` is the source of truth. Read `docs/HANDOFF.md` first before continuing development.
+For development continuity read `docs/HANDOFF.md` first. For a readable inventory of implemented behavior read `docs/FEATURES.md`.
 
-## GUI execution controls
+## Production modes
 
-```text
-STANDBY   no target-side execution
-HGW       normal sequential automation
-BATCH     serialized one-batch-at-a-time HWGW
-PIPELINE  continuous controller-managed depth-2 HWGW
-```
-
-`Prep + hold` remains available for manual testing/recovery, and `Resume` releases a prepared hold or clears a reviewed pipeline safety stop.
-
-## Integrated depth-2 pipeline
-
-Four consecutive real overlapping `phantasy` batches were validated with 100.00% money recovery, +0.000 security, correct H → W1 → G → W2 order, and no safety stops. The then-current sustainable cadence was about 6262 ms.
-
-The controller-integrated `PIPELINE` mode keeps the live depth cap at 2 while integration is validated. The coordinator runs on home, H/G/W workers remain remote, Port 14 events are routed centrally by `batchId`, Port 15 keeps the latest completion, and Port 16 exposes the current single-target pipeline state.
-
-The 200 ms stage gap remains unchanged until rolling timing history exists.
-
-## Multi-target resource allocator — dry run
-
-The first global multi-target planning scaffold is now available:
-
-```text
-run hacking/multi-target-scheduler.js money 4 0.10 200 64
-run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
-run hacking/multi-target-scheduler.js xp 4 0.10 200 64
-```
-
-It launches **no workers**. Instead of assigning a fixed depth to every target, it repeatedly scores and reserves complete virtual HWGW batches against one shared host/time calendar. Better targets can receive more depth, while a diminishing-returns fairness penalty leaves room for secondary viable targets when capacity permits.
-
-Profiles:
-
-```text
-MONEY     expected cash per reserved RAM-time
-BALANCED  70% normalized money efficiency + 30% XP proxy
-XP        action-thread/difficulty XP proxy per reserved RAM-time
-```
-
-The XP score is intentionally a proxy at this stage, not an exact hacking-experience formula. Full allocation state is published to **Port 17**, leaving Port 16 free for the live single-target pipeline.
-
-## Manual finite pipeline test
-
-```text
-run hacking/pipeline-runner.js phantasy 0.10 200 2
-```
-
-Normal single-target operation should use GUI `Pipeline` mode rather than repeatedly starting this manually.
-
-## Runtime ports
-
-| Port | Purpose |
+| Mode | Function |
 | --- | --- |
-| 1 | controller snapshot |
-| 2 | planner / selected strategy |
-| 3 | tactical plan |
-| 4 | hack-completion event queue |
-| 5 | income telemetry |
-| 6 | diagnostic request queue |
-| 7 | economy/progression snapshot |
-| 8 | economic target state |
-| 9 | rooting/tool state |
-| 10 | cloud-capacity action state |
-| 11 | manual money-goal / spending lock |
-| 12 | current serialized HWGW batch snapshot |
-| 13 | controller command queue |
-| 14 | batch worker landing-timing event queue |
-| 15 | latest completed serialized/pipeline batch |
-| 16 | single-target pipeline planner / simulation / executor |
-| 17 | global multi-target allocation planner |
+| `STANDBY` | Production admission off; safe state for real validation. |
+| `HGW` | Sequential remote hack/grow/weaken automation. |
+| `BATCH` | Serialized synchronized HWGW. |
+| `PIPELINE` | Continuous same-target synchronized HWGW, hard live depth 2. |
+| `MULTI` | Controller-managed real multi-target finite waves. Global depth is configurable; same-target production depth is still 1 pending validation rollout. |
+
+Mode changes drain admitted synchronized work to a safe boundary.
+
+## Main features
+
+- Adaptive economic target selection with partial/full preparation strategies.
+- Distributed money-first prepper with bounded reserved RAM, adaptive concentration, multi-host same-target prep, and ETA telemetry.
+- Serialized HWGW and real continuous depth-2 pipeline execution.
+- Real finite multi-target execution with one shared host/time calendar and central timing-event routing.
+- Persistent global stress evidence and independent per-target/per-depth overlap evidence.
+- Validation tab with depth-2 qualification, configurable depth-N validation, individual full-depth climb, and sequential `PROVEN2+ SET` full-depth testing.
+- AUTOMULTI supervisory foundation for scenario selection and global validation; final heterogeneous same-target production scheduling is still under development.
+- Manual savings/spending lock plus advisor-driven home/cloud capacity progression.
+- Automatic rooting/deployment/synchronization of remote execution capacity.
+- Seven-tab React Control Plane with collapsible cards and Netscript-free React callbacks.
+- Observation-only stock Market Lab with retained wall-clock history, true 5m/15m/30m/1h/4h candlesticks, full-history line view, recorder-gap handling, and portfolio display.
+- Integrated health/tests plus terminal diagnostics and RAM audit.
+
+## Current dynamic MULTI boundary
+
+Validation can learn different safe overlap depths for different targets and retains evidence independently, for example `target A = depth 5` and `target B = depth 2`. Production MULTI **does not consume those higher target-local depths yet**. The next production stage is target-stream validation plus a marginal allocator that combines target-local proof with separate global concurrency proof.
+
+## Documentation
+
+- `docs/FEATURES.md` — implemented features and what each subsystem does.
+- `docs/HANDOFF.md` — current development state, runtime evidence, and immediate next work.
+- `docs/architecture.md` — architecture and safety boundaries.
+- `docs/SYSTEM_MAP.md` — file/module responsibility map.
+- `docs/RUNTIME_STATE.md` — ports, durable files, and command/state contracts.
+- `docs/GUI_ARCHITECTURE.md` — main GUI structure and callback rules.
+- `docs/BATCH_SCHEDULER.md` — synchronized scheduling and dynamic MULTI design.
+- `docs/TESTING.md` — current validation procedures and regression checklist.
+- `docs/ROADMAP.md` — completed/current/next development stages.
 
 ## Useful commands
 
 ```text
 run startup.js
 run diagnostics/mem-audit.js
-run hacking/batch-scheduler.js phantasy 0.10 200
-run hacking/multi-target-scheduler.js money 4 0.10 200 64
-run hacking/multi-target-scheduler.js balanced 4 0.10 200 64
-run hacking/multi-target-scheduler.js xp 4 0.10 200 64
 run hacking/pipeline-runner.js phantasy 0.10 200 2
+run hacking/multi-target-runner.js money 6 0.10 200 3
+run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 10 resume
+run diagnostics/multi-depth-validate.js phantasy 3 2 0.10 200
+run diagnostics/multi-full-depth-test.js phantasy 2 0.10 200
+run diagnostics/multi-full-depth-set.js 2 0.10 200
 ```
 
-## Next priorities
+Real overlap/stress validation requires the controller to be fully STANDBY. Do not manually rerun a failed higher depth before inspecting the failure evidence.
 
-1. finish continuous PIPELINE startup/drain/restart validation;
-2. inspect MONEY/BALANCED/XP multi-target dry-run allocations and tune fairness/global landing spacing;
-3. add rolling per-target landing/recovery history;
-4. extract shared batch-planning/reservation logic;
-5. build persistent multi-target admission simulation;
-6. first real multi-target test with global depth 2 / per-target depth 1;
-7. then replace fixed depth with dynamic safe per-target depth under one global RAM/time calendar;
-8. keep automatic watchdog termination deferred until timing is stable.
+## Core safety rules
+
+Home remains the control/UI plane; normal workers execute remotely. Only one real synchronized coordinator owns Port 14 at a time. RAM availability never overrides proven concurrency. Global distinct-target proof and target-local overlap proof are separate. Higher-depth failure preserves lower proof. Manual savings locks override automated spending. Stock trading is currently disabled.
