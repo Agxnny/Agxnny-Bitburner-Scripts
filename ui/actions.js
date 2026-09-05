@@ -13,6 +13,7 @@ const MULTI_TARGET_RUNNER = "/hacking/multi-target-runner.js";
 
 const model = {
     pendingTest: null,
+    pendingDiagnostic: null,
     pendingGoal: null,
     pendingController: null,
     pendingMultiRun: null,
@@ -36,6 +37,7 @@ export function field(name) { return String(model.fields[name] ?? ""); }
 export function setField(name, value) { model.fields[name] = String(value ?? ""); touchState(); }
 export function status(name) { return String(model[name] ?? ""); }
 export function queueTest(id, label) { model.pendingTest = { id, label }; touchState(); }
+export function queueDiagnostic(script, args = [], label = "Diagnostic") { model.pendingDiagnostic = { script, args, label }; touchState(); }
 export function queueGoal(action) { model.pendingGoal = action; touchState(); }
 export function queueController(action) { model.pendingController = action; touchState(); }
 export function queueMultiRun() { model.pendingMultiRun = currentMultiRequest(); touchState(); }
@@ -57,6 +59,14 @@ export async function processPendingActions(ns, now) {
         model.pendingTest = null;
         ns.writePort(TEST_REQUEST_PORT, JSON.stringify({ test: test.id, requestedAt: now }));
         model.actionStatus = `${test.label} queued`;
+        touchState();
+    }
+
+    if (model.pendingDiagnostic) {
+        const request = model.pendingDiagnostic;
+        model.pendingDiagnostic = null;
+        const pid = ns.run(request.script, 1, ...request.args);
+        model.actionStatus = pid > 0 ? `${request.label} started · PID ${pid}` : `${request.label} failed to start`;
         touchState();
     }
 
