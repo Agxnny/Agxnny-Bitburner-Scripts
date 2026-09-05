@@ -8,8 +8,37 @@ Prefer small focused modules over monoliths. Ordinary modules aim <=300 lines, r
 ## Execution modes
 `STANDBY`, `HGW`, `BATCH`, `PIPELINE`, `MULTI`. Startup defaults STANDBY; prepper runs independently.
 
+## Dynamic MULTI redesign — ACTIVE WORK
+User explicitly wants production to learn per-target overlap depth beyond 2, dynamically tune hack fraction and timing, compare one deep premium target against multiple shallower targets, and automatically borrow idle prep-reserve RAM for validation.
+
+Safety invariants:
+- global concurrency proof and per-target overlap proof remain separate;
+- RAM availability never grants unproven overlap depth;
+- production uses proven depth only; candidate depth is validation-only;
+- failed higher-depth validation must preserve lower proven levels;
+- target-stream recovery validation is required before tightly interleaved deep overlap is admitted;
+- prep owns its reserve whenever real prep demand exists; background validation may only borrow genuinely idle reserve capacity and must yield admission immediately when prep returns.
+
+### Dynamic overlap evidence foundation — IMPLEMENTED
+`lib/multi-overlap-evidence.js` now writes model `MULTI_TARGET_OVERLAP_EVIDENCE_V2_DYNAMIC_DEPTH`. It stores evidence independently per tested depth under each target's `depths` map, including clean/failed/consecutive waves, active proof, drift, spacing, hack fraction, stage gap, batch interval, status/reason and timestamps. Two consecutive clean dedicated waves prove a tested depth. A failure at a higher depth invalidates that depth without erasing lower proof.
+
+V1 runtime evidence is migrated in memory on read, preserving existing depth-2 proof. The next V2 write persists the migrated structure. Do not delete `/data/multi-overlap-evidence.txt` during rollout.
+
+`lib/multi-target-tuning.js` is a new pure policy module. It defines the initial promotion ladder `2,3,4,6,8,10,12`, hack candidates `5,7.5,10,12.5,15,20%`, timing candidates `100,125,150,175,200,250ms`, returns target-local proven/effective profiles, proposes conservative next validation experiments, and provides a marginal batch efficiency primitive for the future portfolio allocator. It does not itself authorize production beyond evidence.
+
+### Still to implement in this redesign
+1. Generalize the dedicated validator from fixed depth 2 to configurable depth N while preserving conservative non-crossing target streams initially.
+2. Replace per-batch final-state assumptions with target-stream recovery validation suitable for deep overlap.
+3. Extend real MULTI admission to consume target-local proven depth and rank the next marginal batch opportunity rather than enforcing distinct targets.
+4. Compare concentrated vs distributed portfolio configurations using realized/expected money per second and RAM-second under proof/timing constraints.
+5. Add bounded hill-climb tuning for depth/hack fraction/stage gap, with cooldown after failed experiments.
+6. Add automatic low-priority validator that borrows only idle prep-reserve hosts/RAM, yields immediately to prep demand, and starts automatically through kickstart.
+7. Feed learned profiles into AUTOMULTI and expose effective/proven/candidate settings in UI.
+
+Current real `hacking/multi-target-runner.js` is STILL per-target depth 1. Do not remove its uniqueness guard until configurable validator/stream proof is implemented and runtime-validated.
+
 ## Concurrency evidence dimensions
-Global distinct-target concurrency and same-target overlap are separate safety dimensions. Historical global stress was clean through distinct depth 5, but durable machine-readable proof starts separately in `/data/multi-stress-evidence.txt`.
+Historical global stress was clean through distinct depth 5, but durable machine-readable proof starts separately in `/data/multi-stress-evidence.txt`.
 
 ## AUTOMULTI
 - `lib/automulti-decision.js`: pure Possible / Proven / Effective decision logic.
@@ -18,139 +47,45 @@ Global distinct-target concurrency and same-target overlap are separate safety d
 - `hacking/automulti-controller.js`: supervisory ASSESS -> RUN -> OBSERVE -> ADAPT.
 Production must never exceed the relevant proven ceiling.
 
-## Same-target overlap rollout
-Durable proof: `lib/multi-overlap-evidence.js` -> `/data/multi-overlap-evidence.txt`, model `MULTI_TARGET_OVERLAP_EVIDENCE_V1`.
-Shared policy: `lib/multi-overlap-policy.js`, model `MULTI_TARGET_OVERLAP_POLICY_V2_SEPARATE_PROOF`.
-Pipeline history creates `VALIDATE2`; two clean dedicated overlap waves create `PROVEN2`. Port 19's older 4/8 ladder is never direct production overlap proof.
+## Existing same-target overlap rollout
+Shared policy: `lib/multi-overlap-policy.js`, currently still conservative depth-2 production policy. Pipeline history creates `VALIDATE2`; dedicated overlap evidence creates production proof.
 
-Dedicated validator:
+Dedicated validator currently remains fixed depth 2:
 ```text
 run diagnostics/multi-overlap-validate.js [target|auto] [waves] [hackFraction] [stageGapMs]
 ```
-Controller must be fully STANDBY. Validator owns Port 14, schedules two same-target HWGW batches, validates timing/order/spacing/drift/recovery, and records evidence.
+Controller must be fully STANDBY. Validator owns Port 14 and records evidence.
 
-Validation UI is integrated in the main dashboard under `ui/views/validation.js`. It supports MIXED VALIDATE2, ALL PREPARED including DEPTH1, and explicit targets. Dashboard launches are quiet. Runtime truth comes from actual validator process state plus file telemetry, so stale state is shown as `VALID STALE` rather than pretending work is still healthy.
+Validation UI is integrated in the main dashboard under `ui/views/validation.js`. Dashboard launches are quiet. Runtime truth comes from actual validator process state plus file telemetry.
 
 Latest runtime evidence from the user: joesguns validated cleanly; screenshot later showed phantasy, sigma-cosmetics, and joesguns already `PROVEN2` while a mixed pass continued through silver-helix and remaining candidates.
 
-Real `hacking/multi-target-runner.js` is still per-target depth 1. Do not remove its uniqueness guard until the current multi-target overlap evidence pass is reviewed.
-
 ## Stock research baseline
-The user is saving toward the $25b 4S forecasting API and requested observation/history first, no autonomous trading yet.
+User is saving toward the $25b 4S forecasting API; stock subsystem remains observation/history only, no autonomous trading yet.
 
-### Persistent compact history
-```text
-lib/stock-history.js
-/data/stock-history.txt
-model STOCK_HISTORY_V1_COMPACT
-```
-History stores one shared timestamp array plus a compact price array per symbol. Timestamps use JavaScript `Date.now()` wall-clock epoch time.
+Persistent history: `lib/stock-history.js` -> `/data/stock-history.txt`, model `STOCK_HISTORY_V1_COMPACT`. Retention is ALL going forward. Timestamps use `Date.now()` wall-clock time and recorder gaps are preserved rather than reconstructed.
 
-Retention is now `ALL`: new samples are no longer trimmed to the former 1,800-sample / ~3-hour rolling cap. Existing data that had already been trimmed before this change cannot be reconstructed, but all new observations remain persisted across normal pulls/restarts until the user explicitly deletes/resets the data file.
+`stocks/history-keeper.js` polls TIX every 200ms, persists a historical sample only when the price set changes, and refreshes market/portfolio heartbeat about once per second. Bitburner v3 access methods are `hasWseAccount`, `hasTixApiAccess`, `has4SData`, `has4SDataTixApi`.
 
-Recorder gaps use wall-clock continuity. `appendStockSample()` can record an explicit restart gap from the last persisted market heartbeat to the first new changed-price sample. Gap records include `from`, `to`, `durationMs`, and endpoint price jumps by symbol. The dashboard never fabricates intermediate prices.
-
-`stockSeriesStats()` excludes returns crossing a detected outage from tick volatility.
-
-### Stock history keeper
-```text
-stocks/history-keeper.js
-```
-Observation-only, never trades. Bitburner v3 stock access methods:
-```text
-ns.stock.hasWseAccount()
-ns.stock.hasTixApiAccess()
-ns.stock.has4SData()
-ns.stock.has4SDataTixApi()
-```
-
-The keeper now polls TIX every 200ms to detect market changes as soon as practical. It does not persist duplicate unchanged prices every 200ms: it fingerprints the full symbol price set and writes a new historical sample only when prices actually change. Current market state/portfolio heartbeat is refreshed roughly once per second even if prices are unchanged. Observed market-tick interval is learned from recent changed-price timestamps and retained as `history.intervalMs` for gap/volatility logic.
-
-`kickstart.js` starts `stocks/history-keeper.js` quietly. The stock dashboard also guards/starts it.
-
-### Separate React Market Lab dashboard
-```text
-stocks/dashboard.js
-stocks/candles.js
-stocks/styles.js
-run stocks/dashboard.js
-```
-The dashboard is separate from the hacking control plane and refreshes cached file state at 250ms. React callbacks remain Netscript-free.
-
-Two chart tabs now exist:
-```text
-CANDLES
-HISTORY · LINE
-```
-
-`CANDLES` is only for fixed OHLC timeframe views. Current selectors:
-```text
-1m / 5m / 15m / 30m / 1h / 4h
-```
-Candles are aligned to real wall-clock timeframe buckets and calculated only from observed samples. Direction is truthful: close > open is green, close < open is red, close == open is neutral grey. Wicks use the candle's actual observed high/low. Recorder gaps force a new candle and display an amber dashed discontinuity marker; candles never bridge missing data.
-
-The candle tab deliberately does not have an ALL-HISTORY mode. It shows a recent window of roughly 70 candles at the chosen timeframe so old history is not compressed into misleading candles.
-
-`HISTORY · LINE` preserves the original line-graph style and is the only place where historical-range selection appears:
-```text
-15m / 1h / 3h / 6h / 12h / 24h / ALL
-```
-`ALL` displays all retained observations. The line is broken at recorder gaps with an amber dashed marker rather than connecting pre-gap and post-gap prices as though they were continuously observed.
-
-Header/hero/portfolio/market-watch remain read-only. Long and short holdings are accounted separately for future bidirectional trading support.
-
-### Startup behavior
-`startup.js` launches both dashboards on home before spawning the quiet kickstart chain:
-```text
-/ui/dashboard.js
-/stocks/dashboard.js
-```
-Each is guarded with `ns.isRunning()`.
-
-### Stock next steps
-Do not build autonomous orders yet. Continue collecting a meaningful pre-4S baseline and inspect runtime/file growth. After 4S becomes available, signal source can switch to native forecast + volatility while preserving history/portfolio/dashboard layers.
-
-Likely future focused modules:
-```text
-stocks/signals.js
-stocks/allocator.js
-stocks/trader.js
-stocks/controller.js
-```
-Economy/manual-goal cash reservation must remain authoritative over future stock deployment.
+`stocks/dashboard.js` is a separate React Market Lab. CANDLES has fixed `1m/5m/15m/30m/1h/4h` wall-clock OHLC views only; direction is truthful (close>open green, close<open red, equal neutral), wicks are observed high/low, gaps are not bridged. HISTORY · LINE alone provides `15m/1h/3h/6h/12h/24h/ALL` historical ranges and breaks the line at gaps. Startup launches both main and stock dashboards.
 
 ## Prepper
-`hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM.
+`hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM. Current reserve selection is host-based and the prepper owns those hosts. Automatic validation borrowing is NOT implemented yet; it must coordinate ownership explicitly rather than simply launching the existing validator against the general execution pool.
 
 ## Runtime ports
 12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap and stock research state are file-based.
 
-## Immediate stock test
-After pulling:
-```text
-run gitpull.js
-```
-Restart the already-running stock keeper and dashboard (or restart the normal startup stack) because Bitburner running scripts do not hot-reload imports.
-
-Validate:
-```text
-- CANDLES tab has only fixed 1m/5m/15m/30m/1h/4h timeframe buttons
-- green candles only when close > open; red only when close < open; neutral when equal
-- wick high/low matches observed data
-- HISTORY · LINE has 15m..24h plus ALL
-- ALL line uses all retained observations and breaks at gaps
-- recorder continues collecting with the dashboard closed
-- history sample count grows only when stock prices actually change
-```
+## Immediate next work
+Continue dynamic MULTI implementation with the configurable depth-N validator and target-stream validation. Preserve the existing depth-2 runtime evidence through the V1->V2 migration. Only after depth-N proof is runtime-safe should production MULTI consume dynamic per-target depth. Then implement marginal portfolio allocation and idle prep-reserve auto-validation.
 
 ## Priority
 ```text
-IN PROGRESS runtime validate depth 2 across multiple targets
-NEXT review mixed/all overlap evidence
-NEXT extend real MULTI planner to evidence-backed per-target depth 2
-NEXT separate total global in-flight cap from distinct-target count
-PARALLEL collect pre-4S stock price history and validate Market Lab runtime/file growth + gap tracking
-LATER add stock signal/allocator/trader/controller after baseline and 4S access
-LATER feed overlap capacity into AUTOMULTI and GUI
-LATER tighter target-local cadence, failed-global-depth cooldown, UI refinements, watchdog
+IN PROGRESS dynamic MULTI: arbitrary per-target evidence + tuning foundation DONE
+NEXT configurable depth-N validator + target-stream recovery proof
+NEXT real MULTI marginal allocator using proven per-target depth
+NEXT concentrated-vs-distributed portfolio selection + hack/timing tuner
+NEXT automatic idle prep-reserve validation borrowing
+NEXT feed learned profiles into AUTOMULTI + GUI
+PARALLEL collect pre-4S stock history
+LATER progression supervisor, stock trading after signal/4S work, watchdog/UI refinements
 ```
