@@ -12,16 +12,20 @@ import {
     RuntimePort,
     publishLastCompletedBatchState,
     publishMultiTargetSchedulerState,
+    readControllerState,
     readEconomyTargetState,
     readPlannerState,
 } from "/lib/runtime-state.js";
 import { isQuiet, positionalArgs } from "/lib/output.js";
 
+const SCRIPT = "/hacking/multi-target-runner.js";
 const DEFAULT_PROFILE = "money";
 const DEFAULT_TARGET_COUNT = 4;
 const DEFAULT_HACK_FRACTION = 0.10;
 const DEFAULT_STAGE_GAP_MS = 200;
-const GLOBAL_LIVE_DEPTH = 2;
+const DEFAULT_GLOBAL_LIVE_DEPTH = 2;
+const MIN_GLOBAL_LIVE_DEPTH = 2;
+const MAX_GLOBAL_LIVE_DEPTH = 12;
 const PER_TARGET_LIVE_DEPTH = 1;
 const GLOBAL_LANDING_GAP_MS = 100;
 const DISPATCH_LEAD_MS = 100;
@@ -38,29 +42,38 @@ const PROFILE_WEIGHTS = Object.freeze({
 });
 
 /**
- * First real multi-target executor prototype.
+ * Conservative real multi-target finite-wave executor.
  *
- * Safety posture is intentionally conservative:
+ * Safety posture:
  * - finite one-wave execution only;
- * - global live depth hard-capped at 2;
- * - per-target live depth hard-capped at 1;
+ * - configurable global live depth, hard-capped at 12;
+ * - per-target live depth remains hard-capped at 1;
  * - only already-prepared targets are admitted;
  * - one coordinator owns Port 14 and routes timing events by batchId;
+ * - unique batch IDs on every invocation;
+ * - controller must be fully parked in STANDBY;
  * - no dynamic Port 19 live-depth promotion yet.
  *
  * Usage:
- *   run hacking/multi-target-runner.js [money|balanced|xp] [targetCount] [hackFraction] [stageGapMs]
+ *   run hacking/multi-target-runner.js [money|balanced|xp] [targetCount] [hackFraction] [stageGapMs] [globalDepth]
  *
  * @param {NS} ns
  */
 export async function main(ns) {
     ns.disableLog("ALL");
-    const args = positionalArgs(ns);
-    const profile = normalizeProfile(args[0]);
-    const targetCount = clampInt(Number(args[1] ?? DEFAULT_TARGET_COUNT), 2, 12);
-    const hackFraction = clamp(Number(args[2] ?? DEFAULT_HACK_FRACTION), 0.001, 0.90);
-    const stageGapMs = Math.max(75, Math.floor(Number(args[3] ?? DEFAULT_STAGE_GAP_MS)));
     const quiet = isQuiet(ns);
+    const parsed = parseRunArgs(positionalArgs(ns));
+    if (!parsed.ok) {
+        if (!quiet) {
+            ns.tprint(`[MULTI-REAL] BLOCKED: ${parsed.reason}`);
+            ns.tprint(`[MULTI-REAL] Usage: run hacking/multi-target-runner.js [money|balanced|xp] [targetCount 2-12] [hackFraction 0.001-0.90] [stageGapMs >=75] [globalDepth 2-12]`);
+        }
+        return;
+    }
+
+    const { profile, targetCount, hackFraction, stageGapMs } = parsed;
+    const globalLiveDepth = Math.min(parsed.globalLiveDepth, targetCount);
+    const runId = `${Date.now().toString(36)}-${ns.pid}`;
 
     if (ns.getHostname() !== "home") {
         if (!quiet) ns.tprint("ERROR: Run hacking/multi-target-runner.js from home.");
@@ -69,7 +82,7 @@ export async function main(ns) {
 
     const preflight = preflightCheck(ns);
     if (!preflight.ok) {
-        publishState(ns, profile, "BLOCKED", preflight.reason, [], []);
+        publishState(ns, profile, globalLiveDepth, "BLOCKED", preflight.reason, [], [], runId);
         if (!quiet) ns.tprint(`[MULTI-REAL] BLOCKED: ${preflight.reason}`);
         return;
     }
@@ -85,16 +98,16 @@ export async function main(ns) {
     normalizeObjectiveScores(templates, weights);
 
     const prepared = templates.filter((target) => target.preparedNow);
-    if (prepared.length < 2) {
-        const reason = `Need at least 2 prepared candidate targets; found ${prepared.length}`;
-        publishState(ns, profile, "BLOCKED", reason, [], []);
+    if (prepared.length < globalLiveDepth) {
+        const reason = `Need ${globalLiveDepth} prepared candidate targets; found ${prepared.length} within top ${targetCount}`;
+        publishState(ns, profile, globalLiveDepth, "BLOCKED", reason, [], [], runId);
         if (!quiet) ns.tprint(`[MULTI-REAL] BLOCKED: ${reason}`);
         return;
     }
 
-    const plan = buildConservativePlan(ns, pool, prepared);
+    const plan = buildConservativePlan(ns, pool, prepared, globalLiveDepth, runId);
     if (!plan.ok) {
-        publishState(ns, profile, "BLOCKED", plan.reason, [], []);
+        publishState(ns, profile, globalLiveDepth, "BLOCKED", plan.reason, [], [], runId);
         if (!quiet) ns.tprint(`[MULTI-REAL] BLOCKED: ${plan.reason}`);
         return;
     }
@@ -102,12 +115,12 @@ export async function main(ns) {
     ns.getPortHandle(RuntimePort.BATCH_TIMING_EVENTS).clear();
     const live = plan.batches;
     if (!quiet) {
-        ns.tprint("=== MULTI-TARGET REAL · CONSERVATIVE PROTOTYPE ===");
-        ns.tprint(`[MULTI-REAL] ${profile.toUpperCase()} | global depth ${GLOBAL_LIVE_DEPTH} | per-target depth ${PER_TARGET_LIVE_DEPTH}`);
+        ns.tprint("=== MULTI-TARGET REAL · CONSERVATIVE FINITE WAVE ===");
+        ns.tprint(`[MULTI-REAL] ${profile.toUpperCase()} | global depth ${globalLiveDepth} | per-target depth ${PER_TARGET_LIVE_DEPTH}`);
         for (const batch of live) ns.tprint(`[MULTI-REAL] ADMIT ${batch.target} | ${batch.id}`);
     }
 
-    publishState(ns, profile, "RUNNING", `${live.length} real batch(es) admitted`, live, []);
+    publishState(ns, profile, globalLiveDepth, "RUNNING", `${live.length} real batch(es) admitted`, live, [], runId);
     let safetyStop = "";
     const completed = [];
 
@@ -147,7 +160,7 @@ export async function main(ns) {
             const allStagesLaunched = batch.stages.every((stage) => stage.launched);
             const anyRunning = batch.stages.some((stage) => stage.jobs.some((job) => ns.isRunning(job.pid, job.hostname)));
             if (allStagesLaunched && !anyRunning && now >= batch.finalLandingAt - COMPLETE_GRACE_MS) {
-                const complete = finalizeBatch(ns, batch, stageGapMs);
+                const complete = finalizeBatch(ns, batch, stageGapMs, globalLiveDepth, runId);
                 batch.done = true;
                 batch.complete = complete;
                 completed.push(complete);
@@ -164,21 +177,50 @@ export async function main(ns) {
             }
         }
 
-        publishState(ns, profile, safetyStop ? "SAFETY_STOP" : "RUNNING", safetyStop || `${live.filter((batch) => !batch.done).length} batch(es) in flight`, live, completed);
+        publishState(ns, profile, globalLiveDepth, safetyStop ? "SAFETY_STOP" : "RUNNING", safetyStop || `${live.filter((batch) => !batch.done).length} batch(es) in flight`, live, completed, runId);
         if (safetyStop) break;
         await ns.sleep(LOOP_MS);
     }
 
     const status = safetyStop ? "SAFETY_STOP" : "COMPLETE";
     const reason = safetyStop || `Completed ${completed.length}/${live.length} conservative real multi-target batch(es)`;
-    publishState(ns, profile, status, reason, live, completed);
+    publishState(ns, profile, globalLiveDepth, status, reason, live, completed, runId);
     if (!quiet) {
         ns.tprint(`[MULTI-REAL] ${status} | completed ${completed.length}/${live.length}`);
         if (safetyStop) ns.tprint(`[MULTI-REAL] ${safetyStop}`);
     }
 }
 
-function buildConservativePlan(ns, pool, prepared) {
+function parseRunArgs(args) {
+    if (args.length > 5) return { ok: false, reason: `Too many positional arguments (${args.length}); possible pasted-command concatenation` };
+
+    const rawProfile = String(args[0] ?? DEFAULT_PROFILE).trim().toLowerCase();
+    if (!PROFILE_WEIGHTS[rawProfile]) return { ok: false, reason: `Unknown profile ${rawProfile || "(empty)"}` };
+
+    const targetCount = optionalInteger(args[1], DEFAULT_TARGET_COUNT);
+    const hackFraction = optionalNumber(args[2], DEFAULT_HACK_FRACTION);
+    const stageGapMs = optionalInteger(args[3], DEFAULT_STAGE_GAP_MS);
+    const globalLiveDepth = optionalInteger(args[4], DEFAULT_GLOBAL_LIVE_DEPTH);
+
+    if (!Number.isInteger(targetCount) || targetCount < 2 || targetCount > 12) return { ok: false, reason: "targetCount must be an integer from 2 to 12" };
+    if (!Number.isFinite(hackFraction) || hackFraction < 0.001 || hackFraction > 0.90) return { ok: false, reason: "hackFraction must be between 0.001 and 0.90" };
+    if (!Number.isInteger(stageGapMs) || stageGapMs < 75 || stageGapMs > 5_000) return { ok: false, reason: "stageGapMs must be an integer from 75 to 5000" };
+    if (!Number.isInteger(globalLiveDepth) || globalLiveDepth < MIN_GLOBAL_LIVE_DEPTH || globalLiveDepth > MAX_GLOBAL_LIVE_DEPTH) return { ok: false, reason: `globalDepth must be an integer from ${MIN_GLOBAL_LIVE_DEPTH} to ${MAX_GLOBAL_LIVE_DEPTH}` };
+
+    return { ok: true, profile: rawProfile, targetCount, hackFraction, stageGapMs, globalLiveDepth };
+}
+
+function optionalNumber(value, fallback) {
+    if (value === undefined || value === null || String(value).trim() === "") return fallback;
+    return Number(value);
+}
+
+function optionalInteger(value, fallback) {
+    const number = optionalNumber(value, fallback);
+    return Number.isFinite(number) ? Math.floor(number) : NaN;
+}
+
+function buildConservativePlan(ns, pool, prepared, globalLiveDepth, runId) {
     const hosts = createHostCalendar(pool, [], Date.now());
     const landings = [];
     const batches = [];
@@ -186,10 +228,11 @@ function buildConservativePlan(ns, pool, prepared) {
     let sequence = 0;
 
     for (const target of candidates) {
-        if (batches.length >= GLOBAL_LIVE_DEPTH) break;
+        if (batches.length >= globalLiveDepth) break;
         if (batches.some((batch) => batch.target === target.hostname)) continue;
         const firstLandingAt = findLandingStart(target, landings, Date.now() + target.firstLandingDelayMs, GLOBAL_LANDING_GAP_MS, Date.now());
         const batch = makeBatch(target, firstLandingAt, ++sequence);
+        batch.id = `multi-${runId}-${target.hostname}-${sequence}`;
         const reservation = tryReserve(hosts, batch);
         if (!reservation.ok) continue;
         commitReservation(hosts, reservation);
@@ -198,8 +241,8 @@ function buildConservativePlan(ns, pool, prepared) {
         for (const stage of batch.stages) landings.push(stage.landingAt);
     }
 
-    if (batches.length < GLOBAL_LIVE_DEPTH) {
-        return { ok: false, reason: `Could only reserve ${batches.length}/${GLOBAL_LIVE_DEPTH} distinct prepared targets`, batches: [] };
+    if (batches.length < globalLiveDepth) {
+        return { ok: false, reason: `Could only reserve ${batches.length}/${globalLiveDepth} distinct prepared targets`, batches: [] };
     }
     return { ok: true, batches };
 }
@@ -267,7 +310,7 @@ function drainTimingEvents(ns, batches) {
     }
 }
 
-function finalizeBatch(ns, batch, gapMs) {
+function finalizeBatch(ns, batch, gapMs, globalLiveDepth, runId) {
     const money = ns.getServerMoneyAvailable(batch.target);
     const maxMoney = ns.getServerMaxMoney(batch.target);
     const security = ns.getServerSecurityLevel(batch.target);
@@ -275,14 +318,17 @@ function finalizeBatch(ns, batch, gapMs) {
     const landing = summarizeLanding(batch.stages);
     const finishedAt = Date.now();
     return {
-        version: 1,
-        model: "MULTI_TARGET_EXECUTOR_V1_CONSERVATIVE",
+        version: 2,
+        model: "MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE",
         pipeline: true,
         multiTarget: true,
         status: "COMPLETE",
         batchId: batch.id,
+        runId,
         target: batch.target,
         gapMs,
+        globalLiveDepth,
+        perTargetLiveDepth: PER_TARGET_LIVE_DEPTH,
         finishedAt,
         final: {
             money,
@@ -322,12 +368,18 @@ function summarizeLanding(stages) {
     let minimumSpacingMs = Infinity;
     for (let i = 1; i < actualTimes.length; i += 1) minimumSpacingMs = Math.min(minimumSpacingMs, actualTimes[i] - actualTimes[i - 1]);
     const finiteErrors = results.map((stage) => Math.abs(stage.landingErrorMs)).filter(Number.isFinite);
+    const expectedJobs = results.reduce((sum, stage) => sum + stage.expectedJobs, 0);
+    const reportedJobs = results.reduce((sum, stage) => sum + stage.reportedJobs, 0);
+    const missingJobs = results.reduce((sum, stage) => sum + stage.missingJobs, 0);
     return {
         orderCorrect,
         expectedOrder,
         actualOrder,
         stages: results,
-        missingJobs: results.reduce((sum, stage) => sum + stage.missingJobs, 0),
+        expectedJobs,
+        reportedJobs,
+        missingJobs,
+        totalMissingJobs: missingJobs,
         maxAbsLandingErrorMs: finiteErrors.length ? Math.max(...finiteErrors) : Infinity,
         minimumSpacingMs: Number.isFinite(minimumSpacingMs) ? minimumSpacingMs : 0,
         maxAllocationSpreadMs: results.length ? Math.max(...results.map((stage) => stage.allocationSpreadMs)) : 0,
@@ -345,8 +397,18 @@ function validateComplete(complete) {
 }
 
 function preflightCheck(ns) {
+    const controller = readControllerState(ns);
+    if (!controller) return { ok: false, reason: "Controller state unavailable" };
+    const mode = String(controller.executionMode?.mode ?? "STANDBY").toUpperCase();
+    const pending = String(controller.executionMode?.pending ?? "").trim();
+    if (mode !== "STANDBY" || pending) return { ok: false, reason: `Controller must be fully parked in STANDBY; current ${pending ? `${mode} -> ${pending}` : mode}` };
+    if (Number(controller.execution?.activeJobs ?? 0) > 0) return { ok: false, reason: "Controller still has active standalone workers" };
+
     if (ns.scriptRunning("/hacking/pipeline-runner.js", "home")) return { ok: false, reason: "Single-target pipeline-runner is active on home" };
     if (ns.scriptRunning("/hacking/multi-target-sim.js", "home")) return { ok: false, reason: "Planning simulator is active on home; stop it before real execution" };
+    const otherMulti = ns.ps("home").some((proc) => proc.filename === SCRIPT && Number(proc.pid) !== Number(ns.pid));
+    if (otherMulti) return { ok: false, reason: "Another multi-target runner is already active" };
+
     const planner = readPlannerState(ns);
     const hosts = new Set(["home"]);
     for (const host of Array.isArray(planner?.executionHosts) ? planner.executionHosts : []) {
@@ -363,18 +425,21 @@ function preflightCheck(ns) {
     return { ok: true, reason: "" };
 }
 
-function publishState(ns, profile, status, reason, batches, completed) {
+function publishState(ns, profile, globalLiveDepth, status, reason, batches, completed, runId) {
     publishMultiTargetSchedulerState(ns, {
-        version: 1,
-        model: "MULTI_TARGET_EXECUTOR_V1_CONSERVATIVE",
+        version: 2,
+        model: "MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE",
         dryRun: false,
         launchesWorkers: true,
         consumesBatchTimingPort: true,
+        finite: true,
+        runId,
         profile,
         status,
         reason,
-        globalLiveDepthCap: GLOBAL_LIVE_DEPTH,
+        globalLiveDepthCap: globalLiveDepth,
         perTargetLiveDepthCap: PER_TARGET_LIVE_DEPTH,
+        admittedTargets: batches.map((batch) => batch.target),
         inFlight: batches.filter((batch) => !batch.done).map((batch) => ({
             id: batch.id,
             target: batch.target,
@@ -408,10 +473,3 @@ function scriptForStage(name) {
     if (name === "GROW") return WORKER_SCRIPTS.GROW;
     return WORKER_SCRIPTS.WEAKEN;
 }
-
-function normalizeProfile(value) {
-    const profile = String(value ?? DEFAULT_PROFILE).trim().toLowerCase();
-    return PROFILE_WEIGHTS[profile] ? profile : DEFAULT_PROFILE;
-}
-function clamp(value, min, max) { return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : min; }
-function clampInt(value, min, max) { return Math.floor(clamp(value, min, max)); }
