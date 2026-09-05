@@ -59,6 +59,15 @@ model STOCK_MARKET_STATE_V1
 ```
 The snapshot includes TIX/4S access flags, cash, symbol prices, long/short holdings, long value, short value, and gross exposure.
 
+Bitburner v3 standardized the stock access method names. Use:
+```text
+ns.stock.hasWseAccount()
+ns.stock.hasTixApiAccess()
+ns.stock.has4SData()
+ns.stock.has4SDataTixApi()
+```
+Do not use the removed v2-era names `hasWSEAccount`, `hasTIXAPIAccess`, or `has4SDataTIXAPI`. A runtime report showed the keeper falsely claiming TIX was unavailable because those removed names were being swallowed by the safe fallback; `stocks/history-keeper.js` was corrected on main.
+
 If TIX API access is unavailable, the keeper publishes WAITING state and parks until access becomes available rather than crashing.
 
 `kickstart.js` starts `stocks/history-keeper.js` quietly alongside prepper and batch-history collection. The dedicated stock dashboard also starts the keeper quietly if it is not already running.
@@ -116,6 +125,8 @@ run gitpull.js
 run startup.js
 ```
 This will start the main control-plane dashboard, the stock Market Lab dashboard, and the normal quiet kickstart chain. The stock history keeper will come up through kickstart/dashboard guard logic.
+
+If the previous keeper process is still running old code after pulling, kill/restart that process or rerun startup after it exits; Bitburner running scripts do not hot-reload imported code.
 
 ## Priority
 ```text
