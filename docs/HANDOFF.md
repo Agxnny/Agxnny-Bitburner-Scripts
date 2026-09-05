@@ -54,29 +54,48 @@ run diagnostics/multi-overlap-validate.js [target|auto] [waves] [hackFraction] [
 ```
 Defaults auto / 2 waves / 10% / 200ms. Controller must be fully STANDBY. Validator blocks other real coordinators, owns Port 14, plans two same-target HWGW batches in one calendar, and initially uses non-crossing adjacent landing streams: A H/W1/G/W2 then B H/W1/G/W2. It checks every timing event, order, spacing >=75ms, drift <=150ms, final money >=99.5%, security <=min+0.05, and records each completed wave.
 
-### Live validation telemetry + separate dashboard
-The validator now publishes a read-only live snapshot every ~250ms:
+Live state:
 ```text
 lib/overlap-validation-state.js
 /data/multi-overlap-validation-state.txt
 model MULTI_OVERLAP_VALIDATION_STATE_V1
 ```
-Snapshot includes target, status, PID, requested/current waves, clean waves, hack %, stage gap, batch interval, live expected/reported jobs, launched/completed stages, both in-flight batches, each stage's planned/actual landing, and last completed result.
+Validator publishes target/status/PID/wave progress, clean waves, hack %, gap, interval, expected/reported jobs, stage progress, both active batches, planned/actual landings, and last result roughly every 250ms.
 
-Dedicated tail dashboard:
+### Main dashboard Validation tab
+The validation UI is now integrated into the normal control-plane dashboard:
 ```text
-diagnostics/validation-dashboard.js
-run diagnostics/validation-dashboard.js
+ui/views/validation.js
 ```
-It opens/resizes its own tail and refreshes ~4Hz. It shows status/target/wave progress, runtime/state freshness, live stage/job progress bars, both batch landing streams with planned vs actual landing/drift, last-wave health/spacing/drift/money/security, and durable per-target proof. It is read-only and can remain open between validation runs.
+Main tabs are now Overview / Targets / Economy / Batch / Validation / Network / Diagnostics.
 
-Important: a validator already running from before this telemetry commit cannot retroactively publish live state. Pull and start the next validator run with the updated script to populate the dashboard.
+Validation tab provides:
+```text
+- target dropdown with MIXED plus planner targets
+- waves, hack %, and stage-gap controls
+- START VALIDATION button
+- launch safety lock unless controller is fully STANDBY
+- live target/status/wave/clean count
+- live stage and timing-job progress bars
+- per-batch H/W1/G/W2 landing-state cards
+- last-wave spacing/drift/money/security result
+- durable per-target table: DEPTH1 / VALIDATE2 / PROVEN2
+```
+React callbacks only queue plain-JS requests; `ui/actions.js` performs the actual Netscript launches.
+
+### Mixed validation coordinator
+```text
+diagnostics/multi-overlap-mixed.js
+```
+Selecting `MIXED` in the Validation tab snapshots every currently prepared target that is `VALIDATE2` and not already `PROVEN2`, then runs the dedicated validator sequentially on each target. It does not run validators concurrently and therefore preserves single Port-14 ownership. Default per-target settings are the values chosen in the tab (normally 2 waves, 10%, 200ms).
+
+The older standalone `diagnostics/validation-dashboard.js` remains optional and was updated to Bitburner 3.0 `ns.ui.openTail()/resizeTail()`, but the main-dashboard Validation tab is now the preferred interface.
 
 ## Prepper
 `hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM.
 
 ## Dashboard architecture
-Main dashboard remains modular under `ui/` with one mounted React tree. The new validation dashboard is intentionally separate from the main GUI so validation can be observed without bloating normal production UI.
+Main dashboard remains one mounted React tree with separate view modules. `ui/state.js` now caches Port 19 history plus overlap evidence/live-validation state. The async action bridge owns validator launches.
 
 ## Runtime contracts
 Real `hacking/multi-target-runner.js` remains finite and per-target depth 1. Do not remove the uniqueness guard until multiple targets have dedicated `PROVEN2` evidence and runtime output is reviewed.
@@ -84,20 +103,20 @@ Real `hacking/multi-target-runner.js` remains finite and per-target depth 1. Do 
 Ports: 12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap validation live/evidence state is file-based.
 
 ## Immediate validation
+Pull and restart the main dashboard so the new tab/module is loaded:
 ```text
 run gitpull.js
-run diagnostics/validation-dashboard.js
 ```
-For a new validator run, stop AUTOMULTI, park controller fully STANDBY, drain real work, then:
-```text
-run diagnostics/multi-overlap-validate.js joesguns 2 0.10 200
-```
+Then restart the normal dashboard/startup path and open the new `Validation` tab.
+
+For the safest first pass select `joesguns`, leave 2 waves / 10% / 200ms, park controller fully STANDBY, and press START VALIDATION. After that, `MIXED` can sequentially validate all currently prepared `VALIDATE2` targets.
+
 After clean proof:
 ```text
 cat /data/multi-overlap-evidence.txt
 run diagnostics/multi-overlap-advisor.js money 0.10 12
 ```
-Validate at least joesguns plus two other good targets (suggest omega-net and silver-helix) before enabling production overlap.
+Validate at least joesguns plus two other good targets before enabling production overlap.
 
 ## Priority
 ```text
@@ -106,7 +125,8 @@ DONE shared ranking cleanup
 DONE overlap candidate policy/advisor
 DONE simulator shared overlap policy
 DONE dedicated depth-2 validator + durable evidence
-DONE separate live validation telemetry/dashboard
+DONE live validation telemetry
+DONE main-dashboard Validation tab + target/MIXED launcher
 NEXT runtime validate depth 2 on multiple targets
 NEXT extend real MULTI planner to evidence-backed per-target depth 2
 NEXT separate total global in-flight cap from distinct-target count
