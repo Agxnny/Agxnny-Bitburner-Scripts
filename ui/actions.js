@@ -17,6 +17,7 @@ const model = {
     pendingGoal: null,
     pendingController: null,
     pendingMultiRun: null,
+    diagnosticActivity: { state: "IDLE", label: "", script: "", pid: 0, startedAt: 0, finishedAt: 0 },
     actionStatus: "Ready",
     goalStatus: "Ready",
     controllerStatus: "Ready",
@@ -36,8 +37,18 @@ const model = {
 export function field(name) { return String(model.fields[name] ?? ""); }
 export function setField(name, value) { model.fields[name] = String(value ?? ""); touchState(); }
 export function status(name) { return String(model[name] ?? ""); }
+export function diagnosticActivity() { return { ...model.diagnosticActivity }; }
 export function queueTest(id, label) { model.pendingTest = { id, label }; touchState(); }
-export function queueDiagnostic(script, args = [], label = "Diagnostic") { model.pendingDiagnostic = { script, args, label }; touchState(); }
+export function queueDiagnostic(script, args = [], label = "Diagnostic") {
+    if (model.diagnosticActivity.state === "RUNNING") {
+        model.actionStatus = `Busy · ${model.diagnosticActivity.label} still running`;
+        touchState();
+        return;
+    }
+    model.pendingDiagnostic = { script, args, label };
+    model.actionStatus = `${label} queued`;
+    touchState();
+}
 export function queueGoal(action) { model.pendingGoal = action; touchState(); }
 export function queueController(action) { model.pendingController = action; touchState(); }
 export function queueMultiRun() { model.pendingMultiRun = currentMultiRequest(); touchState(); }
@@ -54,6 +65,8 @@ export function currentMultiRequest() {
 /** Async Netscript side of the request bridge. React callbacks never call this. */
 export async function processPendingActions(ns, now) {
     let refresh = false;
+    updateDiagnosticActivity(ns, now);
+
     if (model.pendingTest) {
         const test = model.pendingTest;
         model.pendingTest = null;
@@ -66,7 +79,13 @@ export async function processPendingActions(ns, now) {
         const request = model.pendingDiagnostic;
         model.pendingDiagnostic = null;
         const pid = ns.run(request.script, 1, ...request.args);
-        model.actionStatus = pid > 0 ? `${request.label} started · PID ${pid}` : `${request.label} failed to start`;
+        if (pid > 0) {
+            model.diagnosticActivity = { state: "RUNNING", label: request.label, script: request.script, pid, startedAt: now, finishedAt: 0 };
+            model.actionStatus = `${request.label} running · PID ${pid}`;
+        } else {
+            model.diagnosticActivity = { state: "FAILED", label: request.label, script: request.script, pid: 0, startedAt: now, finishedAt: now };
+            model.actionStatus = `${request.label} failed to start`;
+        }
         touchState();
     }
 
@@ -94,6 +113,15 @@ export async function processPendingActions(ns, now) {
         refresh = true;
     }
     if (refresh) refreshSnapshot(ns);
+}
+
+function updateDiagnosticActivity(ns, now) {
+    const activity = model.diagnosticActivity;
+    if (activity.state !== "RUNNING" || !(activity.pid > 0)) return;
+    if (ns.isRunning(activity.pid, "home")) return;
+    model.diagnosticActivity = { ...activity, state: "COMPLETE", finishedAt: now };
+    model.actionStatus = `${activity.label} complete`;
+    touchState();
 }
 
 function launchMultiTargetRun(ns, request) {
