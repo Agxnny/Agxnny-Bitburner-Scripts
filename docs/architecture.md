@@ -8,84 +8,67 @@ GitHub `main` is the source of truth. Read `docs/HANDOFF.md` first, then fetch c
 
 Home is the control/UI plane. Rooted and cloud servers are the remote execution plane. The GUI consumes published state and sends commands; it does not own hacking logic. React callbacks remain Netscript-free.
 
-## Startup behavior
+## Startup and controller modes
 
-`startup.js` still starts the GUI and kickstart chain:
+`startup.js → dashboard → kickstart → planner/deploy/economy → controller`
 
-```text
-startup.js → dashboard → kickstart → planner/deploy/economy → controller
-```
+The controller starts in **STANDBY**. Current modes are STANDBY, HGW, serialized BATCH, and controller-managed single-target PIPELINE. Mode changes are safe-boundary scheduling barriers.
 
-The controller now initializes in **STANDBY**. Control-plane services stay online, but no target-side H/G/W worker, serialized batch coordinator, or pipeline coordinator is launched until the user selects an execution mode or explicitly asks for Prep + hold.
+## Single-target pipeline
 
-## Controller execution modes
+`hacking/pipeline-runner.js` is the current live synchronized executor. Its coordinator runs on home; H/G/W workers run remotely. It uses just-in-time stage launches, host/time RAM reservations, one Port 14 timing-event consumer routed by `batchId`, Port 15 completion telemetry, and Port 16 live state.
 
-```text
-STANDBY   observe only; no target-side execution
-HGW       sequential tactical weaken/grow/hack
-BATCH     serialized synchronized HWGW
-PIPELINE  continuous controller-managed depth-2 HWGW
-```
+Live depth remains fixed at 2 while integration is validated. Two manual `phantasy` runs completed four overlapping batches with 100% money recovery, +0.000 security, correct H → W1 → G → W2 order, and ~6262 ms cadence under the then-current pool.
 
-Mode changes are scheduling barriers. Tactical analysis may be cancelled because it has no target-side effect. Existing H/G/W, serialized batch, or already-admitted pipeline work drains naturally before the requested mode becomes active.
+## Global multi-target direction
 
-## Serialized batch mode
-
-`hacking/batch-runner.js` remains the one-batch-at-a-time path. It plans H/W1/G/W2, launches timed workers, gathers Port 14 events, publishes Port 12/15 state, and then the controller uses the existing post-batch review barrier.
-
-Default stage gap remains 200 ms.
-
-## Integrated pipeline mode
-
-`hacking/pipeline-runner.js` now has two uses:
+The intended end-state is **one global scheduler**, not one independent runner per target:
 
 ```text
-finite manual test:  ... 2
-controller managed:  ... continuous --quiet
+controller
+   ↓
+global scheduler on home
+   ├── target context A
+   ├── target context B
+   └── target context C...
+        ↓
+shared host/time reservation calendar
+        ↓
+remote H/G/W workers
+        ↑
+central Port 14 router by target + batchId
 ```
 
-The controller selects PIPELINE, prepares the target, publishes one settled idle snapshot, then launches the executor remotely. The live depth cap remains exactly 2.
+Target depth will be dynamic. A high-value target may receive many concurrent batches while secondary targets still receive work when their marginal value and reservation fit justify it. RAM percentages are not permanently partitioned; every new complete batch competes for the next feasible global reservation.
 
-### Pipeline timing model
+## Multi-target allocator scaffold
 
-The executor separates:
+`hacking/multi-target-scheduler.js` is the first **dry-run-only** implementation of this model. It considers several targets simultaneously and repeatedly admits the highest-value feasible virtual HWGW batch into one shared host/time calendar.
+
+Profiles:
 
 ```text
-stage gap      = H → W1 → G → W2 inside one batch
-batch interval = H(N) → H(N+1) across batches
+MONEY     normalized cash efficiency per reserved RAM-time
+BALANCED  70% money + 30% XP proxy
+XP        action-thread/difficulty proxy per reserved RAM-time
 ```
 
-Each stage reservation covers its actual process lifetime, including the dispatch lead before action start. A host-aware reservation plan is built before each depth-2 wave. Stages are dispatched just in time and may be split across hosts.
+A diminishing-returns fairness penalty is applied after each target admission. This intentionally allows stronger targets to receive greater depth without defaulting to total starvation of all secondary targets.
 
-### Port 14 ownership
+The planner also applies a global landing spacing floor between target pipelines, so cross-target events are modeled as one timing stream rather than independent clocks.
 
-While PIPELINE is active, one pipeline coordinator consumes Port 14 and routes timing events by `batchId`. Serialized BATCH mode is not allowed to run concurrently.
+It publishes to **Port 17**, leaving Port 16 free for the active single-target pipeline. It launches no workers and does not consume Port 14.
 
-The pipeline executor clears stale Port 14 state once at startup only after preflight confirms no serialized batch-runner process is active.
+## Future multi-target safety model
 
-### Pipeline completion and safety
+Failures should be classified as target-local versus global:
 
-Each completed pipeline batch publishes landing/recovery telemetry to Port 15. Port 16 holds live executor state including in-flight batches, cadence, completion count, recent events, and safety state.
+```text
+target-local: bad recovery/order/prep → pause/repair that target
+system-wide: reservation corruption / shared timing failure → stop global admissions
+```
 
-Admission stops on launch failure, wrong landing order, missing timing events, final money below tolerance, excessive security, or a bad post-wave target baseline.
-
-On a controller execution-mode change, no later wave is admitted. The current depth-2 wave finishes fully, then the pipeline coordinator exits so the controller can complete the mode transition.
-
-On a pipeline safety stop, the controller begins target recovery/prep and holds the target for inspection. The operator uses Resume after review to clear the stop.
-
-## Validated depth-2 baseline
-
-Two manual depth-2 runs on `phantasy` completed four overlapping batches total with 100.00% money, +0.000 security, and correct H → W1 → G → W2 ordering. Both selected roughly 6262 ms batch cadence under the then-current RAM pool.
-
-This validates the basic depth-2 execution path, not higher depth. The 200 ms stage gap remains fixed until rolling history is implemented.
-
-## Pipeline planner
-
-`hacking/batch-scheduler.js` remains the non-executing planning/simulation tool. It provides host-window capacity analysis and a virtual depth-2 admission mode, both published to Port 16.
-
-## GUI architecture
-
-The compact dashboard keeps operational detail without duplicating it across many cards. Overview now exposes Standby/HGW/Batch/Pipeline, Prep + hold, and Resume in one control card. The Batch tab owns serialized/pipeline observability and detailed landing diagnostics.
+The first real multi-target test should remain conservative: two targets, global live depth 2, per-target depth 1. Dynamic higher per-target depth comes only after rolling timing history and shared planner/executor code are in place.
 
 ## Runtime ports
 
@@ -106,12 +89,14 @@ The compact dashboard keeps operational detail without duplicating it across man
 | 13 | controller command queue |
 | 14 | batch landing-timing event queue |
 | 15 | latest completed serialized/pipeline batch |
-| 16 | pipeline planner/simulation/executor state |
+| 16 | single-target pipeline planner/simulation/executor |
+| 17 | global multi-target allocation planner |
 
 ## Current limitations
 
-- Live pipeline depth is fixed at 2.
+- Live single-target pipeline depth is fixed at 2.
+- Multi-target scheduling is planning-only.
 - Port 15 is latest-only, not rolling history.
-- Adaptive timing still uses the latest matching sample rather than several samples.
-- The serialized runner still has its legacy Port 14 clear-at-start behavior, so BATCH and PIPELINE remain mutually exclusive at the controller level.
+- Multi-target XP is currently a proxy metric, not exact XP.
+- Batch-template/reservation math is still duplicated and should be extracted before real multi-target execution.
 - Automatic worker watchdog termination remains deferred.
