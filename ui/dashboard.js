@@ -10,6 +10,7 @@ import {
     readEconomyTargetState,
     readLastCompletedBatchState,
     readManualMoneyGoalState,
+    readMultiTargetSchedulerState,
     readPlannerState,
     readRootState,
     readTacticalPlanState,
@@ -18,6 +19,7 @@ import { readTelemetryState } from "/lib/telemetry.js";
 
 const TEST_REQUEST_PORT = 6;
 const MANUAL_GOAL_CONFIG = "/data/manual-money-goal.txt";
+const MULTI_TARGET_RUNNER = "/hacking/multi-target-runner.js";
 const TABS = Object.freeze(["Overview", "Targets", "Economy", "Batch", "Network", "Diagnostics"]);
 const UI_SYNC_MS = 100;
 const MAIN_TICK_MS = 25;
@@ -28,12 +30,19 @@ const WORKER_LATE_MIN_MS = 5_000;
 let requestedTest = null;
 let requestedGoalAction = null;
 let requestedControllerAction = null;
+let requestedMultiTargetRun = null;
 let actionStatus = "Ready";
 let goalStatus = "Ready";
 let controllerActionStatus = "Ready";
+let multiTargetStatus = "Ready · park controller in STANDBY before launch";
 let goalInput = "";
 let goalLabelInput = "";
 let manualTargetInput = "";
+let multiProfileInput = "money";
+let multiTargetCountInput = "4";
+let multiDepthInput = "2";
+let multiHackPercentInput = "10";
+let multiStageGapInput = "200";
 let cachedState = null;
 let stateVersion = 0;
 let lastDataRefresh = 0;
@@ -73,6 +82,16 @@ export async function main(ns) {
             ns.writePort(RuntimePort.CONTROL_REQUESTS, JSON.stringify({ ...action, requestedAt: now }));
             controllerActionStatus = controllerStatusText(action);
             stateVersion += 1;
+        }
+
+        if (requestedMultiTargetRun) {
+            const request = requestedMultiTargetRun;
+            requestedMultiTargetRun = null;
+            const result = launchMultiTargetRun(ns, request);
+            multiTargetStatus = result.message;
+            cachedState = snapshot(ns);
+            stateVersion += 1;
+            lastDataRefresh = now;
         }
 
         if (requestedGoalAction) {
@@ -121,7 +140,34 @@ function snapshot(ns) {
         batch: readBatchState(ns),
         lastCompletedBatch: readLastCompletedBatchState(ns),
         scheduler: readBatchSchedulerState(ns),
+        multiScheduler: readMultiTargetSchedulerState(ns),
     };
+}
+
+function launchMultiTargetRun(ns, request) {
+    const controller = readControllerState(ns);
+    const mode = String(controller?.executionMode?.mode ?? "STANDBY").toUpperCase();
+    const pending = String(controller?.executionMode?.pending ?? "").trim();
+    if (!controller || isControllerStateStale(controller)) return { ok: false, message: "Blocked · controller state unavailable/stale" };
+    if (mode !== "STANDBY" || pending) return { ok: false, message: `Blocked · switch to STANDBY first (${pending ? `${mode} → ${pending}` : mode})` };
+    if (Number(controller.execution?.activeJobs ?? 0) > 0) return { ok: false, message: "Blocked · controller workers are still draining" };
+    if (ns.scriptRunning(MULTI_TARGET_RUNNER, "home")) return { ok: false, message: "Blocked · multi-target test already running" };
+
+    const profile = String(request.profile ?? "money").toLowerCase();
+    const targetCount = Math.floor(Number(request.targetCount));
+    const globalDepth = Math.floor(Number(request.globalDepth));
+    const hackPercent = Number(request.hackPercent);
+    const stageGapMs = Math.floor(Number(request.stageGapMs));
+    if (!["money", "balanced", "xp"].includes(profile)) return { ok: false, message: "Blocked · invalid profile" };
+    if (!Number.isInteger(targetCount) || targetCount < 2 || targetCount > 12) return { ok: false, message: "Blocked · targets must be 2–12" };
+    if (!Number.isInteger(globalDepth) || globalDepth < 2 || globalDepth > 12) return { ok: false, message: "Blocked · live depth must be 2–12" };
+    if (globalDepth > targetCount) return { ok: false, message: "Blocked · live depth cannot exceed target count" };
+    if (!Number.isFinite(hackPercent) || hackPercent < 0.1 || hackPercent > 90) return { ok: false, message: "Blocked · hack % must be 0.1–90" };
+    if (!Number.isInteger(stageGapMs) || stageGapMs < 75 || stageGapMs > 5000) return { ok: false, message: "Blocked · stage gap must be 75–5000 ms" };
+
+    const pid = ns.run(MULTI_TARGET_RUNNER, 1, profile, targetCount, hackPercent / 100, stageGapMs, globalDepth, "--quiet");
+    if (pid <= 0) return { ok: false, message: "Launch failed · not enough home RAM or runner unavailable" };
+    return { ok: true, message: `Running ${profile.toUpperCase()} · ${globalDepth} batches across top ${targetCount} targets · PID ${pid}` };
 }
 
 async function applyGoalAction(ns, action, now) {
@@ -161,6 +207,7 @@ function header(s) {
     const pipeline = s.scheduler?.execution && (Date.now() - Number(s.scheduler?.updatedAt ?? 0) < 5000 || c.executionMode?.pipelineRunning)
         ? s.scheduler
         : null;
+    const multi = isFreshMultiExecution(s.multiScheduler) ? s.multiScheduler : null;
     return el("div", { style: styles.header },
         el("div", null,
             el("div", { style: styles.eyebrow }, "AGXNNY AUTOMATION"),
@@ -171,6 +218,7 @@ function header(s) {
             badge(live ? "ONLINE" : "WAITING", live ? "good" : "dim"),
             badge(pending ? `SWITCH → ${pending}` : modeBadge(mode), pending ? "warn" : mode === "PIPELINE" ? "accent" : mode === "STANDBY" ? "dim" : "accent"),
             pipeline ? badge(`PIPE ${pipeline.status ?? "RUN"}`, pipeline.safetyStopped ? "warn" : "good") : null,
+            multi ? badge(`MULTI ${multi.status ?? "RUN"}`, multi.status === "SAFETY_STOP" || multi.status === "BLOCKED" ? "warn" : "good") : null,
             c.prep?.hold ? badge("PREP HOLD", "good") : null,
             c.executionMode?.pipelineSafetyStopped ? badge("PIPE STOP", "warn") : null,
             s.manualGoal?.active ? badge("SPEND LOCK", "warn") : null,
@@ -327,13 +375,15 @@ function batchView(s) {
     const current = liveBatchState(s);
     const last = s.lastCompletedBatch ?? null;
     const scheduler = s.scheduler ?? null;
+    const multi = s.multiScheduler ?? null;
     return el("div", null,
         el("div", { style: styles.heroGrid },
             heroMetric("SERIAL BATCH", current?.status ?? "IDLE", current?.target ?? "no active serialized batch"),
             heroMetric("PIPELINE", schedulerMode(scheduler), scheduler ? `${scheduler.status ?? "—"} · ${age(scheduler.updatedAt)}` : "no scheduler state"),
-            heroMetric("IN FLIGHT", String(pipelineInFlight(scheduler)), scheduler?.execution ? `real / max ${scheduler.maxDepth ?? 2}` : scheduler?.admission ? `sim / max ${scheduler.admission.maxDepth ?? 2}` : "—"),
+            heroMetric("MULTI-TARGET", multiExecutionMode(multi), multi ? `${multi.status ?? "—"} · ${age(multi.updatedAt)}` : "no multi-target state"),
             heroMetric("LAST COMPLETE", last ? age(last.finishedAt) : "none", last?.target ?? "waiting"),
         ),
+        card("Multi-target finite wave", multiTargetControls(s, multi), true),
         scheduler ? card("Pipeline", pipelineSummary(scheduler), true) : null,
         current ? card("Current serialized batch", el("div", null,
             el("div", { style: styles.compactGrid },
@@ -346,7 +396,7 @@ function batchView(s) {
         ), true) : null,
         last ? card("Last completed batch", el("div", null,
             el("div", { style: styles.compactGrid },
-                kv("Model", last.pipeline ? "PIPELINE" : "SERIAL"),
+                kv("Model", last.multiTarget ? "MULTI-TARGET" : last.pipeline ? "PIPELINE" : "SERIAL"),
                 kv("Target", last.target ?? "—"),
                 kv("Money", pctFine(last.final?.moneyPercent)),
                 kv("Security Δ", signedNum(last.final?.securityDelta, 3)),
@@ -359,6 +409,56 @@ function batchView(s) {
             details("Stage diagnostics", batchStageDetails(last)),
         ), true) : null,
     );
+}
+
+function multiTargetControls(s, state) {
+    const c = s.controller ?? {};
+    const mode = String(c.executionMode?.mode ?? "STANDBY").toUpperCase();
+    const pending = Boolean(c.executionMode?.pending);
+    const running = state?.model === "MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE" && state?.status === "RUNNING" && Date.now() - Number(state?.updatedAt ?? 0) < 5000;
+    const canRun = mode === "STANDBY" && !pending && !running && Number(c.execution?.activeJobs ?? 0) === 0;
+    const completed = Array.isArray(state?.completed) ? state.completed : [];
+    const inFlight = Array.isArray(state?.inFlight) ? state.inFlight : [];
+    const admitted = Array.isArray(state?.admittedTargets) ? state.admittedTargets : [];
+
+    return el("div", null,
+        el("div", { style: styles.multiControlGrid },
+            labeledControl("Profile", el("select", {
+                value: multiProfileInput,
+                onChange: (event) => { multiProfileInput = String(event.target.value ?? "money"); stateVersion += 1; },
+                style: styles.input,
+            },
+            el("option", { value: "money" }, "MONEY"),
+            el("option", { value: "balanced" }, "BALANCED"),
+            el("option", { value: "xp" }, "XP"))),
+            labeledControl("Top targets", el("input", { value: multiTargetCountInput, type: "number", min: 2, max: 12, onChange: (event) => { multiTargetCountInput = String(event.target.value ?? ""); stateVersion += 1; }, style: styles.input })),
+            labeledControl("Live batches", el("input", { value: multiDepthInput, type: "number", min: 2, max: 12, onChange: (event) => { multiDepthInput = String(event.target.value ?? ""); stateVersion += 1; }, style: styles.input })),
+            labeledControl("Hack %", el("input", { value: multiHackPercentInput, type: "number", min: 0.1, max: 90, step: 0.1, onChange: (event) => { multiHackPercentInput = String(event.target.value ?? ""); stateVersion += 1; }, style: styles.input })),
+            labeledControl("Stage gap ms", el("input", { value: multiStageGapInput, type: "number", min: 75, max: 5000, step: 25, onChange: (event) => { multiStageGapInput = String(event.target.value ?? ""); stateVersion += 1; }, style: styles.input })),
+            el("div", { style: styles.multiLaunch }, button(running ? "Running…" : "Run finite wave", () => {
+                requestedMultiTargetRun = {
+                    profile: multiProfileInput,
+                    targetCount: multiTargetCountInput,
+                    globalDepth: multiDepthInput,
+                    hackPercent: multiHackPercentInput,
+                    stageGapMs: multiStageGapInput,
+                };
+            }, !canRun, "primary")),
+        ),
+        el("div", { style: styles.compactGrid },
+            kv("Controller", pending ? `SWITCHING → ${c.executionMode.pending}` : mode),
+            kv("Per-target cap", "1 batch · no same-target overlap yet"),
+            kv("Status", state?.model?.startsWith("MULTI_TARGET_EXECUTOR") ? state.status ?? "—" : "idle"),
+            kv("Progress", state?.model?.startsWith("MULTI_TARGET_EXECUTOR") ? `${completed.length} complete · ${inFlight.length} in flight` : "—"),
+        ),
+        admitted.length ? el("div", { style: styles.pipelineRows }, ...admitted.slice(0, 12).map((target, i) => kv(`#${i + 1}`, target))) : null,
+        note(state?.model?.startsWith("MULTI_TARGET_EXECUTOR") ? state.reason ?? multiTargetStatus : multiTargetStatus),
+        note("Finite safety test only: increasing Live batches adds distinct prepared targets. Per-target live depth remains 1 until same-target overlap is separately proven."),
+    );
+}
+
+function labeledControl(label, control) {
+    return el("label", { style: styles.controlField }, el("span", { style: styles.controlLabel }, label), control);
 }
 
 function pipelineSummary(state) {
@@ -460,6 +560,7 @@ function diagnosticsView(s) {
             healthRow("Economy", Boolean(s.economic?.selectedTarget)),
             healthRow("Telemetry", Date.now() - Number(s.telemetry?.updatedAt ?? 0) < 5000),
             kv("Scheduler", scheduler.model ?? "none"),
+            kv("Multi-target", s.multiScheduler?.model ?? "none"),
         )),
         card("Tests + commands", el("div", null,
             button("Smoke tests", () => { requestedTest = { id: "all", label: "Smoke tests" }; }, false, "primary"),
@@ -474,11 +575,12 @@ function diagnosticsView(s) {
             kv("Economy", age(s.economic?.updatedAt)),
             kv("Batch", age(s.batch?.updatedAt)),
             kv("Pipeline", age(s.scheduler?.updatedAt)),
+            kv("Multi-target", age(s.multiScheduler?.updatedAt)),
             kv("Last complete", age(s.lastCompletedBatch?.finishedAt)),
         )),
         card("Safety", el("div", null,
-            note("Startup now defaults to STANDBY: control/UI services stay online but no target-side H/G/W, serialized batch, or pipeline coordinator is started until you choose a mode."),
-            note("PIPELINE is controller-managed at hard depth 2. A safety stop prepares and holds the target for review; Resume clears the stop after you inspect it."),
+            note("Startup defaults to STANDBY. The dedicated prepper may still maintain targets on its reserved host while production is parked."),
+            note("Multi-target finite waves require STANDBY and one live batch per target. Increase distinct-target concurrency gradually; same-target overlap remains locked out."),
         )),
     );
 }
@@ -505,7 +607,7 @@ function executionSubtext(controller) {
     const mode = controller.executionMode?.mode ?? "STANDBY";
     if (controller.executionMode?.pending) return `switching → ${controller.executionMode.pending}`;
     if (mode === "PIPELINE") return controller.executionMode?.pipelineRunning ? "depth 2 active" : controller.executionMode?.pipelineSafetyStopped ? "safety stop" : "preparing / ready";
-    if (mode === "STANDBY") return "target-side work paused";
+    if (mode === "STANDBY") return "production parked";
     return actionEtaText(controller.execution?.currentAction);
 }
 function modeLabel(mode) {
@@ -529,6 +631,14 @@ function schedulerMode(scheduler) {
     if (scheduler.execution) return scheduler.continuous ? "CONT DEPTH-2" : "REAL DEPTH-2";
     if (scheduler.admission?.enabled) return "SIM DEPTH-2";
     return "PLANNER";
+}
+function isFreshMultiExecution(state) {
+    return Boolean(state?.model?.startsWith("MULTI_TARGET_EXECUTOR")) && Date.now() - Number(state?.updatedAt ?? 0) < 5000;
+}
+function multiExecutionMode(state) {
+    if (!state?.model?.startsWith("MULTI_TARGET_EXECUTOR")) return "OFF";
+    const depth = Number(state.globalLiveDepthCap ?? 0);
+    return state.status === "RUNNING" ? `LIVE ${depth}` : state.status ?? "READY";
 }
 
 function liveBatchState(s) {
@@ -629,6 +739,10 @@ const styles = {
     statValue: { color: "#e8eef4", fontSize: "10px", marginTop: "3px" },
     targetForm: { display: "grid", gridTemplateColumns: "1fr auto auto", gap: "6px" },
     goalForm: { display: "grid", gridTemplateColumns: "1.1fr 1fr auto auto", gap: "6px" },
+    multiControlGrid: { display: "grid", gridTemplateColumns: "1.15fr repeat(4,minmax(90px,0.75fr)) auto", gap: "6px", alignItems: "end", marginBottom: "7px" },
+    controlField: { display: "flex", flexDirection: "column", gap: "3px", minWidth: 0 },
+    controlLabel: { color: "#708090", fontSize: "8px", textTransform: "uppercase", letterSpacing: "0.4px" },
+    multiLaunch: { display: "flex", alignItems: "flex-end", paddingBottom: "1px" },
     input: { minWidth: 0, fontFamily: "monospace", color: "#d8e1e9", background: "#0b1117", border: "1px solid #2b3945", borderRadius: "4px", padding: "6px 7px", fontSize: "9px" },
     primaryButton: { fontFamily: "monospace", padding: "6px 8px", borderRadius: "4px", border: "1px solid #2e5c7d", background: "#12304a", color: "#bfe4ff", cursor: "pointer", whiteSpace: "nowrap", fontSize: "9px" },
     clearButton: { fontFamily: "monospace", padding: "6px 8px", borderRadius: "4px", border: "1px solid #5b4930", background: "#271e11", color: "#f0cf91", cursor: "pointer", whiteSpace: "nowrap", fontSize: "9px" },
