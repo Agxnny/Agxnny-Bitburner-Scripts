@@ -22,6 +22,7 @@ const OVERLAP_VALIDATOR = "/diagnostics/multi-overlap-validate.js";
 const OVERLAP_MIXED = "/diagnostics/multi-overlap-mixed.js";
 const DEPTH_VALIDATOR = "/diagnostics/multi-depth-validate.js";
 const FULL_DEPTH_TEST = "/diagnostics/multi-full-depth-test.js";
+const FULL_DEPTH_SET = "/diagnostics/multi-full-depth-set.js";
 
 let cachedState = null;
 let stateVersion = 0;
@@ -61,5 +62,6 @@ function validationRuntime(ns) {
     const mixed = ns.scriptRunning(OVERLAP_MIXED, "home");
     const depthValidator = ns.scriptRunning(DEPTH_VALIDATOR, "home");
     const fullDepth = ns.scriptRunning(FULL_DEPTH_TEST, "home");
-    return { active: validator || mixed || depthValidator || fullDepth, validator, mixed, depthValidator, fullDepth };
+    const fullDepthSet = ns.scriptRunning(FULL_DEPTH_SET, "home");
+    return { active: validator || mixed || depthValidator || fullDepth || fullDepthSet, validator, mixed, depthValidator, fullDepth, fullDepthSet };
 }
