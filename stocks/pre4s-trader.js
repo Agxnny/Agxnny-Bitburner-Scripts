@@ -1,6 +1,7 @@
 import { readStockHistory } from "/lib/stock-history.js";
 import { rankSignals } from "/stocks/signals.js";
 import { configuredCapitalLimit, defaultTraderConfig, readTraderConfig, stockTraderConfigFile } from "/lib/stock-trader-config.js";
+import { readTraderPerformance, recordClosedTrade, traderPerformanceSummary } from "/lib/stock-trade-performance.js";
 import { isQuiet, positionalArgs } from "/lib/output.js";
 
 const STATE_FILE = "/data/pre4s-trader-state.txt";
@@ -10,7 +11,7 @@ const LONG_CONFIDENCE = 0.60, SHORT_CONFIDENCE = 0.72;
 const DEFAULT_CAPITAL_FRACTION = 0.15, MAX_LONG_SYMBOL_FRACTION = 0.04, MAX_SHORT_SYMBOL_FRACTION = 0.015;
 const MIN_TRADE_VALUE = 5_000_000;
 
-/** Pre-4S price-inference trader. Conservative shorts are enabled by config by default. @param {NS} ns */
+/** Pre-4S price-inference trader with conservative live shorts and durable closed-trade P&L. @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
     const quiet = isQuiet(ns), args = positionalArgs(ns);
@@ -19,7 +20,7 @@ export async function main(ns) {
     if (!safe(() => ns.stock.hasTixApiAccess(), false)) return ns.tprint("ERROR: TIX API required.");
     const symbols = safe(() => ns.stock.getSymbols(), []);
     let fingerprint = "", lastStateAt = 0;
-    if (!quiet) ns.tprint("[PRE4S] LIVE · 50ms change detector · conservative shorts available · dashboard risk controls enabled");
+    if (!quiet) ns.tprint("[PRE4S] LIVE · 50ms change detector · conservative shorts enabled · durable P&L ledger enabled");
 
     while (true) {
         const nextFingerprint = priceFingerprint(ns, symbols);
@@ -47,10 +48,18 @@ async function evaluate(ns, symbols, cliFraction, marketChanged) {
         const stop = stopLossReason(ns, p, config.stopLossPercent);
         if (p.longShares > 0 && (stop || signal.score < EXIT_SCORE)) {
             const sale = safe(() => ns.stock.sellStock(p.symbol, p.longShares), 0);
-            if (sale > 0) { realized += (sale - p.longAverage) * p.longShares - COMMISSION; trades++; if (stop) stopLossExits++; }
+            if (sale > 0) {
+                const pnl = (sale - p.longAverage) * p.longShares - COMMISSION;
+                realized += pnl; trades++; if (stop) stopLossExits++;
+                await recordClosedTrade(ns, { symbol: p.symbol, side: "LONG", shares: p.longShares, entryPrice: p.longAverage, exitPrice: sale, pnl, reason: stop || "SIGNAL_EXIT", at: Date.now() });
+            }
         } else if (p.shortShares > 0 && (stop || signal.score > -EXIT_SCORE)) {
             const cover = safe(() => ns.stock.sellShort(p.symbol, p.shortShares), 0);
-            if (cover > 0) { realized += (p.shortAverage - cover) * p.shortShares - COMMISSION; trades++; if (stop) stopLossExits++; }
+            if (cover > 0) {
+                const pnl = (p.shortAverage - cover) * p.shortShares - COMMISSION;
+                realized += pnl; trades++; if (stop) stopLossExits++;
+                await recordClosedTrade(ns, { symbol: p.symbol, side: "SHORT", shares: p.shortShares, entryPrice: p.shortAverage, exitPrice: cover, pnl, reason: stop || "SIGNAL_EXIT", at: Date.now() });
+            }
         }
     }
 
@@ -71,18 +80,25 @@ async function evaluate(ns, symbols, cliFraction, marketChanged) {
             const shares = Math.min(safe(() => ns.stock.getMaxShares(signal.symbol), 0), Math.floor(Math.max(0, allocation - COMMISSION) / price));
             if (shares <= 0 || shares * price < MIN_TRADE_VALUE) continue;
             const fill = isLong ? safe(() => ns.stock.buyStock(signal.symbol, shares), 0) : safe(() => ns.stock.buyShort(signal.symbol, shares), 0);
-            if (fill > 0) { const spent = shares * fill + COMMISSION; cashRemaining -= spent; if (isShort) shortRemaining -= spent; trades++; }
+            if (fill > 0) {
+                const spent = shares * fill + COMMISSION;
+                cashRemaining -= spent;
+                if (isShort) shortRemaining -= spent;
+                trades++;
+            }
         }
     }
 
     const live = currentExposure(ns, symbols);
+    const performance = traderPerformanceSummary(readTraderPerformance(ns));
     await ns.write(STATE_FILE, JSON.stringify({
-        model: "PRE4S_TRADER_V4_CONSERVATIVE_SHORTS", status: "LIVE", marketChanged,
+        model: "PRE4S_TRADER_V5_HISTORY", status: "LIVE", marketChanged,
         allowShort: config.allowShort, capitalMode: config.mode, capitalPercent: config.percent, capitalAmount: config.amount,
         capitalLimit, shortCapitalPercent: config.shortCapitalPercent, shortCapitalLimit: equity * config.shortCapitalPercent / 100,
         stopLossPercent: config.stopLossPercent, cashFloor: config.cashFloor, cash: ns.getServerMoneyAvailable("home"), equity,
         exposure: live.total, longExposure: live.long, shortExposure: live.short,
         realizedThisCycle: realized, tradesThisCycle: trades, stopLossExitsThisCycle: stopLossExits,
+        performance,
         thresholds: { longEnter: LONG_ENTER, shortEnter: SHORT_ENTER, longConfidence: LONG_CONFIDENCE, shortConfidence: SHORT_CONFIDENCE },
         topSignals: ranked.slice(0, 8), updatedAt: Date.now(),
     }), "w");
