@@ -1,6 +1,6 @@
 # Agxnny Bitburner Scripts
 
-A modular Bitburner v3.x automation project built around a control-only home node, remote HGW/HWGW execution, adaptive economic targeting, progression automation, diagnostics, and a unified React control-plane GUI.
+A modular Bitburner v3.x automation project built around a control-only home node, remote HGW/HWGW execution, adaptive economic targeting, progression automation, diagnostics, and a React control-plane GUI.
 
 ## Quick start
 
@@ -25,51 +25,62 @@ run ui/dashboard.js
 
 Tabs: **Overview, Targets, Economy, Batch, Network, Diagnostics**.
 
-The Batch tab shows current and retained completed HWGW state, planned stage countdowns, recovery error, landing order, drift/spread, and a planned-vs-actual timing graph. Overview also exposes current-action ETA and an Active Workers panel. Worker lateness is diagnostic only; automatic termination is not enabled yet.
+The dashboard has been compacted to reduce repeated status cards while preserving the controls and diagnostics used during development. Overview now keeps the four main metrics, one combined quick-controls card, compact target/health cards, and only shows the Active Workers card when workers actually exist. The Batch tab now folds pipeline state, serialized-batch state, latest recovery/timing, and collapsible stage diagnostics into fewer panels.
 
-## Architecture summary
+Worker lateness remains diagnostic only; automatic termination is still disabled.
+
+## Execution architecture
 
 - Home is the control/UI node; H/G/W workers run remotely.
 - Planner discovers targets and execution hosts.
 - Economic selection chooses automatic target strategy.
-- Controller switches between sequential HGW and synchronized one-batch-at-a-time HWGW.
-- The current **live** batch path is still serialized.
-- Pipeline scheduling is being built and validated in non-executing simulation before real overlap is enabled.
+- Controller switches between sequential HGW and serialized automatic HWGW.
+- The controller-integrated batch path is still one batch at a time.
+- The first real overlapping test is an opt-in standalone runner with a hard depth cap of 2.
 
-## Current batching status
+## Batch timing
 
-The original W2 grow-security under-compensation bug is fixed. Corrected live batches recover money/security to the intended baseline without standalone repair work.
+The original W2 grow-security under-compensation bug is fixed. Corrected batches recover money/security to the intended baseline without standalone repair work.
 
-Batch workers publish planned/actual completion telemetry through Port 14; Port 12 holds the current batch and Port 15 retains the latest completed batch. Recent `phantasy` testing has shown correct H → W1 → G → W2 order with a 200 ms planned stage gap and low observed drift, but more samples are still required before reducing timings.
+Batch workers publish landing events through Port 14. Port 12 holds the serialized current batch, Port 15 retains the latest completed result, and Port 16 carries planner/simulator/real-pipeline state.
 
-## Pipeline scheduler
+Recent `phantasy` testing showed correct H → W1 → G → W2 ordering around a 200 ms planned stage gap with low drift. Keep 200 ms until repeated real depth-2 samples establish a safe margin.
 
-`hacking/batch-scheduler.js` now has two **non-executing** modes.
+## Pipeline scheduler and real depth-2 runner
 
-One-shot capacity/cadence planning:
+Capacity/cadence planner:
 
 ```text
 run hacking/batch-scheduler.js phantasy 0.10 200
 ```
 
-Persistent depth-2 admission simulation:
+Depth-2 admission simulation:
 
 ```text
 run hacking/batch-scheduler.js phantasy 0.10 200 admission
 ```
 
-The scheduler separates:
+First real depth-2 test:
 
-- **stage gap** — H → W1 → G → W2 spacing inside a batch;
-- **batch interval** — H(N) → H(N+1) spacing between batches.
+```text
+run hacking/pipeline-runner.js phantasy 0.10 200 2
+```
 
-It performs host-by-host RAM reservation over future execution windows, distinguishes burst depth from sustainable cadence, and publishes scheduler state to **Port 16**.
+The real runner is intentionally **not controller-integrated yet**. Before it starts, the controller must already be parked in `PREPARED HOLD` on the same target with no standalone workers or serialized batch running.
 
-Admission mode is hard-capped at **2 virtual in-flight batches**. It requires a prepared baseline before opening the virtual pipeline, waits for the sustainable interval before admitting the second virtual batch, rechecks live host RAM, and enters `SAFETY_STOP` if a newly observed matching Port 15 result has bad ordering, missing timing events, or material recovery error. No workers are launched.
+The real runner:
 
-On the first V2 `phantasy` capacity sample, the timing-only interval was 800 ms while the host-window model estimated roughly **6280 ms** as sustainable with the then-current ~4.2 TB remote pool.
+- hard-caps overlap at 2 real batches;
+- computes a conservative sustainable inter-batch interval;
+- reserves RAM host-by-host over future stage windows;
+- launches stages just in time rather than holding all worker RAM from admission;
+- owns Port 14 for the duration of the test and routes events by `batchId`;
+- publishes live pipeline state to Port 16;
+- publishes each completed pipeline batch to Port 15 for the existing timing GUI;
+- stops new waves on launch failure, bad order, missing timing events, low recovery money, or excessive security;
+- allows already-launched work to drain instead of starting another wave.
 
-See `docs/BATCH_SCHEDULER.md` for the detailed design.
+For the initial test, use exactly `2` batches. Larger values run repeated depth-2 waves and should wait until the first pair is validated.
 
 ## Runtime ports
 
@@ -86,13 +97,13 @@ See `docs/BATCH_SCHEDULER.md` for the detailed design.
 | 9 | rooting/tool state |
 | 10 | cloud-capacity action state |
 | 11 | manual money-goal / spending lock |
-| 12 | current synchronized HWGW batch snapshot |
+| 12 | current serialized HWGW batch snapshot |
 | 13 | controller command queue |
 | 14 | batch worker landing-timing event queue |
 | 15 | latest completed batch snapshot |
-| 16 | pipeline scheduler / admission-simulation snapshot |
+| 16 | pipeline planner / simulation / executor snapshot |
 
-Port 14 is still owned by the serialized batch runner and cleared before each real batch. That must be redesigned before overlapping real batches are enabled.
+The serialized runner still clears Port 14 before its own batch. Therefore the real pipeline runner may only be used while serialized batching is parked. Full controller integration will require one permanent shared Port 14 owner.
 
 ## Useful commands
 
@@ -108,13 +119,14 @@ run network/root.js
 run hacking/batch-runner.js n00dles 0.10 200 1
 run hacking/batch-scheduler.js phantasy 0.10 200
 run hacking/batch-scheduler.js phantasy 0.10 200 admission
+run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
 
 ## Documentation
 
 - `docs/HANDOFF.md` — current milestone and next work
 - `docs/architecture.md` — architecture and data flow
-- `docs/BATCH_SCHEDULER.md` — pipeline scheduler design
+- `docs/BATCH_SCHEDULER.md` — pipeline scheduler/executor design
 - `docs/RUNTIME_STATE.md` — ports/state contracts
 - `docs/TESTING.md` — validation and acceptance criteria
 - `docs/SYSTEM_MAP.md` — module responsibilities
@@ -122,11 +134,11 @@ run hacking/batch-scheduler.js phantasy 0.10 200 admission
 
 ## Immediate roadmap
 
-1. validate the depth-2 admission simulator alongside serialized production;
-2. continue collecting repeated landing/recovery telemetry;
-3. add rolling timing history;
-4. redesign Port 14 for multiple live batch IDs;
-5. reuse host-window reservations for actual atomic worker launch;
-6. first real pipeline test remains capped at depth 2;
-7. only raise depth after repeated depth-2 timing/recovery validation;
+1. validate the first real two-batch pipeline pair;
+2. compare both batches' landing order, drift, spacing, and recovery;
+3. repeat depth-2 waves only after the first pair is healthy;
+4. add rolling timing history;
+5. move shared Port 14 ownership into the eventual controller-integrated scheduler;
+6. replace the serialized per-batch review barrier with pipeline-aware review/admission logic;
+7. only then raise live depth above 2;
 8. later add watchdog kill/recovery and multi-target scheduling.
