@@ -146,19 +146,21 @@ async function applyGoalAction(ns, action, now) {
 
 function controllerStatusText(action) {
     if (action.action === "PREP_TARGET") return `Prep queued for ${action.target || "current target"}`;
-    if (action.action === "RESUME_AUTO") return "Resume automatic execution queued";
+    if (action.action === "RESUME_AUTO") return "Resume selected execution mode queued";
     if (action.action === "SET_MANUAL_TARGET") return `Manual target queued: ${action.target}`;
     if (action.action === "CLEAR_MANUAL_TARGET") return "Automatic target selection queued";
-    if (action.action === "SET_EXECUTION_MODE") return `${action.mode === "BATCH" ? "Batch HWGW" : "Normal HGW"} queued`;
+    if (action.action === "SET_EXECUTION_MODE") return `${modeLabel(action.mode)} queued`;
     return "Controller request queued";
 }
 
 function header(s) {
     const c = s.controller ?? {};
     const live = Boolean(s.controller) && !isControllerStateStale(s.controller);
-    const mode = c.executionMode?.mode ?? "HGW";
+    const mode = c.executionMode?.mode ?? "STANDBY";
     const pending = c.executionMode?.pending;
-    const pipeline = s.scheduler?.execution ? s.scheduler : null;
+    const pipeline = s.scheduler?.execution && (Date.now() - Number(s.scheduler?.updatedAt ?? 0) < 5000 || c.executionMode?.pipelineRunning)
+        ? s.scheduler
+        : null;
     return el("div", { style: styles.header },
         el("div", null,
             el("div", { style: styles.eyebrow }, "AGXNNY AUTOMATION"),
@@ -167,9 +169,10 @@ function header(s) {
         ),
         el("div", { style: styles.badges },
             badge(live ? "ONLINE" : "WAITING", live ? "good" : "dim"),
-            badge(pending ? `SWITCH → ${pending}` : mode === "BATCH" ? "BATCH" : "HGW", pending ? "warn" : mode === "BATCH" ? "accent" : "dim"),
+            badge(pending ? `SWITCH → ${pending}` : modeBadge(mode), pending ? "warn" : mode === "PIPELINE" ? "accent" : mode === "STANDBY" ? "dim" : "accent"),
             pipeline ? badge(`PIPE ${pipeline.status ?? "RUN"}`, pipeline.safetyStopped ? "warn" : "good") : null,
             c.prep?.hold ? badge("PREP HOLD", "good") : null,
+            c.executionMode?.pipelineSafetyStopped ? badge("PIPE STOP", "warn") : null,
             s.manualGoal?.active ? badge("SPEND LOCK", "warn") : null,
         ),
     );
@@ -198,7 +201,7 @@ function overviewView(s) {
     const sec = c.security ?? {};
     const exec = c.execution ?? {};
     const tele = s.telemetry ?? {};
-    const mode = c.executionMode?.mode ?? "HGW";
+    const mode = c.executionMode?.mode ?? "STANDBY";
     const workers = Array.isArray(exec.activeWorkers) ? exec.activeWorkers : [];
 
     return el("div", null,
@@ -206,7 +209,7 @@ function overviewView(s) {
             heroMetric("TARGET", c.hostname ?? "waiting", `${pctFine(Number(m.max ?? 0) > 0 ? Number(m.current ?? 0) / Number(m.max) : 0)} · sec +${Math.max(0, Number(sec.current ?? 0) - Number(sec.minimum ?? 0)).toFixed(2)}`),
             heroMetric("INCOME · 5M", `${moneyFmt(tele.incomePerSecond5m)}/s`, `${Number(tele.hackEvents ?? 0)} hack events`),
             heroMetric("REMOTE RAM", ramFmt(exec.usableRam), `${Number(exec.hostCount ?? 0)} hosts`),
-            heroMetric("EXECUTION", mode === "BATCH" ? "BATCH HWGW" : "NORMAL HGW", actionEtaText(exec.currentAction)),
+            heroMetric("EXECUTION", modeLabel(mode), executionSubtext(c)),
         ),
         card("Quick controls", quickControls(s), true),
         grid(
@@ -233,24 +236,27 @@ function overviewView(s) {
 
 function quickControls(s) {
     const c = s.controller ?? {};
-    const mode = c.executionMode?.mode ?? "HGW";
+    const mode = c.executionMode?.mode ?? "STANDBY";
     const pending = Boolean(c.executionMode?.pending);
     const target = String(c.hostname ?? "");
+    const resumeUseful = Boolean(c.prep?.hold || c.executionMode?.pipelineSafetyStopped);
     return el("div", null,
         el("div", { style: styles.controlGrid },
             el("div", null,
-                kv("Execution", pending ? `SWITCHING → ${c.executionMode.pending}` : mode),
-                kv("Prep", c.prep?.hold ? "PREPARED HOLD" : c.prep?.active ? `PREP ${c.prep.stage ?? "ACTIVE"}` : "automatic"),
-                kv("Review", c.executionMode?.awaitingReview ? "WAITING" : "ready"),
+                kv("Execution", pending ? `SWITCHING → ${c.executionMode.pending}` : modeLabel(mode)),
+                kv("Prep", c.prep?.hold ? "PREPARED HOLD" : c.prep?.active ? `PREP ${c.prep.stage ?? "ACTIVE"}` : "off"),
+                kv("Pipeline", c.executionMode?.pipelineSafetyStopped ? "SAFETY STOP" : c.executionMode?.pipelineRunning ? "RUNNING · depth 2" : mode === "PIPELINE" ? "ready / preparing" : "off"),
             ),
             el("div", { style: styles.controlActions },
+                button("Standby", () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "STANDBY" }; }, pending || mode === "STANDBY", "clear"),
                 button("HGW", () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "HGW" }; }, pending || mode === "HGW", "clear"),
                 button("Batch", () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "BATCH" }; }, pending || mode === "BATCH", "primary"),
+                button("Pipeline", () => { requestedControllerAction = { action: "SET_EXECUTION_MODE", mode: "PIPELINE" }; }, pending || mode === "PIPELINE", "primary"),
                 button("Prep + hold", () => { requestedControllerAction = { action: "PREP_TARGET", target }; }, !target, "primary"),
-                button("Resume auto", () => { requestedControllerAction = { action: "RESUME_AUTO" }; }, false, "clear"),
+                button("Resume", () => { requestedControllerAction = { action: "RESUME_AUTO" }; }, !resumeUseful, "clear"),
             ),
         ),
-        el("div", { style: styles.goalStatus }, c.prep?.lastMessage || c.executionMode?.lastMessage || controllerActionStatus),
+        el("div", { style: styles.goalStatus }, c.executionMode?.lastMessage || c.prep?.lastMessage || controllerActionStatus),
     );
 }
 
@@ -362,13 +368,16 @@ function pipelineSummary(state) {
     const interval = Number(state.batchIntervalMs ?? state.timing?.tunedBatchIntervalMs ?? 0);
     const gap = Number(state.stageGapMs ?? state.timing?.tunedStageGapMs ?? 0);
     const reason = state.reason || admission.decision?.reason || "Waiting";
+    const completed = real
+        ? state.continuous ? `${Number(state.completedBatches ?? 0)} total` : `${state.completedBatches ?? 0}/${state.requestedBatches ?? 0}`
+        : "—";
     return el("div", null,
         el("div", { style: styles.compactGrid },
-            kv("Mode", real ? "REAL DEPTH-2 TEST" : admission.enabled ? "ADMISSION SIM" : "PLANNER"),
+            kv("Mode", real ? state.continuous ? "CONTINUOUS DEPTH-2" : "REAL DEPTH-2 TEST" : admission.enabled ? "ADMISSION SIM" : "PLANNER"),
             kv("Status", state.status ?? admission.decision?.status ?? "—"),
             kv("Stage gap", gap ? `${gap} ms` : "—"),
             kv("Cadence", interval ? `${interval} ms` : "—"),
-            kv("Completed", real ? `${state.completedBatches ?? 0}/${state.requestedBatches ?? 0}` : "—"),
+            kv("Completed", completed),
             kv("Safety", state.safetyStopped || admission.safetyStopped ? "STOPPED" : "OK"),
         ),
         batches.length ? el("div", { style: styles.pipelineRows }, ...batches.slice(0, 2).map((batch) => kv(batch.id ?? "batch", `H ${countdownTo(batch.firstLandingAt)} · W2 ${countdownTo(batch.finalLandingAt)}`))) : null,
@@ -458,7 +467,7 @@ function diagnosticsView(s) {
             el("div", { style: styles.goalStatus }, actionStatus),
             command("RAM audit", "run diagnostics/mem-audit.js"),
             command("Pipeline planner", "run hacking/batch-scheduler.js phantasy 0.10 200"),
-            command("Real depth-2 test", "run hacking/pipeline-runner.js phantasy 0.10 200 2"),
+            command("Finite depth-2 test", "run hacking/pipeline-runner.js phantasy 0.10 200 2"),
         )),
         card("State ages", el("div", null,
             kv("Planner", age(s.planner?.updatedAt)),
@@ -467,9 +476,9 @@ function diagnosticsView(s) {
             kv("Pipeline", age(s.scheduler?.updatedAt)),
             kv("Last complete", age(s.lastCompletedBatch?.finishedAt)),
         )),
-        card("Safety reminders", el("div", null,
-            note("Real pipeline execution requires the controller to be parked at PREPARED HOLD on the same target. Depth is hard-capped at 2 and any timing/recovery failure stops new waves."),
-            note("Worker LATE labels remain diagnostic only; watchdog termination is still disabled."),
+        card("Safety", el("div", null,
+            note("Startup now defaults to STANDBY: control/UI services stay online but no target-side H/G/W, serialized batch, or pipeline coordinator is started until you choose a mode."),
+            note("PIPELINE is controller-managed at hard depth 2. A safety stop prepares and holds the target for review; Resume clears the stop after you inspect it."),
         )),
     );
 }
@@ -492,6 +501,24 @@ function hostRow(h) {
     );
 }
 
+function executionSubtext(controller) {
+    const mode = controller.executionMode?.mode ?? "STANDBY";
+    if (controller.executionMode?.pending) return `switching → ${controller.executionMode.pending}`;
+    if (mode === "PIPELINE") return controller.executionMode?.pipelineRunning ? "depth 2 active" : controller.executionMode?.pipelineSafetyStopped ? "safety stop" : "preparing / ready";
+    if (mode === "STANDBY") return "target-side work paused";
+    return actionEtaText(controller.execution?.currentAction);
+}
+function modeLabel(mode) {
+    const m = String(mode ?? "STANDBY").toUpperCase();
+    if (m === "PIPELINE") return "PIPELINE HWGW";
+    if (m === "BATCH") return "BATCH HWGW";
+    if (m === "HGW") return "NORMAL HGW";
+    return "STANDBY";
+}
+function modeBadge(mode) {
+    const m = String(mode ?? "STANDBY").toUpperCase();
+    return m === "PIPELINE" ? "PIPELINE" : m === "BATCH" ? "BATCH" : m === "HGW" ? "HGW" : "STANDBY";
+}
 function pipelineInFlight(scheduler) {
     if (!scheduler) return 0;
     if (scheduler.execution) return Array.isArray(scheduler.inFlight) ? scheduler.inFlight.length : 0;
@@ -499,7 +526,7 @@ function pipelineInFlight(scheduler) {
 }
 function schedulerMode(scheduler) {
     if (!scheduler) return "OFF";
-    if (scheduler.execution) return "REAL DEPTH-2";
+    if (scheduler.execution) return scheduler.continuous ? "CONT DEPTH-2" : "REAL DEPTH-2";
     if (scheduler.admission?.enabled) return "SIM DEPTH-2";
     return "PLANNER";
 }
@@ -592,7 +619,7 @@ const styles = {
     value: { color: "#d8e1e9", fontSize: "9px", textAlign: "right", overflowWrap: "anywhere" },
     note: { color: "#8796a5", fontSize: "9px", lineHeight: 1.4, marginTop: "6px", padding: "6px", background: "#0c1218", borderLeft: "2px solid #35566f" },
     controlGrid: { display: "grid", gridTemplateColumns: "1fr auto", gap: "12px", alignItems: "center" },
-    controlActions: { display: "flex", gap: "5px", flexWrap: "wrap", justifyContent: "flex-end" },
+    controlActions: { display: "flex", gap: "5px", flexWrap: "wrap", justifyContent: "flex-end", maxWidth: "520px" },
     compactGrid: { display: "grid", gridTemplateColumns: "repeat(2,minmax(0,1fr))", gap: "0 14px" },
     strategyTitle: { fontSize: "15px", fontWeight: 700, color: "#f0f5fa", marginBottom: "6px" },
     statGrid: { display: "grid", gridTemplateColumns: "repeat(3,minmax(0,1fr))", gap: "5px" },
