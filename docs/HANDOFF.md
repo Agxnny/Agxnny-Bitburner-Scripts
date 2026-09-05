@@ -36,7 +36,7 @@ Startup defaults to STANDBY. Background prep is independent of production mode.
 
 ## Latest validated batching evidence
 
-Real multi-target stress test `mixed 6 2 12 0.10 200 10` completed cleanly through distinct-target depth 5:
+Historical real stress validation completed cleanly through distinct-target depth 5:
 
 ```text
 depth 2: 2/2 clean
@@ -47,13 +47,11 @@ worst max drift: 129 ms
 worst minimum spacing: 151 ms
 ```
 
-Targets exercised included `phantasy`, `silver-helix`, `joesguns`, `sigma-cosmetics`, and `omega-net`. Depth 6 did not fail; it was prep-limited because only five prepared candidates were available. Therefore global distinct-target concurrency 5 is proven clean and depth 6 remains inconclusive.
+Depth 6 was prep-limited, not failed. Per-target real MULTI overlap remains hard-capped at 1. Port 19 same-target history and global distinct-target stress evidence are separate safety signals.
 
-Per-target real MULTI overlap remains hard-capped at 1. Port 19 same-target history and Port 20 global distinct-target stress evidence are separate safety signals.
+## AUTOMULTI / stress evidence foundation
 
-### Persistent stress evidence foundation
-
-AUTOMULTI work has started with durable stress evidence rather than a UI-only preset.
+Durable evidence:
 
 ```text
 lib/multi-stress-evidence.js
@@ -61,11 +59,38 @@ data file: /data/multi-stress-evidence.txt
 model: MULTI_STRESS_EVIDENCE_V1
 ```
 
-`diagnostics/multi-target-stress.js` now records its final result into this durable evidence file. The record keeps the highest proven clean distinct-target depth, highest attempted depth, accumulated clean-wave count, observed drift/spacing extremes, unique exercised targets, last result/reason, and a failed depth when a real FAILED/SAFETY_STOP occurs. BLOCKED or ABORTED runs never reduce already-proven depth.
+Completed stress runs persist highest proven clean depth, highest attempted depth, accumulated clean waves, unique targets, drift/spacing extremes, last status/reason, and real FAILED/SAFETY_STOP depth. BLOCKED/ABORTED runs never reduce already-proven depth. Historical depth-5 evidence predates this file and is intentionally not silently seeded; controlled tests should recreate machine-readable proof.
 
-This is intentionally separate from transient Port 20. Port 20 remains live/current stress-run telemetry; the data file is the persistent evidence source that future AUTOMULTI decisions will consume after restarts.
+### Stress tester V2: prep-aware + resumable
 
-Important migration note: the historical depth-5 result documented above predates this persistence helper. The new file begins empty on first pull; do not silently seed it with depth 5. Re-run controlled stress testing to establish machine-readable evidence before AUTOMULTI trusts a depth above its conservative fallback.
+```text
+diagnostics/multi-target-stress.js
+model: MULTI_TARGET_STRESS_V2_PREP_AWARE_RESUME
+Port: 20 live state
+```
+
+Usage now accepts an eighth positional argument:
+
+```text
+run diagnostics/multi-target-stress.js [profile] [maxDepth] [wavesPerDepth] [targetCount] [hackFraction] [stageGapMs] [prepWaitMinutes] [startDepth|resume]
+```
+
+Examples:
+
+```text
+# full validation from depth 2
+run diagnostics/multi-target-stress.js mixed 6 2 12 0.10 200 10 2
+
+# continue at durable provenDepth + 1
+run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 20 resume
+
+# explicitly validate only depth 6 upward
+run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 20 6
+```
+
+When a child MULTI wave returns BLOCKED, the stress coordinator no longer blindly relaunches it every 10 seconds. It enters `WAITING_PREP`, reads fresh Port 18 prepper telemetry every 2 seconds, publishes `preparedCount` and `requiredPreparedCount`, and only retries the child once `preparedCount >= currentDepth`. It aborts if the controller leaves STANDBY and times out at the configured prep-wait limit. This substantially reduces noisy blocked-run churn.
+
+Caveat: Port 18 `preparedCount` is the full eligible prepared universe, while a particular MONEY/BALANCED/XP ranking may still yield fewer usable candidates. Therefore a retry after `preparedCount >= depth` can still legitimately BLOCK again. If that occurs, V2 returns to prep-aware waiting rather than tight relaunching. A future decision module can use profile-specific candidate counts directly.
 
 ## Distributed target prepper V3 adaptive focus
 
@@ -78,22 +103,9 @@ policy: ADAPTIVE_FOCUS_GROW_THEN_WEAKEN
 etaModel: FULL_READY_GROW_PLUS_WEAKEN_V1
 ```
 
-The prepper scans the full eligible target universe and reserves a bounded slice of remote RAM. Allocation is adaptive: `hacking/prepper-allocation.js` compares focus widths and may spread prep or concentrate multiple reserved hosts on one target.
+The prepper scans the full eligible target universe and reserves a bounded slice of remote RAM. Allocation is adaptive: it may spread prep or concentrate multiple reserved hosts on one target. Defaults are 12.5% remote RAM reserve, min 64 GB, max 1024 GB, money ready >=99.5%, security ready <= min+0.05. Prep is money-first, then security cleanup. One target may receive multiple same-wave jobs across different reserved hosts.
 
-Defaults:
-
-```text
-target refresh: 15 seconds
-reserve ratio: 12.5% remote RAM
-minimum reserve: 64 GB
-maximum reserve: 1024 GB
-money ready threshold: >=99.5%
-security ready threshold: <= min +0.05
-```
-
-Prep ordering is money-first. If below the money threshold the stage is GROW even with elevated security; after money is ready, WEAKEN cleans security. One target may receive multiple jobs on different reserved hosts in the same wave, and it is not replanned until that wave drains. Production excludes fresh Port 18 reserved hosts.
-
-`prepTargets[].etaMs` estimates full ready time: remaining active grow/weaken work plus projected future grow rounds and weaken cleanup. Queued ETA includes an advisory adaptive-focus queue delay.
+Port 18 publishes `preparedCount`, `needsPrepCount`, `activeJobs`, `activeTargetCount`, `prepTargets`, reserved hosts/RAM, and adaptive focus data. `prepTargets[].etaMs` estimates full ready time, not just current job completion.
 
 ## Modular dashboard architecture
 
@@ -104,8 +116,8 @@ ui/
   actions.js                plain-JS request model + async action processor
   styles.js                 shared styles
   components/
-    format.js               formatting helpers
-    layout.js               cards, buttons, badges, grids, hero metrics
+    format.js
+    layout.js
   views/
     overview.js
     targets.js
@@ -115,85 +127,60 @@ ui/
     diagnostics.js
 ```
 
-Detailed architecture notes are in `docs/GUI_ARCHITECTURE.md`.
+React callbacks must remain Netscript-free. The dashboard uses one mounted React tree; the async Netscript loop owns process/port/file operations.
 
-### Readability + diagnostics refinement phase 1
+### Current UI refinement state
 
-Current UI includes larger typography, a Diagnostics HEALTHY/DEGRADED/SAFETY STOP/STALE verdict, real diagnostic launch buttons, tracked PID/status for direct diagnostics, and severity-aware State Ages. React callbacks remain Netscript-free.
-
-### Overview control cleanup
-
-Overview is a status/control summary rather than a duplicate control surface. BATCH, PIPELINE, MULTI, and manual Prep+hold launch buttons were removed there. Overview keeps Standby, HGW, and Resume safety. MULTI configuration/start remains on Batch. Backend BATCH/PIPELINE modes remain for compatibility/testing until explicitly reviewed.
-
-### Targets prep-progress card
-
-Targets contains `Servers below max money` using Port 18. V3 exposes multiple hosts/threads per target, but the card still shows compatibility host first. Next refinement should render `N hosts · Nt` and improve GROW/WEAKEN/READY progress presentation.
-
-## GUI runtime model that must not regress
-
-```text
-Netscript async loop
-    -> refresh snapshot about once per second
-    -> process queued plain-JS actions
-
-React tree
-    -> mounted once
-    -> checks a JS version counter frequently
-    -> owns tabs and collapse state locally
-    -> never directly calls Netscript APIs
-```
-
-The prior direct/reactive Netscript approach caused unstable tab switching and dashboard termination. Do not reintroduce Netscript calls inside React callbacks.
+- global typography enlarged for at-a-glance use
+- Diagnostics has health verdict, real test/diagnostic buttons, direct diagnostic PID/status tracking, and state-age severity
+- Overview duplicate BATCH/PIPELINE/MULTI/Prep+hold launch buttons removed; Standby/HGW/Resume remain
+- Batch currently exposes manual MULTI controls; AUTOMULTI will become the primary path after backend decision/controller logic is ready
+- Targets still needs focused allocation display `N hosts · Nt`
 
 ## Multi-target runner/controller
-
-Current real finite executor:
 
 ```text
 hacking/multi-target-runner.js
 model: MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE
 ```
 
-Usage:
-
-```text
-run hacking/multi-target-runner.js [money|balanced|xp] [targetCount 2-12] [hackFraction] [stageGapMs] [globalDepth 2-12]
-```
-
-Controller MULTI repeats finite waves automatically. COMPLETE re-evaluates and launches another wave; BLOCKED retries later; SAFETY_STOP halts future admissions until Resume; mode changes wait for the current finite wave to drain.
+Controller MULTI repeats finite waves automatically. COMPLETE re-evaluates and relaunches; BLOCKED retries; SAFETY_STOP stops admissions until Resume; mode changes wait for active wave drain. Per-target overlap remains 1.
 
 ## Runtime state ports
 
 ```text
 12 serialized batch
-14 live worker timing events; exactly one real coordinator owns it
+14 worker timing event queue; exactly one real coordinator owns it
 15 latest completed batch
-16 single-target pipeline state
-17 multi-target scheduler/executor state
-18 adaptive distributed prepper state
-19 rolling per-target safety history
-20 progressive global stress-test state
+16 single-target pipeline
+17 multi-target scheduler/executor
+18 adaptive prepper
+19 rolling per-target history
+20 progressive global stress test
 ```
-
-See `docs/RUNTIME_STATE.md` for the current contract.
 
 ## Immediate validation sequence
 
+Current production screenshot showed healthy controller-owned MULTI depth 3 across `phantasy`, `silver-helix`, and `omega-net`, with the prior omega-net completion at 100% money, +0.000 security, correct order, 195 ms minimum spacing, and 15 ms max drift. Do not start stress while controller MULTI is active.
+
+When ready to validate V2:
+
 ```text
 1. run gitpull.js
-2. restart startup/dashboard so current modules reload
-3. run diagnostics/multi-target-stress.js mixed 6 2 12 0.10 200 10 while controller is STANDBY
-4. after completion, cat /data/multi-stress-evidence.txt
-5. confirm provenDepth reflects the highest newly completed clean depth and BLOCKED depth does not erase it
-6. continue normal GUI tab/readability/diagnostic-button validation
+2. put controller fully in STANDBY and allow active MULTI wave to drain
+3. run diagnostics/multi-target-stress.js mixed 6 2 12 0.10 200 20 2
+4. if depth 6 is prep-limited, confirm Port 20 reports WAITING_PREP and preparedCount/requiredPreparedCount instead of repeated child launches
+5. after a completed run: cat /data/multi-stress-evidence.txt
+6. then test resume with: run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 20 resume
+7. confirm resume begins at provenDepth + 1
 ```
 
 ## AUTOMULTI implementation sequence
 
 ```text
 DONE 1. persistent stress evidence helper + stress-run recording
-NEXT 2. make stress WAITING_PREP observe Port 18 readiness instead of noisy child relaunch every 10 seconds; add resume/start-depth support
-3. pure AUTOMULTI decision module: prepared targets + production RAM + target value + durable stress ceiling + timing/history evidence
+DONE 2. prep-aware WAITING_PREP + explicit startDepth + durable-evidence resume
+NEXT 3. pure AUTOMULTI decision module: prepared targets + production RAM + target value + durable stress ceiling + timing/history evidence
 4. controller AUTO state machine: ASSESS -> VALIDATE if needed -> RUN -> OBSERVE -> ADAPT
 5. Batch-tab AUTOMULTI button/status; keep manual controls as Advanced/Manual
 6. expose Possible / Proven / AUTO effective concurrency
@@ -201,4 +188,4 @@ NEXT 2. make stress WAITING_PREP observe Port 18 readiness instead of noisy chil
 8. later keep global distinct-target depth separate from per-target overlap depth
 ```
 
-AUTOMULTI must never interpret more RAM/prepared targets as permission to exceed proven stress evidence. It may request controlled validation for a higher depth, but production stays at the last trusted ceiling until that evidence exists. XP scoring remains a proxy rather than exact Formula-based hacking XP.
+AUTOMULTI must never treat more RAM or more prepared targets as permission to exceed proven stress evidence. It may request controlled validation for a higher depth, but production remains at the last trusted ceiling until that evidence exists. XP scoring remains a proxy rather than exact Formula-based hacking XP.
