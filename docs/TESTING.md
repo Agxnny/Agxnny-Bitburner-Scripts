@@ -1,6 +1,6 @@
 # Testing and Validation Guide
 
-This project changes live automation behavior, so validate incrementally rather than assuming a successful launch means the math is correct.
+Validate incrementally rather than assuming a successful launch means the timing and recovery math are correct.
 
 ## General progression
 
@@ -11,14 +11,16 @@ one-shot dry run
   ↓
 persistent non-executing simulation
   ↓
-automatic single-cycle live test
+serialized live HWGW
   ↓
-repeated-cycle stability
+real depth-2 pair
   ↓
-throughput optimization
+repeated depth-2 stability
+  ↓
+controller integration / throughput optimization
 ```
 
-Do not enable overlapping live HWGW until the serialized path and depth-2 simulation are understood.
+Maximum real depth stays at 2 until repeated timing/recovery results are healthy.
 
 ## After pulling code
 
@@ -27,6 +29,8 @@ run gitpull.js
 run startup.js
 run diagnostics/mem-audit.js
 ```
+
+The compact GUI should load with all six tabs responsive. Overview should contain fewer repeated panels than before, and the Batch tab should show Port 16 pipeline state when available.
 
 ## Core smoke checks
 
@@ -40,23 +44,25 @@ run network/root.js
 
 ## Active-worker ETA validation
 
-During normal/prep H/G/W work, Overview should show active jobs/threads, current ETA, and worker rows with host, threads, elapsed time, and remaining estimate.
+During normal/prep H/G/W work, Overview should show the Active Workers card only while workers exist. Rows should show action/target, host, thread count, and ETA/status.
 
-`LATE` is diagnostic only and must not kill workers.
+`LATE` remains diagnostic only and must not kill workers.
 
-## Execution-mode transition validation
+## Execution-mode and prep controls
 
-Switch HGW ↔ BATCH while workers are active. Expected behavior:
+Quick Controls combines HGW/BATCH selection with Prep + hold and Resume auto.
 
-- both mode buttons disable during transition;
-- GUI shows `SWITCHING → <mode>`;
-- no new target-side work is scheduled;
-- existing H/G/W/batch work finishes naturally;
-- the requested mode applies at the safe boundary.
+Verify:
+
+- HGW ↔ BATCH still waits for a safe boundary;
+- mode buttons disable while a transition is pending;
+- Prep + hold reaches `PREPARED HOLD`;
+- Resume auto returns to the selected controller mode;
+- React tab/control clicks remain responsive and do not kill the dashboard script.
 
 ## Serialized batch correctness
 
-A healthy completed batch should satisfy:
+A healthy serialized completion should satisfy:
 
 - correct H → W1 → G → W2 order;
 - `landing.missingJobs === 0`;
@@ -65,13 +71,9 @@ A healthy completed batch should satisfy:
 - no standalone correction work is normally required;
 - predicted-vs-actual recovery error remains small/understood.
 
-The Batch tab should expose planned/actual stage timing, minimum spacing, maximum drift, allocation spread, and recovery comparison.
+Keep the requested stage gap at 200 ms until repeated depth-2 evidence supports any reduction.
 
-Do not reduce the 200 ms stage gap from one sample.
-
-## Pipeline scheduler one-shot validation
-
-Run:
+## Pipeline planner validation
 
 ```text
 run hacking/batch-scheduler.js phantasy 0.10 200
@@ -80,98 +82,155 @@ run hacking/batch-scheduler.js phantasy 0.10 200
 Verify:
 
 - no workers are launched;
-- Port 16/state reports `PIPELINE_DRY_RUN_V2_HOST_WINDOWS`;
-- requested timing-only interval and RAM-sustainable interval are distinct when capacity requires it;
-- burst depth stops at the first host-window reservation failure;
-- blocked output names the batch/stage when possible;
-- current live serialized work lowers reported available RAM rather than being assumed free later.
+- Port 16 model is `PIPELINE_DRY_RUN_V2_HOST_WINDOWS`;
+- timing-only and RAM-sustainable intervals are both visible;
+- host-window reservation failure reports the blocked batch/stage;
+- live used RAM is treated conservatively.
 
-A previous `phantasy` sample found roughly 800 ms timing-only versus 6280 ms sustainable, with burst depth 16 and batch 17 blocked at HACK. Treat this as a point-in-time reference only.
-
-## Depth-2 admission simulation validation
-
-Run alongside serialized production:
+## Virtual depth-2 admission validation
 
 ```text
 run hacking/batch-scheduler.js phantasy 0.10 200 admission
 ```
 
-This must remain non-executing. Confirm the log/state explicitly says dry run and `launchesWorkers: false`.
-
-Expected state progression when the initial target is prepared and RAM permits:
+Expected virtual progression:
 
 ```text
-ADMITTED (virtual batch 1)
-  ↓
+ADMITTED
 INTERVAL_WAIT
-  ↓
-ADMITTED (virtual batch 2)
-  ↓
+ADMITTED
 DEPTH_CAP
-  ↓
-DRAIN (oldest reaches planned W2)
-  ↓
-next virtual admission may occur
+DRAIN
 ```
 
 Acceptance checks:
 
-- `admission.maxDepth === 2` always;
-- `admission.inFlight` never exceeds 2;
-- no H/G/W PID is created by the simulator;
-- initial admission waits at `WAITING_PREP` if money/security are not prepared;
-- after the virtual pipeline opens, temporary raw target money/security changes do not incorrectly gate every new batch;
-- current remote RAM is rechecked before each virtual admission;
-- insufficient host-window capacity produces `RAM_BLOCKED` instead of admission;
-- the second virtual admission respects the tuned sustainable interval;
-- virtual batches leave the in-flight set only at planned final W2 landing.
+- `admission.maxDepth === 2`;
+- `admission.inFlight <= 2` always;
+- no H/G/W PID is created;
+- insufficient capacity produces `RAM_BLOCKED`;
+- bad matching Port 15 telemetry produces `SAFETY_STOP`;
+- Port 16 keeps updating even if the terminal is not visibly tailing.
 
-## Admission safety-stop validation
+Use the Batch GUI for live Port 16 observation rather than relying on automatic terminal scrolling.
 
-Admission mode watches new matching Port 15 completed batches. A healthy new completed batch should not stop admissions.
+## First real depth-2 pipeline test
 
-A safety stop is expected if a newly observed matching completion has any of:
+### 1. Park the controller
 
-- bad landing order;
-- missing timing events;
-- money recovery error > 0.5 percentage points;
-- security recovery error > 0.05;
-- final money < 99.5%;
-- final security > +0.05.
-
-When stopped:
+Choose the intended target and click **Prep + hold** in Overview. Wait until:
 
 ```text
-admission.safetyStopped === true
-admission.decision.status === SAFETY_STOP
+header badge: PREP HOLD
+active workers: none
+serialized batch: idle
+money: >= 99.5%
+security: <= min + 0.05
 ```
 
-No new virtual batch may be admitted, while already-admitted virtual batches continue to drain. Restart the simulator to clear the stop; automatic recovery/reset is intentionally not implemented yet.
+Do **not** click Resume auto while the pipeline runner is active.
 
-## Before live depth-2 execution
+### 2. Run exactly two batches
 
-Do not launch overlapping real batches until all of the following are complete:
+```text
+run hacking/pipeline-runner.js phantasy 0.10 200 2
+```
 
-- repeated serialized timing/recovery samples are stable;
-- rolling timing history exists;
-- Port 14 clearing is removed and one multi-batch-safe consumer routes events by `batchId`;
-- host-window reservations are reused as actual launch allocations;
-- partial launch rollback is atomic;
-- strategic review becomes pipeline-aware;
-- depth-2 admission/safety behavior has been exercised in simulation.
+Preflight should either start the real test or clearly block with a reason. A blocked preflight must launch zero H/G/W workers.
+
+### 3. Observe Port 16 in the Batch tab
+
+Expected state:
+
+```text
+PIPELINE: REAL DEPTH-2
+max depth: 2
+in flight: 1 → 2 → 1 → 0
+completed: 0/2 → 1/2 → 2/2
+safety: OK
+```
+
+The runner uses a finite wave of at most two real batches. It may compute a batch interval larger than 800 ms from current RAM capacity.
+
+### 4. Validate BOTH completed batches
+
+For each completion, verify:
+
+```text
+landing.orderCorrect === true
+landing.missingJobs === 0
+landing.actualOrder === HACK → WEAKEN_HACK → GROW → WEAKEN_GROW
+final.moneyPercent >= 0.995
+final.securityDelta <= 0.05
+```
+
+Also record:
+
+```text
+landing.minimumSpacingMs
+landing.maxAbsLandingErrorMs
+landing.stages[].allocationSpreadMs
+landing.stages[].landingErrorMs
+```
+
+The Batch tab's planned-vs-actual graph should continue to work because each pipeline completion is copied to Port 15.
+
+### 5. Expected safety behavior
+
+Any of the following must stop new waves:
+
+- `ns.exec` launch failure;
+- incorrect landing order;
+- missing timing event;
+- final money below 99.5%;
+- final security above +0.05;
+- target outside prepared tolerance after a wave.
+
+Port 16 should end in `SAFETY_STOP` with a reason. Already-launched work is allowed to drain; merely late workers are not killed automatically.
+
+## Repeated depth-2 testing
+
+Only after the first pair is healthy, repeat several runs with `batchCount=2`.
+
+Do not jump directly to higher live depth. Once repeated pairs are stable, a larger **total batch count** may be tested, but the runner still executes them in depth-2 waves.
+
+Compare across runs:
+
+```text
+worst minimum spacing
+worst absolute landing drift
+worst allocation spread
+money/security recovery
+missing-event count
+launch failures
+```
+
+## Port 14 ownership regression
+
+The real pipeline runner may only be used while serialized batching is parked.
+
+During a real test:
+
+- Port 14 is consumed centrally by `pipeline-runner.js`;
+- events are routed by `batchId`;
+- the queue is not cleared between the two overlapping batches.
+
+Do not run `hacking/batch-runner.js` concurrently because it still clears Port 14 before a serialized batch.
 
 ## Regression checklist
 
 At minimum verify:
 
-- startup launches GUI + stack;
-- all six GUI tabs remain responsive;
+- startup launches compact GUI + stack;
+- all six tabs remain responsive;
 - normal HGW and serialized BATCH modes still work;
-- mode transitions remain safe;
-- Active Workers/ETA state appears and clears correctly;
-- manual target/prep/money-goal controls still work;
+- Quick Controls still switch modes and prep/resume correctly;
+- Active Workers appears only when useful and clears naturally;
+- manual target and money-goal controls still work;
+- Batch tab displays serialized, simulation, and real-pipeline Port 16 state correctly;
+- Port 15 displays the latest serialized or pipeline completion;
+- planned-vs-actual timing graph still renders;
 - Port 14 does not interfere with Port 4 strategic HACK telemetry;
-- Port 15 retains latest completed batch;
-- Port 16 reflects scheduler snapshot or admission simulation state;
-- admission simulation creates no real worker processes;
-- docs reflect the current architecture.
+- real pipeline test never exceeds depth 2;
+- watchdog termination remains disabled;
+- docs reflect current architecture.
