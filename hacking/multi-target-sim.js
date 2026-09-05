@@ -1,4 +1,5 @@
 import { getExecutionPool } from "/lib/execution.js";
+import { getTargetBatchSafety } from "/lib/batch-history.js";
 import {
     buildPreparedBatchTemplate,
     commitReservation,
@@ -11,6 +12,7 @@ import {
 } from "/lib/batch-allocation.js";
 import {
     publishMultiTargetSchedulerState,
+    readBatchHistoryState,
     readEconomyTargetState,
     readPlannerState,
     readPrepperState,
@@ -40,6 +42,10 @@ const PROFILE_WEIGHTS = Object.freeze({
  * It repeatedly frees expired virtual reservations, refreshes target readiness,
  * and admits the highest-value feasible prepared target into one shared global
  * RAM/time calendar. It launches no workers and never consumes Port 14.
+ *
+ * Real Port 19 pipeline history now acts as a hard per-target simulated depth
+ * ceiling. Targets with no trustworthy real pipeline history remain capped at
+ * depth 1, while proven targets may earn higher virtual depth.
  *
  * Usage:
  *   run hacking/multi-target-sim.js [money|balanced|xp] [targetCount] [hackFraction] [stageGapMs] [maxInFlight]
@@ -81,13 +87,14 @@ export async function main(ns) {
     if (!quiet) {
         ns.tprint("=== MULTI-TARGET ADMISSION SIM · PERSISTENT ===");
         ns.tprint(`Profile ${profile.toUpperCase()} | workers launched: NO | Port 17 live state`);
-        ns.tprint("Only prepared targets receive production admissions; the dedicated prepper handles the rest.");
+        ns.tprint("Prepared targets are additionally capped by rolling real Port 19 pipeline evidence.");
     }
 
     while (true) {
         const now = Date.now();
         const planner = readPlannerState(ns);
         const economic = readEconomyTargetState(ns);
+        const batchHistory = readBatchHistoryState(ns);
         const pool = getExecutionPool(ns, planner);
         const newHostSetKey = pool.map((host) => host.hostname).sort().join("|");
 
@@ -135,6 +142,10 @@ export async function main(ns) {
             for (const target of templates) {
                 if (!target.preparedNow) continue;
                 const targetDepth = inFlight.filter((batch) => batch.target === target.hostname).length;
+                const safety = getTargetBatchSafety(batchHistory, target.hostname);
+                const depthCap = clampInt(Number(safety.recommendedDepth ?? 1), 1, 64);
+                if (targetDepth >= depthCap) continue;
+
                 const earliest = Number(nextLandingByTarget.get(target.hostname) ?? now + target.firstLandingDelayMs);
                 const firstLandingAt = findLandingStart(target, landingTimes, earliest, GLOBAL_LANDING_GAP_MS, now);
                 const batch = makeBatch(target, firstLandingAt, ++sequence);
@@ -142,7 +153,7 @@ export async function main(ns) {
                 if (!reservation.ok) continue;
 
                 const adjustedScore = target.baseScore / (1 + FAIRNESS_PENALTY * targetDepth);
-                candidates.push({ target, batch, reservation, adjustedScore, targetDepth });
+                candidates.push({ target, batch, reservation, adjustedScore, targetDepth, depthCap, safety });
             }
 
             if (candidates.length === 0) {
@@ -170,6 +181,8 @@ export async function main(ns) {
                 score: chosen.adjustedScore,
                 expectedCash: chosen.target.expectedCash,
                 ramTimeGbSec: chosen.target.ramTimeGbSec,
+                safetyDepthCap: chosen.depthCap,
+                safetyConfidence: String(chosen.safety?.confidence ?? "UNPROVEN"),
                 allocations: chosen.reservation.allocations,
             };
             inFlight.push(virtual);
@@ -186,16 +199,27 @@ export async function main(ns) {
             const active = inFlight.filter((batch) => batch.target === target.hostname);
             const recentCompleted = completions.filter((entry) => entry.target === target.hostname).length;
             const life = getLife(lifetimeByTarget, target.hostname);
+            const safety = getTargetBatchSafety(batchHistory, target.hostname);
+            const safetyDepthCap = clampInt(Number(safety.recommendedDepth ?? 1), 1, 64);
+            const capReached = target.preparedNow && active.length >= safetyDepthCap;
             return {
                 hostname: target.hostname,
                 preparedNow: target.preparedNow,
-                schedulerState: target.preparedNow ? (active.length > 0 ? "RUNNING" : "READY") : "WAITING_PREP",
+                schedulerState: target.preparedNow
+                    ? (active.length > 0 ? (capReached ? "AT_SAFETY_CAP" : "RUNNING") : "READY")
+                    : "WAITING_PREP",
                 moneyRatio: target.moneyRatio,
                 securityDelta: target.securityDelta,
                 baseScore: target.baseScore,
                 moneyEfficiency: target.moneyEfficiency,
                 xpProxyEfficiency: target.xpProxyEfficiency,
                 activeDepth: active.length,
+                safetyDepthCap,
+                safetyConfidence: String(safety.confidence ?? "UNPROVEN"),
+                pipelineEvidence: Number(safety.pipelineSampleCount ?? 0),
+                consecutiveCleanPipeline: Number(safety.consecutiveClean ?? 0),
+                latestPipelineHealthy: Boolean(safety.latestHealthy),
+                safetyReason: String(safety.reason ?? ""),
                 recentCompleted,
                 lifetimeAdmitted: life.admitted,
                 lifetimeCompleted: life.completed,
@@ -209,12 +233,13 @@ export async function main(ns) {
         }).sort((a, b) => b.activeDepth - a.activeDepth || b.baseScore - a.baseScore);
 
         const state = {
-            version: 2,
-            model: "MULTI_TARGET_ADMISSION_SIM_V2_PERSISTENT",
+            version: 3,
+            model: "MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED",
             dryRun: true,
             persistent: true,
             launchesWorkers: false,
             consumesBatchTimingPort: false,
+            enforcesBatchHistoryDepthCap: true,
             profile,
             targetCount,
             requestedHackFraction: hackFraction,
@@ -223,7 +248,7 @@ export async function main(ns) {
             status: pool.length === 0 ? "BLOCKED" : "RUNNING",
             reason: pool.length === 0
                 ? "No remote production RAM available"
-                : `${inFlight.length} virtual batch(es) in flight; ${targetStates.filter((target) => target.preparedNow).length}/${targetStates.length} target(s) production-ready`,
+                : `${inFlight.length} virtual batch(es) in flight; real Port 19 evidence caps every target independently`,
             startedAt,
             updatedAt: now,
             runtimeMs: now - startedAt,
@@ -253,6 +278,11 @@ export async function main(ns) {
                 preparedCount: Number(prepper?.preparedCount ?? 0),
                 targetCount: Number(prepper?.targetCount ?? 0),
             },
+            batchHistory: {
+                online: Boolean(batchHistory && Date.now() - Number(batchHistory.updatedAt ?? 0) <= 5_000),
+                model: String(batchHistory?.model ?? ""),
+                updatedAt: Number(batchHistory?.updatedAt ?? 0),
+            },
             targets: targetStates,
             inFlight: inFlight.slice(0, 64),
             recentCompletions: completions.slice(-32),
@@ -266,6 +296,8 @@ export async function main(ns) {
                 "Persistent simulation only: no H/G/W workers are launched.",
                 "Expired virtual reservations are freed and new work is admitted continuously.",
                 "Only targets currently at >=99.5% money and <=+0.05 security receive production admissions.",
+                "Each target is hard-capped by Port 19 recommendedDepth; no real pipeline evidence means depth 1.",
+                "Existing virtual work is never killed if a cap falls; new admissions pause until depth drops below the cap.",
                 "Unprepared targets remain WAITING_PREP while the dedicated Port 18 prepper works independently.",
                 "Fairness pressure is based on current virtual depth, so it does not accumulate forever.",
                 "Port 14 remains untouched; this is not yet the real multi-target executor.",
@@ -299,7 +331,8 @@ function getLife(map, hostname) {
 function printSummary(ns, state) {
     ns.tprint(`[MULTI-SIM] ${state.profile.toUpperCase()} | ${state.capacity.inFlight}/${state.capacity.maxInFlight} in flight | ${state.capacity.totalAdmitted} admitted | ${state.capacity.totalCompleted} completed | ${state.capacity.availableRam.toFixed(1)} GB / ${state.capacity.hostCount} hosts`);
     for (const target of state.targets ?? []) {
-        ns.tprint(`  ${target.hostname.padEnd(18)} depth ${String(target.activeDepth).padStart(2)} | ${target.schedulerState.padEnd(12)} | score ${target.baseScore.toFixed(3)} | completed60s ${target.recentCompleted}`);
+        const evidence = `${target.pipelineEvidence}ev/${target.safetyConfidence}`;
+        ns.tprint(`  ${target.hostname.padEnd(18)} depth ${String(target.activeDepth).padStart(2)}/${String(target.safetyDepthCap).padStart(2)} | ${target.schedulerState.padEnd(13)} | ${evidence.padEnd(10)} | score ${target.baseScore.toFixed(3)} | completed60s ${target.recentCompleted}`);
     }
 }
 
