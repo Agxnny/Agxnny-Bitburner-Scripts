@@ -8,10 +8,15 @@ import { isQuiet } from "/lib/output.js";
 
 const LOOP_MS = 250;
 const HEARTBEAT_MS = 2_000;
+const STARTUP_FRESHNESS_SLOP_MS = 1_000;
 
 /**
  * Watches Port 15 and builds rolling per-target real batch safety history on Port 19.
  * It does not own Port 14 and launches no workers.
+ *
+ * The collector only accepts completions that are genuinely new after this
+ * process starts. Port 15 is latest-value state, so a stale snapshot or a
+ * replayed previously-seen batch ID must never manufacture extra evidence.
  *
  * @param {NS} ns
  */
@@ -23,8 +28,16 @@ export async function main(ns) {
         return;
     }
 
+    const startedAt = Date.now();
     let history = normalizeHistory(readBatchHistoryState(ns));
-    let lastBatchId = latestRecordedBatchId(history);
+    const seenBatchIds = recordedBatchIds(history);
+
+    // Treat the snapshot present at startup as already observed. This prevents a
+    // restart from ingesting an old Port 15 completion as a fresh sample.
+    const startupSnapshot = readLastCompletedBatchState(ns);
+    const startupBatchId = String(startupSnapshot?.batchId ?? "");
+    if (startupBatchId) seenBatchIds.add(startupBatchId);
+
     let lastHeartbeat = 0;
 
     if (!quiet) ns.tprint("[BATCH-HISTORY] Watching Port 15; rolling real safety history is published on Port 19.");
@@ -32,14 +45,19 @@ export async function main(ns) {
     while (true) {
         const latest = readLastCompletedBatchState(ns);
         const batchId = String(latest?.batchId ?? "");
-        if (batchId && batchId !== lastBatchId && String(latest?.status ?? "") === "COMPLETE") {
+        const finishedAt = Number(latest?.finishedAt ?? latest?.updatedAt ?? 0);
+        const isFresh = finishedAt >= startedAt - STARTUP_FRESHNESS_SLOP_MS;
+        const isComplete = String(latest?.status ?? "") === "COMPLETE";
+
+        if (batchId && isComplete && isFresh && !seenBatchIds.has(batchId)) {
             history = appendBatchHistory(history, latest);
-            lastBatchId = batchId;
+            seenBatchIds.add(batchId);
             publishBatchHistoryState(ns, history);
             if (!quiet) {
                 const target = String(latest?.target ?? "unknown");
                 const safety = history.targets?.[target];
-                ns.tprint(`[BATCH-HISTORY] ${target} | samples ${safety?.sampleCount ?? 0} | clean streak ${safety?.consecutiveClean ?? 0} | recommended depth ${safety?.recommendedDepth ?? 1} | ${safety?.confidence ?? "UNPROVEN"}`);
+                const source = latest?.pipeline ? "PIPELINE" : "BATCH";
+                ns.tprint(`[BATCH-HISTORY] ${target} | ${source} ${shortId(batchId)} | samples ${safety?.sampleCount ?? 0} | pipeline evidence ${safety?.pipelineSampleCount ?? 0} | clean streak ${safety?.consecutiveClean ?? 0} | recommended depth ${safety?.recommendedDepth ?? 1} | ${safety?.confidence ?? "UNPROVEN"}`);
             }
         } else if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) {
             lastHeartbeat = Date.now();
@@ -50,18 +68,18 @@ export async function main(ns) {
     }
 }
 
-function latestRecordedBatchId(history) {
-    let latestId = "";
-    let latestAt = 0;
+function recordedBatchIds(history) {
+    const ids = new Set();
     for (const target of Object.values(history?.targets ?? {})) {
-        const samples = Array.isArray(target?.samples) ? target.samples : [];
-        for (const sample of samples) {
-            const at = Number(sample?.finishedAt ?? 0);
-            if (at >= latestAt) {
-                latestAt = at;
-                latestId = String(sample?.batchId ?? "");
-            }
+        for (const sample of Array.isArray(target?.samples) ? target.samples : []) {
+            const id = String(sample?.batchId ?? "");
+            if (id) ids.add(id);
         }
     }
-    return latestId;
+    return ids;
+}
+
+function shortId(value) {
+    const id = String(value ?? "");
+    return id.length <= 30 ? id : `…${id.slice(-29)}`;
 }
