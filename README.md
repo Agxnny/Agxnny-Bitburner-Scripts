@@ -25,11 +25,7 @@ run ui/dashboard.js
 
 Tabs: **Overview, Targets, Economy, Batch, Network, Diagnostics**.
 
-The dashboard mounts its React tree once. Tab selection is React-local and immediate; Netscript I/O stays in the asynchronous dashboard loop. React callbacks remain Netscript-free.
-
-The dedicated **Batch** tab separates synchronized-HWGW telemetry from the main Overview page. It shows the current batch, planned H/W1/G/W2 landing countdowns, W2 ETA, planned total duration, the latest completed batch, recovery-model error, timing/order measurements, per-stage landing details, and a planned-vs-actual landing timeline.
-
-Overview now also exposes standalone execution observability: current action ETA plus an **Active Workers** panel showing action/target, host, threads, elapsed time, and remaining estimate. Workers may be highlighted `LATE` after an observational grace margin, but automatic killing is intentionally not enabled yet.
+The Batch tab shows current and retained completed HWGW state, planned stage countdowns, recovery error, landing order, drift/spread, and a planned-vs-actual timing graph. Overview also exposes current-action ETA and an Active Workers panel. Worker lateness is diagnostic only; automatic termination is not enabled yet.
 
 ## Architecture summary
 
@@ -37,62 +33,43 @@ Overview now also exposes standalone execution observability: current action ETA
 - Planner discovers targets and execution hosts.
 - Economic selection chooses automatic target strategy.
 - Controller switches between sequential HGW and synchronized one-batch-at-a-time HWGW.
-- Manual target override, prep-and-hold, and manual money-goal/spending-lock controls are available in the GUI.
-- Automatic cloud capacity actions follow the progression advisor and respect the manual spending lock.
-- Batch-associated HACK telemetry does not trigger strategic review until the full batch is complete.
-- Execution-mode changes pause new scheduling and finish already-running target-side work before applying the new mode.
+- The current **live** batch path is still serialized.
+- Pipeline scheduling is being built and validated in non-executing simulation before real overlap is enabled.
 
 ## Current batching status
 
-The original W2 grow-security under-compensation bug is fixed. Corrected live batches on `sigma-cosmetics` have used approximately:
+The original W2 grow-security under-compensation bug is fixed. Corrected live batches recover money/security to the intended baseline without standalone repair work.
 
-```text
-25H / 1W / 298–299G / 24W
-money after batch: 100%
-security after batch: minimum
-standalone repair weaken: not required
-```
+Batch workers publish planned/actual completion telemetry through Port 14; Port 12 holds the current batch and Port 15 retains the latest completed batch. Recent `phantasy` testing has shown correct H → W1 → G → W2 order with a 200 ms planned stage gap and low observed drift, but more samples are still required before reducing timings.
 
-Recovery-model telemetry is recorded in Port 12. The current live-development step remains **actual landing-drift measurement**.
+## Pipeline scheduler
 
-Batch workers receive their planned landing timestamp and emit completion events to **Port 14**. The batch runner aggregates those events into Port 12 schema version 3, including actual stage order, per-stage landing error, within-stage allocation spread, minimum adjacent spacing, missing timing events, and maximum absolute drift.
+`hacking/batch-scheduler.js` now has two **non-executing** modes.
 
-A stage split across several hosts is considered fully landed when its **last allocation** completes.
-
-The most recent `COMPLETE` batch is also copied to **Port 15**, so the GUI can keep showing the previous result even after Port 12 advances to the next running batch.
-
-The configured landing order remains:
-
-```text
-HACK
-  + 200 ms
-WEAKEN_HACK
-  + 200 ms
-GROW
-  + 200 ms
-WEAKEN_GROW
-```
-
-## Pipeline scheduler prototype
-
-Work has started on `hacking/batch-scheduler.js` as a **dry-run-only** pipeline planner. It does not launch workers yet.
-
-The scheduler treats two timing controls separately:
-
-- **stage gap** — H → W1 → G → W2 spacing inside a batch;
-- **batch interval** — H(N) → H(N+1) spacing between successive batches.
-
-It builds a global landing calendar, uses matching Port 15 timing telemetry as a conservative drift/spread safety signal, models time-aware aggregate RAM occupancy, and estimates a simulated safe pipeline depth. Results are published to **Port 16**.
-
-The scheduler intentionally does not reduce timings aggressively from one completed batch. Rolling timing history and host-by-host future RAM reservation are required before live overlap is enabled.
-
-Dry-run example:
+One-shot capacity/cadence planning:
 
 ```text
 run hacking/batch-scheduler.js phantasy 0.10 200
 ```
 
-See `docs/BATCH_SCHEDULER.md` for the detailed design and safety milestones.
+Persistent depth-2 admission simulation:
+
+```text
+run hacking/batch-scheduler.js phantasy 0.10 200 admission
+```
+
+The scheduler separates:
+
+- **stage gap** — H → W1 → G → W2 spacing inside a batch;
+- **batch interval** — H(N) → H(N+1) spacing between batches.
+
+It performs host-by-host RAM reservation over future execution windows, distinguishes burst depth from sustainable cadence, and publishes scheduler state to **Port 16**.
+
+Admission mode is hard-capped at **2 virtual in-flight batches**. It requires a prepared baseline before opening the virtual pipeline, waits for the sustainable interval before admitting the second virtual batch, rechecks live host RAM, and enters `SAFETY_STOP` if a newly observed matching Port 15 result has bad ordering, missing timing events, or material recovery error. No workers are launched.
+
+On the first V2 `phantasy` capacity sample, the timing-only interval was 800 ms while the host-window model estimated roughly **6280 ms** as sustainable with the then-current ~4.2 TB remote pool.
+
+See `docs/BATCH_SCHEDULER.md` for the detailed design.
 
 ## Runtime ports
 
@@ -113,9 +90,9 @@ See `docs/BATCH_SCHEDULER.md` for the detailed design and safety milestones.
 | 13 | controller command queue |
 | 14 | batch worker landing-timing event queue |
 | 15 | latest completed batch snapshot |
-| 16 | dry-run pipeline scheduler analysis |
+| 16 | pipeline scheduler / admission-simulation snapshot |
 
-Port 14 is currently safe because batching is serialized and the runner clears stale timing events immediately before launch. That behavior must be redesigned before pipelining.
+Port 14 is still owned by the serialized batch runner and cleared before each real batch. That must be redesigned before overlapping real batches are enabled.
 
 ## Useful commands
 
@@ -130,13 +107,14 @@ run network/inspect.js
 run network/root.js
 run hacking/batch-runner.js n00dles 0.10 200 1
 run hacking/batch-scheduler.js phantasy 0.10 200
+run hacking/batch-scheduler.js phantasy 0.10 200 admission
 ```
 
 ## Documentation
 
 - `docs/HANDOFF.md` — current milestone and next work
 - `docs/architecture.md` — architecture and data flow
-- `docs/BATCH_SCHEDULER.md` — dry-run pipeline scheduler design
+- `docs/BATCH_SCHEDULER.md` — pipeline scheduler design
 - `docs/RUNTIME_STATE.md` — ports/state contracts
 - `docs/TESTING.md` — validation and acceptance criteria
 - `docs/SYSTEM_MAP.md` — module responsibilities
@@ -144,11 +122,11 @@ run hacking/batch-scheduler.js phantasy 0.10 200
 
 ## Immediate roadmap
 
-1. collect repeated landing telemetry in the Batch tab;
-2. measure worst landing error, allocation spread, and minimum stage spacing;
-3. validate the dry-run scheduler's stage-gap, batch-interval, and RAM predictions;
-4. add rolling timing history and host-by-host future reservation;
-5. redesign Port 14 for multiple live batch IDs;
-6. first live pipeline test capped at depth 2;
-7. after batch timing is stable, design watchdog kill/recovery rules from observed worker timing;
-8. later optimize global RAM scheduling and multi-target execution.
+1. validate the depth-2 admission simulator alongside serialized production;
+2. continue collecting repeated landing/recovery telemetry;
+3. add rolling timing history;
+4. redesign Port 14 for multiple live batch IDs;
+5. reuse host-window reservations for actual atomic worker launch;
+6. first real pipeline test remains capped at depth 2;
+7. only raise depth after repeated depth-2 timing/recovery validation;
+8. later add watchdog kill/recovery and multi-target scheduling.
