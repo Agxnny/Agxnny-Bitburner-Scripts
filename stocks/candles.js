@@ -1,59 +1,75 @@
-const DEFAULT_MAX_CANDLES = 60;
-const MIN_SAMPLES_PER_CANDLE = 5;
+const AUTO_TARGET_CANDLES = 70;
 const GAP_FACTOR = 2.25;
 
-/** Build sampled OHLC candles from recorded price points without bridging recorder gaps. */
-export function buildCandles(series, maxCandles = DEFAULT_MAX_CANDLES, expectedIntervalMs = 6000) {
-    const points = Array.isArray(series)
-        ? series.filter((point) => Number.isFinite(Number(point?.price)) && Number(point.price) > 0 && Number.isFinite(Number(point?.at)))
-        : [];
-    if (points.length === 0) return { candles: [], bucketSize: 0, intervalMs: 0 };
+/** Filter a stock series to a wall-clock lookback. rangeMs <= 0 means all retained history. */
+export function filterSeriesByRange(series, rangeMs = 0) {
+    const points = validPoints(series);
+    const range = Math.max(0, Number(rangeMs) || 0);
+    if (!range || points.length < 2) return points;
+    const cutoff = Number(points.at(-1).at) - range;
+    return points.filter((point) => Number(point.at) >= cutoff);
+}
 
-    const target = Math.max(1, Math.floor(maxCandles));
-    const bucketSize = Math.max(MIN_SAMPLES_PER_CANDLE, Math.ceil(points.length / target));
-    const gapThreshold = Math.max(1, Number(expectedIntervalMs) || 6000) * GAP_FACTOR;
+/** Build wall-clock aligned OHLC candles without bridging recorder gaps. */
+export function buildCandles(series, intervalMs = 0, expectedIntervalMs = 6000) {
+    const points = validPoints(series);
+    if (!points.length) return { candles: [], intervalMs: 0 };
+
+    const expected = Math.max(1, Number(expectedIntervalMs) || 6000);
+    const span = Math.max(expected, Number(points.at(-1).at) - Number(points[0].at));
+    const interval = Math.max(expected, Number(intervalMs) > 0 ? Number(intervalMs) : niceInterval(span / AUTO_TARGET_CANDLES, expected));
+    const gapThreshold = expected * GAP_FACTOR;
     const candles = [];
-    let bucket = [];
-    let gapBefore = false;
+    let current = null;
+    let previous = null;
 
-    const flush = () => {
-        if (!bucket.length) return;
-        const prices = bucket.map((point) => Number(point.price));
-        candles.push({
-            at: Number(bucket[0].at),
-            endAt: Number(bucket.at(-1).at),
-            open: prices[0],
-            high: Math.max(...prices),
-            low: Math.min(...prices),
-            close: prices.at(-1),
-            samples: bucket.length,
-            gapBefore,
-        });
-        bucket = [];
-        gapBefore = false;
-    };
-
-    for (let i = 0; i < points.length; i++) {
-        const point = points[i];
-        const prior = points[i - 1];
-        const isGap = prior && Number(point.at) - Number(prior.at) > gapThreshold;
-        if (isGap || bucket.length >= bucketSize) flush();
-        if (isGap) gapBefore = true;
-        bucket.push(point);
+    for (const point of points) {
+        const gapBefore = previous && Number(point.at) - Number(previous.at) > gapThreshold;
+        const bucketAt = Math.floor(Number(point.at) / interval) * interval;
+        if (!current || gapBefore || current.bucketAt !== bucketAt) {
+            if (current) candles.push(current);
+            current = makeCandle(point, bucketAt, Boolean(gapBefore));
+        } else {
+            updateCandle(current, point);
+        }
+        previous = point;
     }
-    flush();
+    if (current) candles.push(current);
+    return { candles, intervalMs: interval };
+}
 
-    const baseInterval = median(points.slice(1).map((point, index) => Number(point.at) - Number(points[index].at)).filter((delta) => delta > 0 && delta <= gapThreshold));
+function makeCandle(point, bucketAt, gapBefore) {
+    const price = Number(point.price);
     return {
-        candles: candles.slice(-target),
-        bucketSize,
-        intervalMs: baseInterval > 0 ? baseInterval * bucketSize : 0,
+        bucketAt,
+        at: Number(point.at),
+        endAt: Number(point.at),
+        open: price,
+        high: price,
+        low: price,
+        close: price,
+        samples: 1,
+        gapBefore,
     };
 }
 
-function median(values) {
-    if (!values.length) return 0;
-    const sorted = [...values].sort((a, b) => a - b);
-    const middle = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+function updateCandle(candle, point) {
+    const price = Number(point.price);
+    candle.endAt = Number(point.at);
+    candle.high = Math.max(candle.high, price);
+    candle.low = Math.min(candle.low, price);
+    candle.close = price;
+    candle.samples += 1;
+}
+
+function validPoints(series) {
+    return Array.isArray(series)
+        ? series.filter((point) => Number.isFinite(Number(point?.price)) && Number(point.price) > 0 && Number.isFinite(Number(point?.at)))
+        : [];
+}
+
+function niceInterval(raw, floor) {
+    const choices = [1000, 5000, 10000, 30000, 60000, 300000, 900000, 1800000, 3600000, 14400000, 86400000];
+    const minimum = Math.max(Number(floor) || 1, Number(raw) || 1);
+    return choices.find((value) => value >= minimum) ?? Math.ceil(minimum / 86400000) * 86400000;
 }
