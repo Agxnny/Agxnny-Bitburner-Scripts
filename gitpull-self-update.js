@@ -19,23 +19,25 @@ export async function main(ns) {
 
     await ns.sleep(50);
 
-    if (ns.fileExists(selfPath, "home")) {
-        const removed = ns.rm(selfPath, "home");
-        if (!removed) {
-            ns.tprint(`FAILED    ${selfPath}`);
-            ns.tprint("          Could not remove old updater after handoff.");
-            return;
-        }
-        ns.tprint(`REMOVED   ${selfPath}`);
+    const existed = ns.fileExists(selfPath, "home");
+    const oldContent = existed ? String(ns.read(selfPath)) : null;
+
+    if (existed && !ns.rm(selfPath, "home")) {
+        ns.tprint(`FAILED     ${selfPath}`);
+        ns.tprint("           Could not remove old updater after handoff.");
+        return;
     }
 
     const ok = await ns.wget(url, selfPath, "home");
     if (!ok) {
-        ns.tprint(`FAILED    ${selfPath}`);
-        ns.tprint(`          ${url}`);
+        ns.tprint(`FAILED     ${selfPath}`);
+        ns.tprint(`           ${url}`);
         return;
     }
 
-    ns.tprint(`REPLACED  ${selfPath}`);
-    ns.tprint("CONFIRMED: gitpull.js was freshly installed after handoff.");
+    const newContent = String(ns.read(selfPath));
+    if (!existed) ns.tprint(`ADDED      ${selfPath}`);
+    else if (newContent !== oldContent) ns.tprint(`UPDATED    ${selfPath}`);
+    else ns.tprint(`REPLACED   ${selfPath} (unchanged)`);
+    ns.tprint("CONFIRMED: gitpull.js handoff completed.");
 }
