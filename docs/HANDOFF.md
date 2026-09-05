@@ -124,9 +124,7 @@ remaining time in the active GROW wave
 
 For a money-ready/high-security target it includes remaining active WEAKEN time plus any additional weaken rounds. Queued targets also add an advisory delay based on the latest adaptive focus width/makespan. Because the prep allocator recalculates after each wave from live state, queued ETA remains advisory rather than an exact schedule.
 
-## Modular dashboard refactor
-
-The old monolithic `ui/dashboard.js` has been replaced by a parity-first modular architecture.
+## Modular dashboard architecture
 
 ```text
 ui/
@@ -148,31 +146,35 @@ ui/
 
 Detailed architecture notes are in `docs/GUI_ARCHITECTURE.md`.
 
-Feature parity retained:
+### Readability + diagnostics refinement phase 1
+
+The first operational refinement pass is now committed:
 
 ```text
-- six existing tabs
-- single-mounted React tree
-- React-local tab switching
-- collapsible normal cards and hero cards
-- quick STANDBY / HGW / BATCH / PIPELINE / MULTI controls
-- prep + hold and Resume controls
-- manual target override
-- money-goal controls
-- MULTI finite/controller controls
-- live MULTI activity
-- pipeline summary
-- serialized and completed batch timing telemetry
-- network view
-- diagnostics/test commands
-- stale pipeline freshness gating
+- global dashboard typography increased roughly 10-15%
+- primary values/card titles/buttons are more prominent
+- Diagnostics now has a top-level HEALTHY / DEGRADED / SAFETY STOP / STALE TELEMETRY verdict
+- Diagnostics has real buttons for:
+    Smoke tests
+    Progression test
+    Memory audit
+    Income diagnostic
+    Economy target diagnostic
+    Progression diagnostic
+    Target ranking diagnostic
+- direct diagnostics launched from the GUI are tracked with label, state, PID, start age, and finish age
+- only one tracked direct diagnostic is admitted at a time from the dashboard
+- State Ages now uses fresh/aging/stale visual severity
+- read-only diagnostics may run in any controller mode
 ```
+
+React callbacks still only enqueue plain-JS actions. The Netscript loop in `ui/actions.js` performs `ns.run`, PID tracking, and completion polling. Do not move Netscript calls into React callbacks.
 
 ### Targets prep-progress card
 
 The Targets tab contains `Servers below max money` using Port 18 prep telemetry. It shows server, money %, active/queued GROW or WEAKEN state, advisory ETA, and current host/security information.
 
-The V3 telemetry exposes multiple hosts/threads per target, but the current card still presents the compatibility `host` field first. A future small UI improvement can render focused host count/thread totals directly.
+The V3 telemetry exposes multiple hosts/threads per target, but the current card still presents the compatibility `host` field first. The next UI refinement should render focused host count/thread totals directly and improve prep-state progress presentation.
 
 ## GUI runtime model that must not regress
 
@@ -226,28 +228,32 @@ See `docs/RUNTIME_STATE.md` for the current contract.
 
 ```text
 1. run gitpull.js
-2. restart startup/prepper so V3 + the full-ready ETA model are live
-3. watch Targets -> Servers below max money
-4. confirm active ETA does not simply count down to the end of the current GROW cycle when additional grow/weaken work remains
-5. confirm low-money targets show ETA covering both growth and later security cleanup
-6. confirm money-ready/high-security targets show weaken-to-ready ETA
-7. confirm same-target parallel jobs remain active across multiple reserved hosts when focus mode chooses concentration
-8. confirm prepared count rises and no prep jobs collide with production hosts
+2. restart startup/dashboard so updated ui/actions.js, ui/styles.js, and ui/views/diagnostics.js load
+3. rapidly switch all six tabs repeatedly and confirm the dashboard remains alive/snappy
+4. confirm larger typography is readable without making Batch/Diagnostics unmanageably tall
+5. open Diagnostics and confirm the top verdict is HEALTHY under normal fresh state
+6. click Memory audit and confirm it launches, shows RUNNING + PID, then COMPLETE
+7. click Income / Economy targets / Progression / Target ranking and confirm each launches once and reports completion
+8. confirm clicking another direct diagnostic while one is running reports Busy rather than launching duplicate tracked work
+9. confirm stale State Ages rows change to amber/red as expected if a service is stopped
+10. confirm prepper V3 remains active and no GUI changes disturb production/prep state
 ```
 
 Because the new `ui/*` support files are ordinary `.js` files outside `lib/`, the current `diagnostics/mem-audit.js` labels them as `script` even though they are imported modules. That audit classification is cosmetic.
 
-## Next development sequence after prep validation
+## Planned refinement sequence after phase-1 validation
 
 ```text
-1. Let adaptive prep raise prepared-target count above five.
-2. Re-run stress test through depth 6; depth 5 is already proven.
-3. Improve stress BLOCKED behavior so it observes Port 18 readiness instead of relaunching a blocked runner every 10 seconds.
-4. Persist/consume proven global stress depth as an evidence ceiling for production MULTI, never as a forced depth.
-5. Validate repeated controller-owned MULTI waves and MULTI -> STANDBY drain.
-6. Move from whole-wave repetition to rolling per-target admissions.
-7. Add target-local recovery before aggressive continuous admission or same-target overlap.
-8. Keep watchdog termination deferred until batching/pipeline behavior is stable.
+1. Targets: show focused allocation as N hosts · Nt and improve prep progress visualization.
+2. Overview: add compact global activity visibility for production / prep / spending.
+3. Network: add used/max RAM plus PREP / PRODUCTION / FREE / DRAINING role information and useful sorting.
+4. Economy: add explicit manual-goal progress visualization and stronger spend-lock reason.
+5. Diagnostics: add stress evidence/status controls once stress BLOCKED behavior is improved.
+6. Batch: add compact live H -> W1 -> G -> W2 progress and later requested/proven/effective concurrency.
+7. Let adaptive prep raise prepared-target count above five and re-run stress through depth 6.
+8. Improve stress BLOCKED behavior so it observes Port 18 readiness instead of relaunching a blocked runner every 10 seconds.
+9. Persist/consume proven global stress depth as an evidence ceiling for production MULTI, never as a forced depth.
+10. Keep watchdog termination deferred until batching/pipeline behavior is stable.
 ```
 
 XP scoring remains a proxy rather than exact Formula-based hacking XP.
