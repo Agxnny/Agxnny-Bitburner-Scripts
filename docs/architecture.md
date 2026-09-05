@@ -2,175 +2,90 @@
 
 ## Source of truth
 
-GitHub `main` is the source of truth. Read `docs/HANDOFF.md` first for current work, then fetch current files before editing.
+GitHub `main` is the source of truth. Read `docs/HANDOFF.md` first, then fetch current files before editing.
 
 ## Core principle
 
-Home is the **control/UI plane**. Rooted and cloud servers are the **execution plane**. H/G/W workers, tactical analysis, and timed batch execution run remotely whenever possible.
+Home is the control/UI plane. Rooted and cloud servers are the remote execution plane. The GUI consumes published state and sends commands; it does not own hacking logic. React callbacks remain Netscript-free.
 
-The GUI consumes structured runtime state and sends lightweight commands; it does not own target analysis or worker scheduling.
+## Startup behavior
 
-## Startup
-
-```text
-startup.js
-    starts /ui/dashboard.js on home
-        ↓
-    spawns /kickstart.js --quiet
-        ↓
-planner → deploy/sync → economy/target → controller
-```
-
-## GUI architecture
-
-`ui/dashboard.js` mounts its React tree once. Runtime snapshots are refreshed by the asynchronous Netscript loop and exposed through plain-JS cached state. Tab selection is React-local and callbacks remain Netscript-free.
-
-The dashboard was compacted so repeated controller/economy/batch information is no longer shown in several separate cards. Overview combines execution/prep controls and hides Active Workers when empty. The Batch tab consumes Port 12, Port 15, and Port 16 in one compact workspace with collapsible stage diagnostics.
-
-## Controller-integrated execution modes
-
-### Normal HGW
-
-Sequential tactical weaken/grow/hack execution.
-
-### Serialized synchronized HWGW
-
-The automatic controller path remains one complete batch at a time:
+`startup.js` still starts the GUI and kickstart chain:
 
 ```text
-HACK              t0
-WEAKEN_HACK       t0 + gap
-GROW              t0 + 2 × gap
-WEAKEN_GROW       t0 + 3 × gap
+startup.js → dashboard → kickstart → planner/deploy/economy → controller
 ```
 
-Default stage gap: 200 ms.
+The controller now initializes in **STANDBY**. Control-plane services stay online, but no target-side H/G/W worker, serialized batch coordinator, or pipeline coordinator is launched until the user selects an execution mode or explicitly asks for Prep + hold.
 
-`hacking/batch-runner.js` reserves a full serialized batch, launches all H/W1/G/W2 workers with timed delays, waits for completion, publishes Port 12/15 telemetry, then the controller enforces a strategic-review barrier.
-
-## Pipeline planner and simulator
-
-`hacking/batch-scheduler.js` remains the non-executing planning layer.
-
-It separates:
+## Controller execution modes
 
 ```text
-stage gap      = H → W1 → G → W2 spacing within a batch
-batch interval = H(N) → H(N+1) spacing between batches
+STANDBY   observe only; no target-side execution
+HGW       sequential tactical weaken/grow/hack
+BATCH     serialized synchronized HWGW
+PIPELINE  continuous controller-managed depth-2 HWGW
 ```
 
-It models future stage execution windows host-by-host, catches RAM fragmentation, distinguishes burst depth from sustainable cadence, and can run a persistent virtual depth-2 admission simulation. Planner/simulation state is published to Port 16.
+Mode changes are scheduling barriers. Tactical analysis may be cancelled because it has no target-side effect. Existing H/G/W, serialized batch, or already-admitted pipeline work drains naturally before the requested mode becomes active.
 
-## First real depth-2 executor
+## Serialized batch mode
 
-`hacking/pipeline-runner.js` is the first **real overlapping** HWGW test harness.
+`hacking/batch-runner.js` remains the one-batch-at-a-time path. It plans H/W1/G/W2, launches timed workers, gathers Port 14 events, publishes Port 12/15 state, and then the controller uses the existing post-batch review barrier.
 
-It is intentionally standalone rather than a controller mode. Before it starts, it requires:
+Default stage gap remains 200 ms.
+
+## Integrated pipeline mode
+
+`hacking/pipeline-runner.js` now has two uses:
 
 ```text
-controller target == pipeline target
-controller PREPARED HOLD == true
-controller active standalone jobs == 0
-serialized batch runner == idle
-target money >= 99.5%
-target security <= minimum + 0.05
+finite manual test:  ... 2
+controller managed:  ... continuous --quiet
 ```
 
-The controller must remain parked for the duration of the test.
+The controller selects PIPELINE, prepares the target, publishes one settled idle snapshot, then launches the executor remotely. The live depth cap remains exactly 2.
 
-### Depth rule
+### Pipeline timing model
 
-Real overlap is hard-capped at:
+The executor separates:
 
 ```text
-MAX_DEPTH = 2
+stage gap      = H → W1 → G → W2 inside one batch
+batch interval = H(N) → H(N+1) across batches
 ```
 
-The first recommended run asks for exactly two total batches. Larger requested counts are executed as later **waves** of at most two batches only after the current wave drains and the target is still prepared.
-
-### Host-window reservations
-
-Each stage is modeled as:
-
-```text
-startAt   = landingAt - actionDuration
-landingAt = planned completion
-ram       = threads × worker RAM
-```
-
-The executor computes a conservative RAM-sustainable batch interval, reserves every stage host-by-host, and records exact host/thread allocations before launching the wave.
-
-### Just-in-time dispatch
-
-Unlike the serialized runner, the real pipeline executor does not start every script immediately and hold RAM during a long `additionalMsec` delay. Each stage is dispatched shortly before its calculated `startAt`, with a small dispatch lead and any remaining timing correction passed as `additionalMsec`.
-
-This makes live RAM behavior match the host-window reservation model much more closely.
+Each stage reservation covers its actual process lifetime, including the dispatch lead before action start. A host-aware reservation plan is built before each depth-2 wave. Stages are dispatched just in time and may be split across hosts.
 
 ### Port 14 ownership
 
-At preflight, the executor verifies serialized batching is parked. It then clears stale Port 14 data **once** and becomes the only timing-event consumer for the test.
+While PIPELINE is active, one pipeline coordinator consumes Port 14 and routes timing events by `batchId`. Serialized BATCH mode is not allowed to run concurrently.
 
-All new events are routed by:
+The pipeline executor clears stale Port 14 state once at startup only after preflight confirms no serialized batch-runner process is active.
 
-```text
-batchId → matching in-flight batch → stage telemetry
-```
+### Pipeline completion and safety
 
-This is the first real multi-batch-safe Port 14 consumer. It is not yet safe to run simultaneously with the serialized batch runner because that runner still assumes it may clear Port 14.
+Each completed pipeline batch publishes landing/recovery telemetry to Port 15. Port 16 holds live executor state including in-flight batches, cadence, completion count, recent events, and safety state.
 
-### Completion and safety stop
+Admission stops on launch failure, wrong landing order, missing timing events, final money below tolerance, excessive security, or a bad post-wave target baseline.
 
-Each real pipeline batch produces the same landing summary concepts used by serialized batches:
+On a controller execution-mode change, no later wave is admitted. The current depth-2 wave finishes fully, then the pipeline coordinator exits so the controller can complete the mode transition.
 
-```text
-actualOrder
-orderCorrect
-missingJobs
-minimumSpacingMs
-maxAbsLandingErrorMs
-landing.stages[]
-```
+On a pipeline safety stop, the controller begins target recovery/prep and holds the target for inspection. The operator uses Resume after review to clear the stop.
 
-A completed pipeline batch is copied to Port 15, allowing the existing Batch-tab timing graph to display it.
+## Validated depth-2 baseline
 
-New waves stop on:
+Two manual depth-2 runs on `phantasy` completed four overlapping batches total with 100.00% money, +0.000 security, and correct H → W1 → G → W2 ordering. Both selected roughly 6262 ms batch cadence under the then-current RAM pool.
 
-- any worker launch failure;
-- incorrect H/W1/G/W2 order;
-- missing timing events;
-- final money below 99.5%;
-- final security above minimum +0.05;
-- target outside prepared tolerance after a wave.
+This validates the basic depth-2 execution path, not higher depth. The 200 ms stage gap remains fixed until rolling history is implemented.
 
-Already-launched work is allowed to drain. The runner does not automatically kill healthy in-flight workers just because admission has stopped.
+## Pipeline planner
 
-## Runtime state
+`hacking/batch-scheduler.js` remains the non-executing planning/simulation tool. It provides host-window capacity analysis and a virtual depth-2 admission mode, both published to Port 16.
 
-- Port 12: current serialized batch.
-- Port 14: batch timing event queue.
-- Port 15: latest completed serialized or pipeline batch.
-- Port 16: latest planner, admission simulation, or real pipeline-executor state.
+## GUI architecture
 
-The Batch GUI detects Port 16 model/mode and shows planner, virtual, or real depth-2 status without requiring terminal tailing.
-
-## Strategic-review boundary
-
-The automatic controller still performs review after each serialized batch. The standalone pipeline test bypasses that automatic admission loop by requiring PREPARED HOLD and managing its own finite wave.
-
-A future controller-integrated pipeline must replace the per-batch review barrier with:
-
-```text
-healthy completion → continue admissions
-safety/strategy failure → stop admissions → drain → prep/review → restart
-```
-
-## Standalone worker observability
-
-Normal/prep H/G/W allocations include PID, host, threads, action, target, start time, expected duration, and expected finish time. The GUI may label a worker `LATE` after an observational grace margin. No automatic worker killing is enabled yet.
-
-## Remote-only worker policy
-
-`lib/execution.js` excludes home from H/G/W capacity. If remote capacity is unavailable, automation waits instead of consuming control/UI RAM.
+The compact dashboard keeps operational detail without duplicating it across many cards. Overview now exposes Standby/HGW/Batch/Pipeline, Prep + hold, and Resume in one control card. The Batch tab owns serialized/pipeline observability and detailed landing diagnostics.
 
 ## Runtime ports
 
@@ -190,19 +105,13 @@ Normal/prep H/G/W allocations include PID, host, threads, action, target, start 
 | 12 | current serialized batch state |
 | 13 | controller command queue |
 | 14 | batch landing-timing event queue |
-| 15 | latest completed batch state |
-| 16 | pipeline planner / simulation / executor state |
+| 15 | latest completed serialized/pipeline batch |
+| 16 | pipeline planner/simulation/executor state |
 
-## Current development stage
+## Current limitations
 
-Stage 4 serialized batching remains the automatic production path. Stage 5 now includes:
-
-- stage-gap and batch-interval modeling;
-- host-by-host future RAM reservation;
-- burst-depth versus sustainable-cadence analysis;
-- persistent virtual depth-2 admission simulation;
-- **opt-in real depth-2 overlapping execution**;
-- central per-`batchId` timing routing for that standalone real test;
-- safety-stop logic and finite depth-2 waves.
-
-Next work is live validation of the first real pair, rolling timing history, then controller integration of shared queue ownership/admission/review behavior. Maximum live depth must remain 2 until repeated results are healthy.
+- Live pipeline depth is fixed at 2.
+- Port 15 is latest-only, not rolling history.
+- Adaptive timing still uses the latest matching sample rather than several samples.
+- The serialized runner still has its legacy Port 14 clear-at-start behavior, so BATCH and PIPELINE remain mutually exclusive at the controller level.
+- Automatic worker watchdog termination remains deferred.
