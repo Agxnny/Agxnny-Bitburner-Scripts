@@ -11,42 +11,56 @@ BATCH     serialized one-batch-at-a-time HWGW
 PIPELINE  continuous controller-managed depth-2 HWGW
 ```
 
-`startup.js` defaults the production controller to **STANDBY**. The dedicated prepper is a separate background maintenance service, so STANDBY means no production hacking/batch/pipeline work; the reserved prep host may still run grow/weaken maintenance.
+`startup.js` defaults the production controller to STANDBY. The dedicated prepper is a separate background maintenance service, so its reserved host may still run grow/weaken maintenance while production is parked.
 
-## Dedicated prepper
+## Latest validated runtime milestones
 
-The dedicated prepper is live on home and the production pool correctly excludes its reserved host. Before prepper reservation the multi-target dry run saw `4196.00 GB / 59 hosts`; with prepper active it saw `4156.50 GB / 58 hosts`.
+Dedicated prepper reservation is stable: production capacity remains `4156.5 GB / 58 hosts` with one host excluded for prep.
+
+Rolling real Port 19 evidence is replay-safe. Latest validated `phantasy` single-target pipeline evidence reached 4 consecutive clean pipeline completions, producing recommended depth 4 / MEDIUM.
+
+Persistent history-capped multi-target simulation is validated. MONEY profile held:
+
+```text
+phantasy        depth 4/4
+joesguns        depth 1/1
+sigma-cosmetics depth 1/1
+foodnstuff      depth 0/1 WAITING_PREP
+```
+
+while rolling admissions progressed from 6 admitted / 0 completed to 8 admitted / 2 completed without violating evidence caps.
+
+Controller-managed PIPELINE -> STANDBY drain is runtime-validated: the pipeline runner remained alive while the admitted wave drained, then exited while dashboard, prepper, history collector, and controller stayed running.
+
+Latest memory audit is clean:
+
+```text
+52 installed managed JS files
+40 runnable scripts
+12 library modules
+0 unmanaged installed .js files
+```
+
+Largest scripts before adding the live multi-target prototype were:
+
+```text
+10.65 GB hacking/pipeline-runner.js
+ 9.70 GB hacking/batch-runner.js
+ 8.90 GB hacking/multi-target-sim.js
+ 8.85 GB hacking/multi-target-scheduler.js
+```
+
+Run a fresh audit after pulling the new prototype because the managed file count should increase by one.
 
 ## Rolling real batch safety history
 
-Files/services:
-
-```text
-lib/batch-history.js
-hacking/batch-history.js
-```
-
-`kickstart.js` starts the collector on home. It watches fresh completed real batches on Port 15 and publishes rolling per-target safety history on Port 19. Current model:
+Current Port 19 model:
 
 ```text
 ROLLING_BATCH_HISTORY_V2_PIPELINE_EVIDENCE
 ```
 
-The collector is hardened against replay/duplication: the startup Port 15 snapshot is treated as already seen, fresh timestamps are required, batch IDs are deduplicated, and only real PIPELINE completions can promote depth above 1.
-
-Latest runtime validation on `phantasy`:
-
-```text
-PIPELINE depth 2, interval 6216 ms
-batch 1: money 100.00%, security +0.000, ORDER OK
-batch 2: money 100.00%, security +0.000, ORDER OK
-collector after batch 1: pipeline evidence 3, clean streak 3, recommended depth 2 / LOW
-collector after batch 2: pipeline evidence 4, clean streak 4, recommended depth 4 / MEDIUM
-```
-
-The 16 total retained samples still include older diagnostic history, but only the validated pipeline evidence/streak drives depth recommendations.
-
-A clean pipeline sample requires:
+Clean criteria:
 
 ```text
 order correct
@@ -66,81 +80,81 @@ Depth ladder:
 8+ consecutive clean  -> depth 8 / HIGH
 ```
 
-## Persistent multi-target admission simulation
+The persistent simulator may use these caps. Real multi-target execution must remain more conservative until its own timing behavior is proven.
 
-`hacking/multi-target-sim.js` remains planning-only and launches no workers. It now enforces Port 19 `recommendedDepth` as a **hard per-target simulated admission cap**.
+## First real multi-target prototype
+
+New managed script:
+
+```text
+hacking/multi-target-runner.js
+```
 
 Current model:
 
 ```text
-MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED
+MULTI_TARGET_EXECUTOR_V1_CONSERVATIVE
 ```
 
-Important behavior:
+This is a finite manual-test executor, not controller-integrated production. Safety posture:
 
-- unprepared targets remain `WAITING_PREP`;
-- prepared targets with no trusted pipeline evidence are capped at depth 1;
-- proven targets can earn depth 2/4/8 according to Port 19;
-- when a target reaches its evidence cap it reports `AT_SAFETY_CAP`;
-- if a recommendation falls below current virtual depth, existing virtual batches are not killed; new admissions stop until depth naturally falls below the cap;
-- the shared global host/time RAM reservation calendar and objective/fairness scoring remain unchanged;
-- Port 17 now exposes `safetyDepthCap`, `safetyConfidence`, pipeline evidence count, clean streak, and Port 19 collector status for each target.
+```text
+global live depth 2
+per-target live depth 1
+2 distinct prepared targets
+shared global host/time RAM reservation calendar
+JIT H/W/G/W dispatch
+one global Port 14 consumer/router keyed by batchId
+Port 15 completion publication
+no dynamic Port 19 live-depth promotion
+```
 
-This is still simulation only; Port 19 does not yet authorize high live multi-target depth.
+It refuses to start while the single-target pipeline runner, serialized batch runner, or persistent multi-target simulator is active.
 
-## Real pipeline launch-race note
-
-One earlier manual depth-2 run safety-stopped because `ns.exec` failed on `blade`. Subsequent depth-2 runs completed cleanly, including the validated 6216 ms run above, so the failure is currently **not reproducible**. Do not add blind launch retries that could violate future host/time reservations. Revisit only if the failure recurs with repeatable host/RAM evidence.
+Important: the earlier one-off `ns.exec failed on blade` single-target pipeline failure has not reproduced in subsequent runs. Do not add blind launch retries; revisit only if launch failure becomes repeatable with host/RAM evidence.
 
 ## Runtime batching / scheduler state
 
 - Port 12: serialized batch snapshot.
-- Port 14: live batch timing-event queue.
-- Port 15: latest completed serialized/pipeline batch.
-- Port 16: current single-target pipeline planner/simulator/executor.
-- Port 17: one-shot or persistent global multi-target planner/simulator.
+- Port 14: live batch timing-event queue; exactly one real coordinator owns it.
+- Port 15: latest completed batch.
+- Port 16: single-target pipeline planner/simulator/executor.
+- Port 17: global multi-target planner/simulator/executor state.
 - Port 18: dedicated prepper/reserved-host state.
 - Port 19: rolling per-target real batch safety history.
 
-The current real PIPELINE executor still owns Port 14 while active. Multi-target planning and the Port 19 collector do not consume Port 14.
-
 ## Current important limitations
 
-- Live PIPELINE depth is still fixed at 2.
-- Multi-target work is still simulation/planning only; no real multi-target worker launches yet.
-- Port 19 depth evidence is intentionally conservative and only real pipeline completions promote it.
-- XP scoring is still a proxy, not exact Formula-based hacking XP.
+- Controller PIPELINE is still single-target and fixed depth 2.
+- New multi-target runner is manual and finite only.
+- Real multi-target depth is intentionally fixed to global 2 / per-target 1.
+- XP scoring remains a proxy, not exact Formula-based hacking XP.
 - Automatic worker watchdog termination remains deferred.
-- Prepper, Port 17, and Port 19 state are not yet surfaced in the GUI.
+- Prepper, Port 17, and Port 19 are not yet surfaced in the GUI.
+- Multi-target launch/recovery behavior has not yet been runtime validated.
 
 ## Immediate next development sequence
 
 ```text
 1. Pull latest main
-2. Run persistent MONEY simulation and verify phantasy is capped at depth 4 while unproven targets remain depth 1
-3. Verify AT_SAFETY_CAP appears and replacement admissions respect caps over time
-4. Compare BALANCED and XP under the same evidence caps
-5. Finish continuous PIPELINE + PIPELINE→STANDBY drain validation
-6. First real multi-target test with conservative global live depth 2 / per-target depth 1
-7. Evolve real executor toward dynamic per-target depth only after clean timing evidence
-8. Keep automatic worker killing deferred until multi-target timing is stable
+2. Run mem-audit; expect 53 managed JS files, 41 runnable scripts, 12 modules, 0 unmanaged
+3. Ensure multi-target simulator and single-target pipeline runner are stopped
+4. Run first real conservative MONEY multi-target test
+5. Verify two distinct prepared targets each complete one clean HWGW batch with correct Port 14 routing
+6. If clean, repeat several finite waves before any controller integration
+7. Add target-local failure/recovery policy before continuous real multi-target admission
+8. Only then consider controller integration and later evidence-gated dynamic real depth
+9. Keep automatic worker killing deferred until multi-target timing is stable
 ```
 
 ## Useful commands
 
 ```text
+run gitpull.js
 run startup.js
 run diagnostics/mem-audit.js
 ps home
 run hacking/multi-target-sim.js money 4 0.10 200 64
-run hacking/multi-target-sim.js balanced 4 0.10 200 64
-run hacking/multi-target-sim.js xp 4 0.10 200 64
+run hacking/multi-target-runner.js money 4 0.10 200
 run hacking/pipeline-runner.js phantasy 0.10 200 2
-```
-
-For updates:
-
-```text
-run gitpull.js
-run startup.js
 ```
