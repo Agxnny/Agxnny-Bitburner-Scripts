@@ -11,6 +11,7 @@
     "hacking/batch-history.js",
     "hacking/multi-target-scheduler.js",
     "hacking/multi-target-sim.js",
+    "hacking/multi-target-runner.js",
     "hacking/pipeline-runner.js",
     "hacking/prepper.js",
     "hacking/economy-planner.js",
