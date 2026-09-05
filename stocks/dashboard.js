@@ -1,8 +1,12 @@
 import { latestStockGap, readStockHistory, readStockMarketState, stockSeries, stockSeriesStats } from "/lib/stock-history.js";
+import { readTraderConfig, writeTraderConfig } from "/lib/stock-trader-config.js";
 import { buildCandles, filterSeriesByRange } from "/stocks/candles.js";
+import { TraderControls } from "/stocks/trader-controls.js";
 import { stockStyles as s } from "/stocks/styles.js";
 
 const KEEPER = "/stocks/history-keeper.js";
+const TRADER = "/stocks/pre4s-trader.js";
+const TRADER_STATE_FILE = "/data/pre4s-trader-state.txt";
 const REFRESH_MS = 250;
 const FOUR_S_GOAL = 25e9;
 const CANDLE_VIEWS = [
@@ -13,28 +17,42 @@ const CANDLE_VIEWS = [
     { label: "4h", lookbackMs: 14_400_000, candleMs: 120_000 },
 ];
 const HISTORY_RANGES = [["15m", 900000], ["1h", 3600000], ["3h", 10800000], ["6h", 21600000], ["12h", 43200000], ["24h", 86400000], ["ALL", 0]];
-let cache = { history: null, market: null, keeperRunning: false, updatedAt: 0 };
+let cache = { history: null, market: null, traderConfig: null, traderState: null, keeperRunning: false, traderRunning: false, updatedAt: 0 };
+let pendingTraderConfig = null;
 let version = 0;
 
-/** Separate read-only React dashboard for stock history and portfolio. @param {NS} ns */
+/** Separate React dashboard for stock history, portfolio and pre-4S controls. @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
     if (ns.getHostname() !== "home") return;
     if (!ns.scriptRunning(KEEPER, "home")) ns.run(KEEPER, 1, "--quiet");
     ns.ui.openTail();
     ns.ui.setTailTitle("Agxnny Stocks · Market Lab");
-    ns.ui.resizeTail(1120, 760);
+    ns.ui.resizeTail(1120, 800);
     refresh(ns);
     ns.clearLog();
     ns.printRaw(el(App));
     while (true) {
+        if (pendingTraderConfig) {
+            const request = pendingTraderConfig;
+            pendingTraderConfig = null;
+            await writeTraderConfig(ns, request);
+        }
         refresh(ns);
         await ns.sleep(REFRESH_MS);
     }
 }
 
 function refresh(ns) {
-    cache = { history: readStockHistory(ns), market: readStockMarketState(ns), keeperRunning: ns.scriptRunning(KEEPER, "home"), updatedAt: Date.now() };
+    cache = {
+        history: readStockHistory(ns),
+        market: readStockMarketState(ns),
+        traderConfig: readTraderConfig(ns),
+        traderState: readJson(ns, TRADER_STATE_FILE),
+        keeperRunning: ns.scriptRunning(KEEPER, "home"),
+        traderRunning: ns.scriptRunning(TRADER, "home"),
+        updatedAt: Date.now(),
+    };
     version += 1;
 }
 
@@ -53,10 +71,11 @@ function App() {
     const active = symbols.some((row) => row.symbol === selected) ? selected : symbols[0]?.symbol ?? "";
     return el("div", { style: s.app },
         header(market), hero(market),
+        el(TraderControls, { config: cache.traderConfig, traderState: cache.traderState, traderRunning: cache.traderRunning, onSave: queueTraderConfig }),
         el("div", { style: s.grid }, chartCard(active, symbols, setSelected, view, setView, candleView, setCandleView, range, setRange), portfolioCard(market)),
         marketTable(symbols, active, setSelected),
         el("div", { style: s.footer },
-            el("span", null, "MARKET LAB · observation only · no trading"),
+            el("span", null, `MARKET LAB · ${cache.traderRunning ? "pre-4S trader live" : "trader stopped"}`),
             el("span", null, `History ${sampleAge(cache.history?.updatedAt)} · ${Number(cache.history?.timestamps?.length ?? 0)} samples · ${cache.history?.retention ?? "ALL"}`),
         ),
     );
@@ -69,14 +88,14 @@ function header(market) {
         el("div", null,
             el("div", { style: s.eyebrow }, "AGXNNY STOCK RESEARCH"),
             el("div", { style: s.title }, "Market Lab"),
-            el("div", { style: s.subtitle }, "Fast TIX observation · scaled OHLC windows · full-history line view · wall-clock continuity"),
+            el("div", { style: s.subtitle }, "Fast TIX observation · pre-4S signal trading · scaled OHLC windows · full-history line view"),
         ),
         el("div", { style: s.badges },
             badge(cache.keeperRunning ? "RECORDER ONLINE" : "RECORDER OFFLINE", cache.keeperRunning ? "good" : "warn"),
             badge(access.tix ? "TIX API" : "NO TIX", access.tix ? "accent" : "warn"),
             badge(access.fourSApi ? "4S API" : "PRE-4S", access.fourSApi ? "good" : "warn"),
             gap ? badge(`LAST GAP ${duration(gap.durationMs)}`, "warn") : badge("CONTINUOUS", "good"),
-            badge("TRADING OFF", "accent"),
+            badge(cache.traderRunning ? "TRADING LIVE" : "TRADING OFF", cache.traderRunning ? "good" : "accent"),
         ),
     );
 }
@@ -233,7 +252,7 @@ function portfolioCard(market) {
         rows.length ? el("div", { style: s.table },
             el("div", { style: { ...s.row, ...s.rowHead } }, el("span", null, "Symbol"), el("span", { style: s.right }, "Side"), el("span", { style: s.right }, "Shares"), el("span", { style: s.right }, "Value"), el("span", { style: s.right }, "P&L")),
             ...rows.map(portfolioRow),
-        ) : el("div", { style: s.note }, "No stock positions are open. This dashboard is observation-only and will not place trades."),
+        ) : el("div", { style: s.note }, "No stock positions are open."),
         el("div", { style: s.stats }, stat("Long P&L", signedMoney(pnl.long)), stat("Short P&L", signedMoney(pnl.short)), stat("Gross exposure", money(market.portfolio?.grossExposure)), stat("Open positions", rows.length)),
     );
 }
@@ -268,6 +287,11 @@ function marketTable(symbols, active, setSelected) {
     );
 }
 
+function queueTraderConfig(config) { pendingTraderConfig = config; }
+function readJson(ns, file) {
+    if (!ns.fileExists(file, "home")) return null;
+    try { return JSON.parse(String(ns.read(file) || "null")); } catch { return null; }
+}
 function portfolioPnl(rows) {
     let long = 0, short = 0;
     for (const row of rows) {
