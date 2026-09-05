@@ -23,6 +23,7 @@
 | 15 | Latest completed batch | Latest-value snapshot |
 | 16 | Single-target pipeline planner/simulation/executor | Latest-value snapshot |
 | 17 | Global multi-target allocation planner | Latest-value snapshot |
+| 18 | Dedicated prepper / reserved-host state | Latest-value snapshot |
 
 ## Port 1 — controller state
 
@@ -32,9 +33,9 @@ Current execution modes:
 STANDBY | HGW | BATCH | PIPELINE
 ```
 
-Important `executionMode` fields include mode/pending/transition state, serialized and pipeline runner state, pipeline max depth/safety stop, review state, and `lastMessage`. Startup initializes the controller in `STANDBY`.
+Important `executionMode` fields include mode/pending/transition state, serialized and pipeline runner state, pipeline max depth/safety stop, review state, and `lastMessage`. Startup initializes the production controller in `STANDBY`.
 
-Standalone/prep H/G/W allocations continue to publish PID, host, threads, action, target, start time, expected duration, and expected finish time. GUI `LATE` labels remain presentation-only.
+The background prepper is independent of the production mode. Therefore STANDBY may still show grow/weaken work on the dedicated reserved prep host.
 
 ## Port 13 — controller requests
 
@@ -50,9 +51,9 @@ Mode changes wait for a safe boundary. For PIPELINE, later wave admission stops 
 
 ## Port 14 — batch timing event queue
 
-Workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error. Serialized BATCH and live PIPELINE remain mutually exclusive. The current real pipeline coordinator owns and routes Port 14 by `batchId` while active.
+Workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error. Serialized BATCH and live PIPELINE remain mutually exclusive. The real pipeline coordinator owns and routes Port 14 by `batchId` while active.
 
-The multi-target allocator on Port 17 is dry-run only and does **not** consume Port 14.
+Neither the Port 17 multi-target dry-run allocator nor the Port 18 prepper consumes Port 14. Prepper workers are launched without batch timing arguments.
 
 ## Port 15 — latest completed batch
 
@@ -68,8 +69,6 @@ PIPELINE_ADMISSION_SIM_V3_DEPTH2
 PIPELINE_EXECUTOR_DEPTH2_V2
 ```
 
-The real executor publishes continuous/controller-managed flags, target, status/reason, completed and in-flight batches, stage gap, batch interval, recent events, safety state, and drain state.
-
 ## Port 17 — global multi-target allocation planner
 
 Published by `hacking/multi-target-scheduler.js` with model:
@@ -78,32 +77,36 @@ Published by `hacking/multi-target-scheduler.js` with model:
 MULTI_TARGET_ALLOCATOR_DRY_RUN_V1
 ```
 
-Key fields:
+It is planning-only and reports dynamic per-target batch allocation, profile scoring, shared host/time reservations, and host peak use.
+
+## Port 18 — dedicated prepper / reserved-host state
+
+Published by `hacking/prepper.js` with model:
 
 ```text
-version: 1
-dryRun: true
-launchesWorkers: false
-profile: money | balanced | xp
-targetCount
-requestedHackFraction
-stageGapMs
-globalLandingGapMs
+DEDICATED_TARGET_PREPPER_V1
+```
+
+Important fields:
+
+```text
+enabled
+reservedHost
 status
 reason
-capacity
-objective
-targets[]
-allocations[]
-hostPeak[]
+targetCount
+preparedCount
+completedWaves
+currentTarget
+currentAction
+requestedThreads
+launchedThreads
+pid
+startedAt
 updatedAt
 ```
 
-Each `targets[]` entry reports its HWGW thread template, batch RAM/RAM-time, expected cash, money efficiency, XP-proxy efficiency, base score, assigned virtual batch count, allocation share, and whether the target is currently prepared.
-
-`assignedBatches` is intentionally dynamic rather than a fixed per-target depth. `allocations[]` records the virtual global admission order and exact host/stage/thread reservations for inspection.
-
-The current XP metric is explicitly a proxy (`ACTION_THREAD_DIFFICULTY_PROXY_PER_RAM_SECOND`) and must not be treated as exact Bitburner XP.
+`lib/execution.js` treats a Port 18 reservation as active only while the heartbeat is fresh (currently 5 seconds). A fresh `reservedHost` is excluded from the normal remote execution pool so production HGW/BATCH/PIPELINE/multi-target planning cannot allocate new work to it. If the prepper stops and Port 18 becomes stale, the host automatically returns to the production pool.
 
 ## GUI rule
 
