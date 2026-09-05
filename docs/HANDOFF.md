@@ -32,25 +32,42 @@ while rolling admissions progressed from 6 admitted / 0 completed to 8 admitted 
 
 Controller-managed PIPELINE -> STANDBY drain is runtime-validated: the pipeline runner remained alive while the admitted wave drained, then exited while dashboard, prepper, history collector, and controller stayed running.
 
-Latest memory audit is clean:
+Latest memory audit after adding the live multi-target runner is clean:
 
 ```text
-52 installed managed JS files
-40 runnable scripts
+53 installed managed JS files
+41 runnable scripts
 12 library modules
 0 unmanaged installed .js files
 ```
 
-Largest scripts before adding the live multi-target prototype were:
+Largest runnable scripts now include:
 
 ```text
+11.80 GB hacking/multi-target-runner.js
 10.65 GB hacking/pipeline-runner.js
  9.70 GB hacking/batch-runner.js
  8.90 GB hacking/multi-target-sim.js
  8.85 GB hacking/multi-target-scheduler.js
 ```
 
-Run a fresh audit after pulling the new prototype because the managed file count should increase by one.
+First real conservative multi-target execution is runtime-validated. Command:
+
+```text
+run hacking/multi-target-runner.js money 4 0.10 200
+```
+
+Observed admissions and completions:
+
+```text
+ADMIT phantasy  | multi-phantasy-1
+ADMIT joesguns  | multi-joesguns-2
+COMPLETE joesguns | money 100.00% | sec +0.000 | ORDER OK
+COMPLETE phantasy | money 100.00% | sec +0.000 | ORDER OK
+COMPLETE | completed 2/2
+```
+
+This validates one global coordinator executing two distinct targets concurrently at global live depth 2 / per-target depth 1, with clean final recovery and correct cross-target timing order.
 
 ## Rolling real batch safety history
 
@@ -80,11 +97,11 @@ Depth ladder:
 8+ consecutive clean  -> depth 8 / HIGH
 ```
 
-The persistent simulator may use these caps. Real multi-target execution must remain more conservative until its own timing behavior is proven.
+The persistent simulator may use these caps. Real multi-target execution must remain more conservative until repeated live timing behavior is proven.
 
 ## First real multi-target prototype
 
-New managed script:
+Managed script:
 
 ```text
 hacking/multi-target-runner.js
@@ -126,25 +143,25 @@ Important: the earlier one-off `ns.exec failed on blade` single-target pipeline 
 ## Current important limitations
 
 - Controller PIPELINE is still single-target and fixed depth 2.
-- New multi-target runner is manual and finite only.
+- Multi-target runner is manual and finite only.
 - Real multi-target depth is intentionally fixed to global 2 / per-target 1.
+- First live multi-target wave is clean, but repeated-wave reliability is not yet established.
+- Target-local failure/recovery policy is not yet implemented for continuous multi-target execution.
 - XP scoring remains a proxy, not exact Formula-based hacking XP.
 - Automatic worker watchdog termination remains deferred.
 - Prepper, Port 17, and Port 19 are not yet surfaced in the GUI.
-- Multi-target launch/recovery behavior has not yet been runtime validated.
 
 ## Immediate next development sequence
 
 ```text
-1. Pull latest main
-2. Run mem-audit; expect 53 managed JS files, 41 runnable scripts, 12 modules, 0 unmanaged
-3. Ensure multi-target simulator and single-target pipeline runner are stopped
-4. Run first real conservative MONEY multi-target test
-5. Verify two distinct prepared targets each complete one clean HWGW batch with correct Port 14 routing
-6. If clean, repeat several finite waves before any controller integration
-7. Add target-local failure/recovery policy before continuous real multi-target admission
-8. Only then consider controller integration and later evidence-gated dynamic real depth
-9. Keep automatic worker killing deferred until multi-target timing is stable
+1. Repeat several finite real MONEY multi-target waves at global depth 2 / per-target depth 1
+2. Confirm both targets continue to finish with 100% money, min security, correct order, zero missing timing jobs, and acceptable landing drift/spacing
+3. Compare finite BALANCED and XP selection under the same live safety caps
+4. Add target-local failure/recovery policy before continuous real multi-target admission
+5. Add continuous rolling multi-target admission while keeping global live depth 2 / per-target depth 1
+6. Only after repeated clean evidence, integrate with controller
+7. Later evolve toward evidence-gated dynamic per-target depth
+8. Keep automatic worker killing deferred until multi-target timing is stable
 ```
 
 ## Useful commands
@@ -156,5 +173,7 @@ run diagnostics/mem-audit.js
 ps home
 run hacking/multi-target-sim.js money 4 0.10 200 64
 run hacking/multi-target-runner.js money 4 0.10 200
+run hacking/multi-target-runner.js balanced 4 0.10 200
+run hacking/multi-target-runner.js xp 4 0.10 200
 run hacking/pipeline-runner.js phantasy 0.10 200 2
 ```
