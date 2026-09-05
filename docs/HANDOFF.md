@@ -41,7 +41,7 @@ Latest pre-GUI memory audit after adding the live multi-target runner was clean:
 0 unmanaged installed .js files
 ```
 
-A fresh audit is required after pulling the GUI integration because `ui/dashboard.js` now imports Port 17 state and may have a higher RAM cost.
+A fresh audit is required after pulling the GUI integration because `ui/dashboard.js` now imports Port 17 state and has additional multi-target UI logic.
 
 ## Real multi-target validation
 
@@ -98,13 +98,18 @@ no dynamic same-target overlap yet
 
 The runner refuses to launch if the controller is not fully settled in STANDBY, if controller workers are still active, or if conflicting batch/pipeline/simulator coordinators are running.
 
-The landing summary now publishes aggregate `expectedJobs`, `reportedJobs`, `missingJobs`, and `totalMissingJobs`, so Port 19 missing-job safety checks have an explicit aggregate field.
+The landing summary publishes aggregate `expectedJobs`, `reportedJobs`, `missingJobs`, and `totalMissingJobs`, so Port 19 missing-job safety checks have an explicit aggregate field.
 
-## Main GUI multi-target controls
+## Main GUI multi-target controls and activity
 
-`ui/dashboard.js` now reads Port 17 and exposes a compact **Multi-target finite wave** control card in the **Batch** tab.
+`ui/dashboard.js` reads Port 17 and exposes two multi-target cards in the **Batch** tab:
 
-Controls:
+```text
+Multi-target finite wave
+Multi-target activity
+```
+
+The finite-wave control card provides:
 
 ```text
 Profile: MONEY / BALANCED / XP
@@ -117,9 +122,21 @@ Run finite wave
 
 `Live batches` means distinct-target global concurrency. Same-target overlap remains locked at depth 1. The Run button is disabled unless the production controller is fully in STANDBY with no active controller jobs.
 
-React callbacks remain Netscript-free: they only write plain-JS request state. The async dashboard loop validates the request and calls `ns.run()`.
+The new activity card shows current executor profile/run ID, active-target count, completed count, and one row per active target with:
 
-Port 17 state is displayed in the Batch tab and the header shows a MULTI badge while a fresh executor state is active.
+```text
+target
+ACTIVE status
+H landing countdown
+W2 landing countdown
+launched stage list
+```
+
+Completed target timing rows are available under an expandable section and show recovery health, money/security, max landing drift, minimum spacing, and order status.
+
+All dashboard content cards are now collapsible. The four compact hero metric cards are also collapsible. Collapse state is React-local UI state only; no Netscript work occurs inside card-toggle callbacks.
+
+React callbacks remain Netscript-free: they only update local/plain-JS request state. The async dashboard loop validates actions and performs Netscript I/O or `ns.run()` calls.
 
 ## Rolling real batch safety history
 
@@ -167,6 +184,7 @@ The persistent simulator may use these caps. The real multi-target executor stil
 - Multi-target runner is GUI-launchable but still finite/manual-test execution, not controller-integrated production.
 - Per-target real multi-target depth is intentionally fixed at 1.
 - Larger GUI tests increase the number of distinct concurrent targets, not same-target pipeline depth.
+- Active multi-target timing card currently shows first H and final W2 landing countdowns plus launched-stage progress; full four-stage per-target live timing bars are not yet published on Port 17.
 - Target-local failure/recovery policy is not yet implemented for continuous multi-target execution.
 - XP scoring remains a proxy, not exact Formula-based hacking XP.
 - Automatic worker watchdog termination remains deferred.
@@ -175,11 +193,11 @@ The persistent simulator may use these caps. The real multi-target executor stil
 ## Immediate next development sequence
 
 ```text
-1. Pull latest main and restart startup so the new dashboard is live
-2. Run a fresh mem-audit and record the new dashboard/runner RAM costs
-3. In Batch tab, keep controller in STANDBY and test MONEY with 3 distinct live batches
-4. If clean, try 4 distinct live batches, then increase gradually rather than jumping directly to 12
-5. Record exactly which targets were admitted and each completion/recovery result
+1. Pull latest main and restart startup so the collapsible dashboard/activity card is live
+2. Run a fresh mem-audit and record the new dashboard RAM cost
+3. Finish the currently running MONEY multi-target test and record admitted targets/results
+4. In Batch tab, test MONEY with 3 distinct live batches and inspect the new activity rows/timing countdowns
+5. If clean, try 4 distinct live batches, then increase gradually rather than jumping directly to 12
 6. Compare BALANCED and XP target selection at the same safe distinct-target depth
 7. Add target-local failure/recovery policy before any continuous multi-target admission
 8. Only after repeated clean evidence consider same-target overlap/dynamic per-target live depth
