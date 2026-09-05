@@ -22,7 +22,7 @@ export function validationView(s) {
             ),
             el("div", { style: styles.goalStatus }, status("validationStatus")),
             note(controllerMode === "STANDBY" && !controllerPending
-                ? "Mixed validates every currently prepared VALIDATE2 target sequentially. A specific target runs only that target."
+                ? "MIXED validates prepared VALIDATE2 targets. ALL PREPARED also includes DEPTH1 targets and uses the dedicated validator as the qualification test. Dashboard launches are quiet; results stay in this tab."
                 : `Validation launch locked until controller is fully STANDBY · current ${controllerPending ? `${controllerMode} → ${controllerPending}` : controllerMode}`),
         ), true),
         liveOverview(state),
@@ -39,8 +39,9 @@ function targetSelect(s) {
         onChange: (event) => setField("validationTarget", event.target.value),
         style: styles.input,
     },
-        el("option", { value: "mixed" }, "MIXED · all VALIDATE2"),
-        ...rankings.slice(0, 24).map((entry) => el("option", { key: entry.hostname, value: entry.hostname }, entry.hostname)),
+        el("option", { value: "mixed" }, "MIXED · prepared VALIDATE2 only"),
+        el("option", { value: "all" }, "ALL PREPARED · includes DEPTH1"),
+        ...rankings.map((entry) => el("option", { key: entry.hostname, value: entry.hostname }, entry.hostname)),
     );
 }
 
@@ -74,6 +75,7 @@ function liveOverview(state) {
             kv("Clean this run", Number(state.cleanWaves ?? 0)),
             kv("Telemetry", fresh ? badge("LIVE", "good") : badge("STALE", "warn")),
             state.mixed ? kv("Mixed progress", `${Number(state.mixedIndex ?? 0)}/${Number(state.mixedTotal ?? 0)}`) : null,
+            state.mixedScope ? kv("Scope", String(state.mixedScope).toUpperCase()) : null,
             note(state.reason ?? "Waiting for validation activity"),
         )),
         card("Progress", el("div", null,
@@ -99,7 +101,7 @@ function landingStream(state) {
                 el("div", { style: styles.statValue }, stage.actualLandingAt ? `✓ ${signedMs(Number(stage.actualLandingAt) - Number(stage.landingAt))}` : stage.launched ? "IN FLIGHT" : "WAITING"),
                 el("div", { style: styles.dimText }, `${stage.events ?? 0}/${stage.jobs ?? 0} jobs`),
             ))),
-        )) : note("No active validation batches. Start a target or Mixed validation above."),
+        )) : note("No active validation batches. Start a target, Mixed, or All Prepared validation above."),
     ), true);
 }
 
@@ -118,7 +120,7 @@ function evidenceTable(rows) {
 
 function targetRows(s) {
     const rankings = Array.isArray(s.planner?.rankings) ? s.planner.rankings : [];
-    return rankings.slice(0, 16).map((entry) => {
+    return rankings.map((entry) => {
         const policy = targetOverlapPolicy(s.batchHistory, entry.hostname, s.overlapEvidence);
         const durable = s.overlapEvidence?.targets?.[entry.hostname] ?? {};
         const state = policy.provenDepth >= 2 ? "PROVEN2" : policy.eligibleForValidation ? "VALIDATE2" : "DEPTH1";
@@ -129,7 +131,7 @@ function toneStyle(value) {
     const text = String(value ?? "").toUpperCase();
     if (text.includes("FAILED") || text.includes("ABORT")) return styles.badText;
     if (text.includes("PROVEN") || text.includes("CLEAN") || text.includes("COMPLETE")) return styles.goodText;
-    if (text.includes("RUN") || text.includes("START") || text.includes("VALIDATE") || text.includes("MIXED")) return styles.warnText;
+    if (text.includes("RUN") || text.includes("START") || text.includes("VALIDATE") || text.includes("MIXED") || text.includes("ALL")) return styles.warnText;
     return styles.dimText;
 }
 function fmtMs(value) { const n = Number(value); return Number.isFinite(n) && n > 0 ? `${n.toFixed(0)}ms` : "—"; }
