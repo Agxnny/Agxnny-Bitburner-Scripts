@@ -57,6 +57,7 @@ Per-target real MULTI overlap remains hard-capped at 1. Port 19 same-target hist
 hacking/prepper.js
 model: DISTRIBUTED_TARGET_PREPPER_V2
 state: Port 18
+policy: GROW_THEN_WEAKEN
 ```
 
 V2 periodically scans the full eligible target universe through shared target logic, reserves a bounded slice of remote RAM across multiple hosts, and prepares different targets concurrently.
@@ -72,9 +73,11 @@ money ready threshold: >=99.5%
 security ready threshold: <= min +0.05
 ```
 
+Prep ordering is now deliberately money-first. If a target is below the money threshold, the prepper spends its assigned host on GROW even if security is high. Once money reaches the ready threshold, it switches that target to WEAKEN until security is within tolerance. This is intended to rush low-money servers toward usable economic state instead of spending early cycles cleaning security that subsequent grows would raise again.
+
 Production excludes all fresh Port 18 `reservedHosts[]` entries through `lib/execution.js`. Existing production work on a newly selected prep host drains naturally before prep uses it.
 
-Port 18 publishes aggregate prep state plus `prepTargets[]` entries containing hostname, current/max money, money ratio, security delta, action, active host, and advisory ETA.
+Port 18 publishes aggregate prep state plus `prepTargets[]` entries containing hostname, current/max money, money ratio, security delta, action, active host, and advisory ETA. Port 18 also publishes `policy: GROW_THEN_WEAKEN`.
 
 ## Modular dashboard refactor
 
@@ -122,7 +125,7 @@ Feature parity retained:
 
 ### New Targets prep-progress card
 
-The Targets tab now contains `Servers below max money` using Port 18 prep telemetry. It shows:
+The Targets tab contains `Servers below max money` using Port 18 prep telemetry. It shows:
 
 ```text
 SERVER
@@ -134,7 +137,7 @@ HOST / SEC   active reserved host or security delta
 
 The card also shows prepared count, below-max count, active prep count, reserved prep RAM, and reserved host count.
 
-Important: the ETA is advisory. It is estimated from current grow/weaken timing, queue position, and reserved prep-host capacity; target state can change before completion.
+Important: the ETA is advisory. It is estimated from current grow/weaken timing, queue position, and reserved prep-host capacity; target state can change before completion. The estimator now follows the grow-first ordering and includes a projected weaken phase after the remaining grow work.
 
 ## GUI runtime model that must not regress
 
@@ -186,28 +189,24 @@ See `docs/RUNTIME_STATE.md` for the current contract.
 
 ## Immediate validation sequence
 
-The modular dashboard code is committed but still requires live Bitburner validation.
+The modular dashboard is live-validated for startup/rendering and the Targets prep card is displaying fresh Port 18 state.
 
 ```text
-1. run gitpull.js
-2. stop/restart ui/dashboard.js or run startup.js so all imported UI modules reload
-3. run diagnostics/mem-audit.js
-4. verify there are no unmanaged .js files
-5. rapidly switch all six tabs repeatedly; dashboard must remain alive
-6. collapse/reopen cards and hero metrics across tabs
-7. test Standby/HGW/Batch/Pipeline mode buttons without running risky work unnecessarily
-8. open Targets and verify the Servers below max money card receives fresh Port 18 state
-9. confirm money %, prep state, ETA, and active host/security values update over time
-10. test MULTI form editing and finite/controller buttons while respecting STANDBY safety gates
-11. inspect ps home if the dashboard exits or tab switching becomes sticky
+1. pull main and restart startup/prepper so GROW_THEN_WEAKEN policy is live
+2. rapidly switch all six tabs repeatedly; dashboard must remain alive
+3. watch Targets -> Servers below max money
+4. confirm low-money targets prefer GROW even when security is elevated
+5. confirm each target switches to WEAKEN only after money reaches >=99.5%
+6. confirm prepared count rises after the weaken cleanup phase
+7. inspect ps home / ps <prep-host> if a target appears stuck
 ```
 
 Because the new `ui/*` support files are ordinary `.js` files outside `lib/`, the current `diagnostics/mem-audit.js` labels them as `script` even though they are imported modules. That audit classification is cosmetic; the important checks are managed/unmanaged status and dashboard RAM.
 
-## Next development sequence after GUI validation
+## Next development sequence after prep validation
 
 ```text
-1. Let prepper V2 raise prepared-target count above five.
+1. Let prepper V2 raise prepared-target count above five under grow-first policy.
 2. Re-run stress test through depth 6; depth 5 is already proven.
 3. Improve stress BLOCKED behavior so it observes Port 18 readiness instead of relaunching a blocked runner every 10 seconds.
 4. Persist/consume proven global stress depth as an evidence ceiling for production MULTI, never as a forced depth.
