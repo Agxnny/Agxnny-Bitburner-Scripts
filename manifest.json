@@ -28,6 +28,7 @@
     "hacking/workers/weaken.js",
     "lib/batch-allocation.js",
     "lib/batch-history.js",
+    "lib/multi-stress-evidence.js",
     "lib/deployment.js",
     "lib/execution.js",
     "lib/network.js",
