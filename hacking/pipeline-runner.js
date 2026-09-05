@@ -28,18 +28,18 @@ const BATCH_RUNNER_SCRIPT = "/hacking/batch-runner.js";
 const EXPECTED_STAGE_ORDER = Object.freeze(["HACK", "WEAKEN_HACK", "GROW", "WEAKEN_GROW"]);
 
 /**
- * Opt-in first executable pipeline test.
+ * Real depth-2 HWGW pipeline executor.
  *
- * This runner is intentionally NOT controller-integrated. The controller must be
- * parked in manual PREP/HOLD on the same target before this script will start.
- * It executes at most two real batches at once, owns Port 14 while running, and
- * stops admitting new waves on any launch/timing/recovery failure.
- *
- * Usage:
- *   run hacking/pipeline-runner.js <target> [hackFraction] [stageGapMs] [batchCount]
- *
- * Recommended first test:
+ * Manual finite test:
  *   run hacking/pipeline-runner.js phantasy 0.10 200 2
+ *
+ * Controller-managed continuous execution:
+ *   run hacking/pipeline-runner.js phantasy 0.10 200 continuous --quiet
+ *
+ * The hard live depth remains 2. In continuous mode the runner admits depth-2
+ * waves until the controller requests another execution mode or a safety check
+ * fails. Mode changes stop new admissions, allow the current admitted wave to
+ * drain, then exit so the controller can finish the transition safely.
  *
  * @param {NS} ns
  */
@@ -49,11 +49,13 @@ export async function main(ns) {
     const target = String(args[0] ?? "");
     const hackFraction = clamp(Number(args[1] ?? DEFAULT_HACK_FRACTION), 0.001, 0.90);
     const requestedGapMs = Math.max(MIN_STAGE_GAP_MS, Math.floor(Number(args[2] ?? DEFAULT_STAGE_GAP_MS)));
-    const requestedBatches = clampInt(Number(args[3] ?? DEFAULT_BATCH_COUNT), 1, 20);
+    const runArg = String(args[3] ?? DEFAULT_BATCH_COUNT).trim().toLowerCase();
+    const continuous = runArg === "continuous" || runArg === "auto";
+    const requestedBatches = continuous ? 0 : clampInt(Number(args[3] ?? DEFAULT_BATCH_COUNT), 1, 20);
     const quiet = isQuiet(ns);
 
     if (!target) {
-        if (!quiet) ns.tprint("Usage: run hacking/pipeline-runner.js <target> [hackFraction] [stageGapMs] [batchCount]");
+        if (!quiet) ns.tprint("Usage: run hacking/pipeline-runner.js <target> [hackFraction] [stageGapMs] [batchCount|continuous]");
         return;
     }
 
@@ -61,12 +63,14 @@ export async function main(ns) {
     if (!preflight.ok) {
         if (!quiet) {
             ns.tprint(`[PIPELINE-REAL] BLOCKED: ${preflight.reason}`);
-            ns.tprint("[PIPELINE-REAL] Park the controller with Prep target to 100%, wait for PREPARED HOLD, then retry.");
+            ns.tprint("[PIPELINE-REAL] Use controller PIPELINE mode or park the target in PREPARED HOLD before a manual test.");
         }
         publishRunnerState(ns, {
             target,
             status: "BLOCKED",
             reason: preflight.reason,
+            continuous,
+            controllerManaged: preflight.controllerManaged,
             requestedBatches,
             completedBatches: 0,
             inFlight: [],
@@ -77,8 +81,8 @@ export async function main(ns) {
 
     if (!quiet && preflight.note) ns.tprint(`[PIPELINE-REAL] PREFLIGHT: ${preflight.note}`);
 
-    // This runner is the only real batch coordinator allowed by preflight.
-    // Clear the old serialized queue once, then own/reroute every new event by batchId.
+    // One real coordinator owns Port 14 during pipeline execution. Clearing once
+    // here is safe because preflight proves no serialized batch coordinator is alive.
     ns.getPortHandle(RuntimePort.BATCH_TIMING_EVENTS).clear();
 
     const events = [];
@@ -87,13 +91,15 @@ export async function main(ns) {
     let wave = 0;
     let safetyStopped = false;
     let safetyReason = "";
+    let drainRequested = false;
 
-    pushEvent(events, "START", `Real pipeline test started on ${target}; depth cap ${MAX_DEPTH}, requested ${requestedBatches} batch(es)`);
+    const runLabel = continuous ? "continuous" : `${requestedBatches} batch(es)`;
+    pushEvent(events, "START", `Real pipeline started on ${target}; depth cap ${MAX_DEPTH}, ${runLabel}`);
     if (preflight.note) pushEvent(events, "PREFLIGHT", preflight.note);
-    if (!quiet) ns.tprint(`[PIPELINE-REAL] START ${target} | hard depth ${MAX_DEPTH} | ${requestedBatches} batch(es)`);
+    if (!quiet) ns.tprint(`[PIPELINE-REAL] START ${target} | hard depth ${MAX_DEPTH} | ${runLabel}`);
 
-    while (completedBatches < requestedBatches && !safetyStopped) {
-        const waveSize = Math.min(MAX_DEPTH, requestedBatches - completedBatches);
+    while ((continuous || completedBatches < requestedBatches) && !safetyStopped && !drainRequested) {
+        const waveSize = continuous ? MAX_DEPTH : Math.min(MAX_DEPTH, requestedBatches - completedBatches);
         const wavePlan = buildWavePlan(ns, target, hackFraction, requestedGapMs, waveSize, ++wave);
         if (!wavePlan.ok) {
             safetyStopped = true;
@@ -117,9 +123,16 @@ export async function main(ns) {
             const now = Date.now();
             drainTimingEvents(ns, live);
 
+            if (preflight.controllerManaged && controllerRequestsDrain(ns)) {
+                if (!drainRequested) pushEvent(events, "DRAIN", "Controller requested another execution mode; no later wave will be admitted");
+                drainRequested = true;
+            }
+
             for (const batch of live) {
                 if (batch.done || batch.cancelled) continue;
                 for (const stage of batch.stages) {
+                    // The batch was already admitted as a complete HWGW unit. Even
+                    // during a mode transition all four stages must finish safely.
                     if (stage.launched || now < stage.startAt - DISPATCH_LEAD_MS) continue;
                     const launched = launchStage(ns, target, batch, stage);
                     if (!launched.ok) {
@@ -162,8 +175,10 @@ export async function main(ns) {
 
             publishRunnerState(ns, {
                 target,
-                status: safetyStopped ? "DRAINING_AFTER_STOP" : "RUNNING",
-                reason: safetyStopped ? safetyReason : `Wave ${wave} active`,
+                status: safetyStopped ? "DRAINING_AFTER_STOP" : drainRequested ? "DRAINING_FOR_MODE_SWITCH" : "RUNNING",
+                reason: safetyStopped ? safetyReason : drainRequested ? "Current admitted wave is draining before controller mode switch" : `Wave ${wave} active`,
+                continuous,
+                controllerManaged: preflight.controllerManaged,
                 requestedBatches,
                 completedBatches,
                 stageGapMs: wavePlan.stageGapMs,
@@ -173,12 +188,13 @@ export async function main(ns) {
                 events,
                 safetyStopped,
                 safetyReason,
+                drainRequested,
             });
 
             await ns.sleep(LOOP_MS);
         }
 
-        if (safetyStopped) break;
+        if (safetyStopped || drainRequested) break;
         if (!targetPrepared(ns, target)) {
             safetyStopped = true;
             safetyReason = "Wave completed but target is outside prepared tolerance; stopping before next admission";
@@ -187,11 +203,18 @@ export async function main(ns) {
         }
     }
 
-    const status = safetyStopped ? "SAFETY_STOP" : "COMPLETE";
+    const status = safetyStopped ? "SAFETY_STOP" : drainRequested ? "DRAINED_FOR_MODE_SWITCH" : "COMPLETE";
+    const reason = safetyStopped
+        ? safetyReason
+        : drainRequested
+            ? `Drained safely after ${completedBatches} completed batch(es); controller may switch modes`
+            : `Completed requested ${completedBatches} pipeline batch(es)`;
     publishRunnerState(ns, {
         target,
         status,
-        reason: safetyStopped ? safetyReason : `Completed requested ${completedBatches} pipeline batch(es)`,
+        reason,
+        continuous,
+        controllerManaged: preflight.controllerManaged,
         requestedBatches,
         completedBatches,
         inFlight: [],
@@ -199,10 +222,11 @@ export async function main(ns) {
         events,
         safetyStopped,
         safetyReason,
+        drainRequested,
     });
 
     if (!quiet) {
-        ns.tprint(`[PIPELINE-REAL] ${status} | completed ${completedBatches}/${requestedBatches}`);
+        ns.tprint(`[PIPELINE-REAL] ${status} | completed ${completedBatches}${continuous ? "" : `/${requestedBatches}`}`);
         if (safetyStopped) ns.tprint(`[PIPELINE-REAL] ${safetyReason}`);
     }
 }
@@ -210,29 +234,42 @@ export async function main(ns) {
 function preflightCheck(ns, target) {
     const controller = readControllerState(ns);
     const batch = readBatchState(ns);
-    if (!controller) return { ok: false, reason: "Controller state unavailable", note: "" };
-    if (String(controller.hostname ?? "") !== target) return { ok: false, reason: `Controller target is ${String(controller.hostname ?? "none")}, not ${target}`, note: "" };
-    if (!controller.prep?.hold) return { ok: false, reason: "Controller is not in PREPARED HOLD", note: "" };
-    if (Number(controller.execution?.activeJobs ?? 0) > 0) return { ok: false, reason: "Controller still has active standalone workers", note: "" };
-    if (controller.executionMode?.batchRunning) return { ok: false, reason: "Serialized batch runner is active", note: "" };
+    if (!controller) return { ok: false, reason: "Controller state unavailable", note: "", controllerManaged: false };
+    if (String(controller.hostname ?? "") !== target) return { ok: false, reason: `Controller target is ${String(controller.hostname ?? "none")}, not ${target}`, note: "", controllerManaged: false };
+
+    const controllerManaged = String(controller.executionMode?.mode ?? "") === "PIPELINE"
+        && !String(controller.executionMode?.pending ?? "");
+    if (!controllerManaged && !controller.prep?.hold) {
+        return { ok: false, reason: "Controller is neither in PIPELINE mode nor PREPARED HOLD", note: "", controllerManaged };
+    }
+    if (Number(controller.execution?.activeJobs ?? 0) > 0) return { ok: false, reason: "Controller still has active standalone workers", note: "", controllerManaged };
+    if (controller.executionMode?.batchRunning) return { ok: false, reason: "Serialized batch runner is active", note: "", controllerManaged };
 
     const liveSerializedHosts = runningSerializedBatchHosts(ns, batch);
     if (liveSerializedHosts.length) {
-        return { ok: false, reason: `Serialized batch-runner.js is still executing on ${liveSerializedHosts.join(", ")}`, note: "" };
+        return { ok: false, reason: `Serialized batch-runner.js is still executing on ${liveSerializedHosts.join(", ")}`, note: "", controllerManaged };
     }
 
     const staleBatchStatus = batch && ["PLANNING", "READY", "RUNNING"].includes(String(batch.status ?? ""))
         ? String(batch.status)
         : "";
-    if (!targetPrepared(ns, target)) return { ok: false, reason: "Target is not at prepared money/security baseline", note: "" };
+    if (!targetPrepared(ns, target)) return { ok: false, reason: "Target is not at prepared money/security baseline", note: "", controllerManaged };
 
     return {
         ok: true,
         reason: "",
+        controllerManaged,
         note: staleBatchStatus
-            ? `Ignoring stale Port 12 ${staleBatchStatus} snapshot because controller is parked and no serialized batch-runner process exists`
+            ? `Ignoring stale Port 12 ${staleBatchStatus} snapshot because no serialized batch-runner process exists`
             : "",
     };
+}
+
+function controllerRequestsDrain(ns) {
+    const controller = readControllerState(ns);
+    if (!controller) return false;
+    const pending = String(controller.executionMode?.pending ?? "").trim().toUpperCase();
+    return Boolean(pending && pending !== "PIPELINE");
 }
 
 function runningSerializedBatchHosts(ns, batch) {
@@ -250,7 +287,7 @@ function runningSerializedBatchHosts(ns, batch) {
         try {
             if (ns.scriptRunning(BATCH_RUNNER_SCRIPT, hostname)) running.push(hostname);
         } catch {
-            // A disappearing/stale planner host should not make a PREPARED HOLD unsafe.
+            // Ignore disappearing/stale planner hosts.
         }
     }
     return running;
@@ -347,9 +384,10 @@ function buildTemplate(ns, target, requestedHackFraction, requestedGapMs, last) 
 
 function makeBatches(template, depth, firstLandingAt, intervalMs, target, wave) {
     const batches = [];
+    const createdAt = Date.now();
     for (let index = 0; index < depth; index += 1) {
         const batchFirstLandingAt = firstLandingAt + index * intervalMs;
-        const id = `pipe-${target}-${Date.now()}-${wave}-${index + 1}`;
+        const id = `pipe-${target}-${createdAt}-${wave}-${index + 1}`;
         const stages = template.map((stage) => ({
             ...stage,
             batch: index + 1,
@@ -368,7 +406,7 @@ function makeBatches(template, depth, firstLandingAt, intervalMs, target, wave) 
             timingEvents: [],
             done: false,
             cancelled: false,
-            createdAt: Date.now(),
+            createdAt,
         });
     }
     return batches;
@@ -637,8 +675,8 @@ function targetPrepared(ns, target) {
 
 function publishRunnerState(ns, state) {
     publishBatchSchedulerState(ns, {
-        version: 4,
-        model: "PIPELINE_EXECUTOR_DEPTH2_V1",
+        version: 5,
+        model: "PIPELINE_EXECUTOR_DEPTH2_V2",
         dryRun: false,
         simulation: false,
         execution: true,
