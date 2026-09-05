@@ -76,6 +76,8 @@
     "diagnostics/multi-overlap-advisor.js",
     "diagnostics/multi-overlap-validate.js",
     "diagnostics/multi-overlap-mixed.js",
+    "diagnostics/multi-depth-validate.js",
+    "diagnostics/multi-full-depth-test.js",
     "diagnostics/validation-dashboard.js",
     "diagnostics/dashboard.js",
     "diagnostics/economy-targets.js",
