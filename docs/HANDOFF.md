@@ -34,7 +34,7 @@ model MULTI_TARGET_OVERLAP_POLICY_V2_SEPARATE_PROOF
 ```
 Pipeline history creates a `VALIDATE2` candidate. Dedicated evidence creates `PROVEN2`. Port 19's older 4/8 ladder is not production overlap proof.
 
-Latest runtime evidence: `joesguns` completed the dedicated two-wave depth-2 validator cleanly and is user-confirmed validated. A mixed VALIDATE2 pass was then started across the remaining qualified targets.
+Latest runtime evidence: `joesguns` completed the dedicated two-wave depth-2 validator cleanly and is user-confirmed validated. A mixed VALIDATE2 pass was then started across the remaining qualified targets. Screenshot evidence showed phantasy, sigma-cosmetics, and joesguns already PROVEN2 while silver-helix was being validated.
 
 Read-only advisor:
 ```text
@@ -72,7 +72,7 @@ ui/views/validation.js
 ```
 Main tabs: Overview / Targets / Economy / Batch / Validation / Network / Diagnostics.
 
-Validation target selector now provides:
+Validation target selector provides:
 ```text
 MIXED · prepared VALIDATE2 only
 ALL PREPARED · includes DEPTH1
@@ -82,15 +82,34 @@ individual planner targets
 
 Selecting an individual target from the dashboard is also an explicit qualification request: if it is prepared, the dedicated validator may test it even when it currently shows DEPTH1. The normal validator safety/recovery criteria still apply before proof is persisted.
 
-Dashboard-launched validation is now always quiet. `ui/actions.js` passes `--quiet` to both single-target and mixed/all validation launchers. Manual terminal launches keep their normal printed output unless the user explicitly supplies `--quiet`.
+Dashboard-launched validation is always quiet. `ui/actions.js` passes `--quiet` to single-target and mixed/all launchers. Manual terminal launches keep printed output unless `--quiet` is supplied.
 
-Validation tab shows controls, live target/status/wave/clean count, stage/job progress, landing streams, last-wave timing/recovery, and durable DEPTH1 / VALIDATE2 / PROVEN2 rows. React callbacks only queue plain-JS requests; `ui/actions.js` performs Netscript launches.
+### Validation stale-state fix
+A runtime screenshot revealed a stale-state mismatch: the Validation tab could keep showing `VALIDATING…` from an old state-file status while the header correctly stopped showing a live validation badge after telemetry became stale. `Status` and `Telemetry` also rendered `[object Object]` because `kv()` stringifies React elements.
+
+Fix:
+```text
+ui/state.js
+```
+now snapshots actual `ns.scriptRunning()` state for `/diagnostics/multi-overlap-validate.js` and `/diagnostics/multi-overlap-mixed.js` as `validationRuntime`.
+
+`ui/views/validation.js` now:
+```text
+- decides whether validation is really running from validationRuntime.active, not stale state-file status
+- releases START VALIDATION once the actual processes are gone
+- reports RUNNING · STALE TELEMETRY when a process exists but state updates stop
+- renders Status and Telemetry as plain text through kv(), removing [object Object]
+```
+
+`ui/dashboard.js` header now uses the same real process truth. If validation is active and telemetry is fresh it shows `VALID <status>`; if process is active but telemetry is stale it shows `VALID STALE`. If no validator/mixed process exists, no live validation badge is shown regardless of old state-file contents.
+
+This makes the header, Validation tab button, and stale telemetry indication use one consistent runtime truth.
 
 ### Mixed validation coordinator
 ```text
 diagnostics/multi-overlap-mixed.js
 ```
-It supports two scopes while remaining backward compatible:
+It supports:
 ```text
 validate2   prepared VALIDATE2 targets needing proof
 all         every prepared target needing proof, including DEPTH1
@@ -101,7 +120,7 @@ It runs validators strictly sequentially so only one Port-14 owner exists. Quiet
 `hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM.
 
 ## Dashboard architecture
-Main dashboard remains one mounted React tree with separate view modules. `ui/state.js` caches Port 19 history plus overlap evidence/live-validation state. The async action bridge owns validator launches.
+Main dashboard remains one mounted React tree with separate view modules. `ui/state.js` caches Port 19 history plus overlap evidence/live-validation state and now actual validation process status. The async action bridge owns validator launches.
 
 ## Runtime contracts
 Real `hacking/multi-target-runner.js` remains finite and per-target depth 1. Do not remove the uniqueness guard until multiple targets have dedicated `PROVEN2` evidence and runtime output is reviewed.
@@ -109,13 +128,15 @@ Real `hacking/multi-target-runner.js` remains finite and per-target depth 1. Do 
 Ports: 12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap validation live/evidence state is file-based.
 
 ## Immediate validation
-Do not interrupt the user's currently running mixed validation. After it completes, pull this pass:
+The user's currently running mixed validation should not be interrupted solely for the UI fix. After it completes:
 ```text
 run gitpull.js
 ```
-Restart/reload the main dashboard so the updated Validation view/action bridge is loaded. Future dashboard validation runs will be quiet.
+Then restart/reload the main dashboard so `ui/state.js`, `ui/dashboard.js`, and `ui/views/validation.js` are re-imported.
 
-Use `MIXED` for already-qualified VALIDATE2 targets. Use `ALL PREPARED` to work through all currently prepared, not-yet-PROVEN2 targets including DEPTH1. Individual targets can also be selected directly.
+If a future validator genuinely stalls, the dashboard will now distinguish `VALID STALE` from an old completed/stopped process. Once the process exits, the launch button will recover automatically even if the last state-file status remains RUNNING/MIXED_NEXT.
+
+Use `MIXED` for qualified VALIDATE2 targets. Use `ALL PREPARED` for all prepared, not-yet-PROVEN2 targets including DEPTH1.
 
 ## Priority
 ```text
@@ -127,6 +148,7 @@ DONE dedicated depth-2 validator + durable evidence
 DONE live validation telemetry
 DONE main-dashboard Validation tab + quiet launch
 DONE MIXED VALIDATE2 + ALL PREPARED scopes
+DONE validation stale-state/runtime-truth dashboard fix
 IN PROGRESS runtime validate depth 2 across multiple targets
 NEXT review mixed/all runtime evidence
 NEXT extend real MULTI planner to evidence-backed per-target depth 2
