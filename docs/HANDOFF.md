@@ -18,46 +18,40 @@ Safety invariants: global concurrency proof and target-local overlap proof remai
 
 Current depth-N validation is conservative serialized landing-stream proof. Target-stream trajectory/steady-state validation is still required before tighter interleaved production overlap. Current production `hacking/multi-target-runner.js` remains per-target depth 1; do not remove uniqueness guard until runtime proof supports the next scheduler.
 
-## Pre-4S stock trading pilot
+## Pre-4S stock trading — V7 ADAPTIVE
 Goal is to earn while hacking validation occupies STANDBY and accelerate the $25b 4S forecast API purchase.
 
-`stocks/history-keeper.js` remains the source price recorder. `stocks/signals.js` adds a price-only pre-4S signal using 5m/15m/30m momentum, regression trend, tick-direction bias, agreement and realized volatility. It requires multi-window history and returns a bounded signed score/confidence; it does not pretend to know the hidden 4S forecast.
+`stocks/history-keeper.js` remains the source price recorder. `stocks/signals.js` provides the price-only 5m/15m/30m pre-4S signal. `stocks/pre4s-trader.js` is part of normal startup and polls prices every 50ms while doing meaningful entry work only on genuine market changes.
 
-`stocks/pre4s-trader.js` is now part of normal startup. `kickstart.js` stage 2 starts it automatically if it is not already running, alongside the prepper, batch-history collector, and stock-history recorder. The trader polls prices every 50ms but only reevaluates entries on a genuine price change; heartbeat/state refresh remains at least once per second. Stops and exits are checked before new entries.
+### Entry persistence
+`lib/stock-trader-policy.js` now requires three consecutive qualifying market changes before opening a position. Long qualification remains score >= +0.62/confidence >=60%; conservative short qualification remains score <= -0.72/confidence >=72%.
 
-### Conservative shorts — ENABLED
-Pre-4S shorts are enabled by default through persisted trader config, with deliberately stricter admission than longs:
-- long entry score >= +0.62, confidence >= 60%;
-- short entry score <= -0.72, confidence >= 72%;
-- long per-symbol cap 4% of equity;
-- short per-symbol cap 1.5% of equity;
-- separate short budget default 5% of equity, dashboard-adjustable 0–10%;
-- configurable stop loss applies symmetrically to longs and shorts;
-- setting short budget to 0 or disabling the dashboard short toggle prevents new shorts.
+### Profit-aware exits and adaptive emergency stops
+The old fixed-stop/weak-score exit path produced poor early evidence (many `LONG_STOP` losses), so V7 changes the exit model:
+- emergency stop is volatility-aware and clamped to roughly 4–10%, using the configured dashboard stop as a floor;
+- once a position has reached >=4% peak profit, trailing-profit protection activates;
+- trailing giveback is 1.5% after 4% peak, 2% after 7% peak, and 2.5% after 10% peak;
+- positions at >=8% current profit take profit when momentum is no longer strongly supportive;
+- genuine opposite-direction reversal exits immediately;
+- a weak signal may exit after two minutes rather than immediately churn;
+- automatic exits get a 60-second re-entry cooldown.
 
-### Market Lab capital control + stop loss
-`lib/stock-trader-config.js` persists `/data/pre4s-trader-config.txt`. `stocks/trader-controls.js` is a focused React component; it emits plain config requests and performs no Netscript I/O. `stocks/dashboard.js` owns async file writes.
+`lib/stock-position-state.js` persists `/data/pre4s-position-state.txt`, tracking opened time, entry score/confidence, peak profit (MFE proxy), worst profit (MAE proxy), and current profit for each open position. Closed-trade records now retain entry signal, peak/worst excursion and holding time when available.
 
-Market Lab lets the user choose `% OF PLAYER CASH` capped 0–30% or `FIXED AMOUNT` with k/m/b/t suffixes. The selected value is a maximum total stock exposure. Lowering the cap below current exposure blocks new entries but does not force-liquidate otherwise healthy positions.
+### Evidence-scaled capital
+`lib/stock-performance-analysis.js` grades durable realized results. While fewer than 20 closes exist, the trader uses 50% of the dashboard-configured capital limit. Clearly poor evidence after 20 closes reduces effective allocation to 35%; positive PF/expectancy can promote to 75% and eventually 100% after stronger evidence. This changes the *effective* cap only; the user-configured cap remains the absolute maximum.
 
-Stop loss default is 5%, allowed 0–50%, and 0 disables it. Longs exit when executable bid <= average entry × (1-stopLoss). Shorts exit when executable ask >= average entry × (1+stopLoss). Signal exits remain active independently.
+### Conservative shorts
+Shorts remain deliberately stricter than longs: max 1.5% equity per short, separate short budget default 5% and dashboard range 0–10%. The same adaptive emergency-stop and profit-taking framework applies to shorts.
 
-### Manual position close — IMPLEMENTED
-`lib/stock-trader-actions.js` persists a single request/response action in `/data/pre4s-trader-action.txt`. `stocks/portfolio.js` renders the Market Lab portfolio and a CLOSE button for every open long or short position. React only queues a plain close request; the async dashboard loop writes it, and the trader executes the actual stock API call.
+### Market Lab controls/manual exits
+`lib/stock-trader-config.js` persists `/data/pre4s-trader-config.txt`. Market Lab supports percent or fixed total capital, configured emergency-stop floor, short budget, and short enable/disable. `lib/stock-trader-actions.js` + `stocks/portfolio.js` provide manual CLOSE; successful manual closes are ledgered as `MANUAL_EXIT` and apply a 60-second re-entry cooldown.
 
-A successful manual close is recorded in the durable P&L ledger with reason `MANUAL_EXIT`. The trader applies a 60-second symbol re-entry cooldown after a manual close so it does not immediately repurchase/re-short the position the user just exited. The most recent manual action result is shown beneath the portfolio. Manual actions require the trader process to be running; normal startup now ensures that process is admitted automatically.
-
-### Historical trader P&L — IMPLEMENTED
-`lib/stock-trade-performance.js` persists `/data/pre4s-trader-performance.txt` using model `PRE4S_TRADER_PERFORMANCE_V1`. Every closed trade records timestamp, symbol, side, shares, average entry, executable exit, realized P&L after the sell/cover commission, and exit reason. Up to the latest 500 closed trades are retained.
-
-Durable summary tracks total/long/short realized P&L, closed trades, wins/losses, win rate, gross profit/loss, profit factor, peak realized P&L and maximum realized-P&L drawdown. `stocks/pre4s-trader.js` publishes this summary and recent closes in its live state; Market Lab renders the historical metrics and latest closed trades inside trader controls.
-
-Historical P&L starts from exits made after this ledger-enabled version is pulled. Earlier already-completed trades cannot be reconstructed reliably from price history alone.
-
-Manifest includes `lib/stock-trader-config.js`, `lib/stock-trader-actions.js`, `lib/stock-trade-performance.js`, `stocks/trader-controls.js`, and `stocks/portfolio.js`.
+### Historical P&L
+`lib/stock-trade-performance.js` persists `/data/pre4s-trader-performance.txt` and keeps up to 500 closes. Summary includes realized/long/short P&L, wins/losses, win rate, gross profit/loss, profit factor and max realized drawdown. New V7 records may also include entry score/confidence, peak/worst excursion and holding time.
 
 ## Stock research baseline
-`lib/stock-history.js` retains all history going forward with `Date.now()` timestamps and recorder gaps. `stocks/history-keeper.js` polls TIX every 200ms and persists actual price-vector changes. Market Lab CANDLES uses 5m/15m/30m/1h/4h lookbacks; HISTORY · LINE provides 15m/1h/3h/6h/12h/24h/ALL. Startup launches recorder, Market Lab, and pre-4S trader.
+`lib/stock-history.js` retains all history going forward with `Date.now()` timestamps and recorder gaps. Market Lab CANDLES uses 5m/15m/30m/1h/4h lookbacks; HISTORY · LINE provides 15m/1h/3h/6h/12h/24h/ALL. Startup launches recorder, Market Lab, and pre-4S trader.
 
 ## AUTOMULTI
 `lib/automulti-decision.js`, `lib/automulti-live.js`, `lib/multi-target-ranking.js`, and `hacking/automulti-controller.js` provide the supervisory AUTO foundation. Production must not exceed relevant proof ceilings.
@@ -69,22 +63,20 @@ Manifest includes `lib/stock-trader-config.js`, `lib/stock-trader-actions.js`, `
 12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap validation and stocks use files.
 
 ## Immediate runtime work
-Pull latest and run the normal startup path. Confirm Market Lab shows TRADING LIVE without manually launching `stocks/pre4s-trader.js`. Verify a portfolio CLOSE button removes the selected long/short, records a `MANUAL_EXIT` in historical P&L, and does not re-enter that symbol for roughly 60 seconds. Hacking validation can continue independently.
+Pull latest and restart the pre-4S trader so model `PRE4S_TRADER_V7_ADAPTIVE` is loaded. Existing open positions are adopted into position tracking on first evaluation, so their precise original entry timestamp/signal cannot be reconstructed, but current/peak/worst profit starts tracking from V7 startup. Observe whether profitable positions now close via `LONG_TRAIL`, `LONG_TAKE_PROFIT`, or `SIGNAL_REVERSAL` rather than repeatedly reaching fixed `LONG_STOP`.
 
 ## Priority
 ```text
 DONE dynamic per-target arbitrary-depth evidence foundation
 DONE configurable depth-N + individual/set full-depth validation
-DONE pre-4S price signal engine + conservative live trader
-DONE Market Lab percent/fixed capital controls + configurable stop loss
-DONE 50ms change detector + conservative pre-4S shorts
-DONE durable historical trader P&L + long/short performance split
-DONE manual Market Lab position closes + 60s re-entry cooldown
-DONE normal startup auto-starts pre-4S trader
-NOW collect validation and trader performance evidence in parallel
+DONE pre-4S live trader + conservative shorts + manual closes
+DONE durable historical P&L
+DONE V7 persistent entries + adaptive emergency stops + trailing/take-profit exits
+DONE V7 evidence-scaled capital + position excursion tracking
+NOW collect V7 trader evidence and hacking validation in parallel
 NEXT target-stream trajectory validation
 NEXT real MULTI marginal allocator using proven per-target depth
-NEXT Market Lab signal/confidence columns + richer performance visualization
+NEXT Market Lab signal/confidence/action columns + richer cohort visualization
 NEXT concentrated-vs-distributed selection + hack/timing tuner
 NEXT idle prep-reserve auto-validation borrowing
 NEXT feed learned profiles into AUTOMULTI + GUI
