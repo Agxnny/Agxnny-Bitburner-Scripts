@@ -14,146 +14,110 @@ Global distinct-target concurrency and same-target overlap are separate safety d
 ## AUTOMULTI
 - `lib/automulti-decision.js`: pure Possible / Proven / Effective decision logic.
 - `lib/automulti-live.js`: live adapter.
-- `lib/multi-target-ranking.js`: one shared MONEY/BALANCED/XP ranking policy.
-- `hacking/automulti-controller.js`: supervisory ASSESS -> RUN -> OBSERVE -> ADAPT, with controlled validation.
+- `lib/multi-target-ranking.js`: shared MONEY/BALANCED/XP ranking policy.
+- `hacking/automulti-controller.js`: supervisory ASSESS -> RUN -> OBSERVE -> ADAPT.
 Production must never exceed the relevant proven ceiling.
 
 ## Same-target overlap rollout
-Durable proof:
-```text
-lib/multi-overlap-evidence.js
-/data/multi-overlap-evidence.txt
-model MULTI_TARGET_OVERLAP_EVIDENCE_V1
-```
-Two consecutive clean dedicated validation waves prove target depth 2. A later failed dedicated validation makes active policy fall back to depth 1 until revalidated.
+Durable proof: `lib/multi-overlap-evidence.js` -> `/data/multi-overlap-evidence.txt`, model `MULTI_TARGET_OVERLAP_EVIDENCE_V1`.
+Shared policy: `lib/multi-overlap-policy.js`, model `MULTI_TARGET_OVERLAP_POLICY_V2_SEPARATE_PROOF`.
+Pipeline history creates `VALIDATE2`; two clean dedicated overlap waves create `PROVEN2`. Port 19's older 4/8 ladder is never direct production overlap proof.
 
-Policy:
+Dedicated validator:
 ```text
-lib/multi-overlap-policy.js
-model MULTI_TARGET_OVERLAP_POLICY_V2_SEPARATE_PROOF
-```
-Pipeline history creates a `VALIDATE2` candidate. Dedicated evidence creates `PROVEN2`. Port 19's older 4/8 ladder is not production overlap proof.
-
-Latest runtime evidence: `joesguns` completed the dedicated two-wave depth-2 validator cleanly and is user-confirmed validated. A mixed VALIDATE2 pass was then started across the remaining qualified targets. Screenshot evidence showed phantasy, sigma-cosmetics, and joesguns already PROVEN2 while silver-helix was being validated.
-
-Read-only advisor:
-```text
-run diagnostics/multi-overlap-advisor.js money 0.10 12
-```
-Earlier runtime showed 32,588 GB production RAM / 68 hosts and five prepared candidate targets: phantasy, silver-helix, omega-net, sigma-cosmetics, joesguns.
-
-Persistent simulator:
-```text
-hacking/multi-target-sim.js
-model MULTI_TARGET_ADMISSION_SIM_V4_SHARED_OVERLAP_POLICY
-```
-Simulation uses `candidateDepth`; real production must use `provenDepth`.
-
-### Dedicated real depth-2 validator
-```text
-diagnostics/multi-overlap-validate.js
 run diagnostics/multi-overlap-validate.js [target|auto] [waves] [hackFraction] [stageGapMs]
 ```
-Defaults auto / 2 waves / 10% / 200ms. Controller must be fully STANDBY. Validator owns Port 14, plans two same-target HWGW batches in one calendar, checks timing/order/spacing/drift/recovery, and records each completed wave.
+Controller must be fully STANDBY. Validator owns Port 14, schedules two same-target HWGW batches, validates timing/order/spacing/drift/recovery, and records evidence.
 
-Manual/automatic `auto` validation still requires normal pipeline qualification. Dashboard-selected explicit targets can pass `--allow-unqualified`, which permits a prepared DEPTH1 target to use the dedicated controlled validator itself as the qualification test. This does not grant production depth 2 unless the dedicated evidence actually passes the normal two-clean-wave requirement.
+Validation UI is integrated in the main dashboard under `ui/views/validation.js`. It supports MIXED VALIDATE2, ALL PREPARED including DEPTH1, and explicit targets. Dashboard launches are quiet. Runtime truth now comes from actual validator process state plus file telemetry, so stale state is shown as `VALID STALE` rather than pretending work is still healthy.
 
-Live state:
+Latest runtime evidence from the user: joesguns validated cleanly; screenshot later showed phantasy, sigma-cosmetics, and joesguns already `PROVEN2` while a mixed pass continued through silver-helix and remaining candidates.
+
+Real `hacking/multi-target-runner.js` is still per-target depth 1. Do not remove its uniqueness guard until the current multi-target overlap evidence pass is reviewed.
+
+## Stock research baseline — NEW
+The user is currently saving toward the $25b 4S forecasting API and requested observation/history first, no autonomous trading yet.
+
+### Persistent compact history
 ```text
-lib/overlap-validation-state.js
-/data/multi-overlap-validation-state.txt
-model MULTI_OVERLAP_VALIDATION_STATE_V1
+lib/stock-history.js
+/data/stock-history.txt
+model STOCK_HISTORY_V1_COMPACT
 ```
-Validator publishes target/status/PID/wave progress, clean waves, hack %, gap, interval, expected/reported jobs, stage progress, both active batches, planned/actual landings, and last result roughly every 250ms.
+History stores one shared timestamp array plus a compact price array per symbol. Default cadence is 6 seconds, max 1,800 samples, roughly a 3-hour rolling window. This avoids a large object-per-symbol-per-tick file while still giving enough baseline data for pre-4S volatility research.
 
-### Main dashboard Validation tab
+The helper also exposes `stockSeries()` and `stockSeriesStats()`. Current volatility proxy is standard deviation of recorded tick-to-tick returns. This is intentionally descriptive only; no forecast/trading signal is produced yet.
+
+### Stock history keeper
 ```text
-ui/views/validation.js
+stocks/history-keeper.js
 ```
-Main tabs: Overview / Targets / Economy / Batch / Validation / Network / Diagnostics.
-
-Validation target selector provides:
+Observation-only, never trades. It records every TIX-visible symbol, current price, bid/ask, max shares, and current long/short positions. Current market/portfolio snapshot is persisted separately:
 ```text
-MIXED · prepared VALIDATE2 only
-ALL PREPARED · includes DEPTH1
-individual planner targets
+/data/stock-market-state.txt
+model STOCK_MARKET_STATE_V1
 ```
-`ALL PREPARED` snapshots every currently prepared target that still lacks dedicated depth-2 proof, including targets with no prior pipeline qualification, and validates them sequentially. Already-PROVEN2 targets are skipped. Unprepared targets are not admitted and must be prepared before they can be validated.
+The snapshot includes TIX/4S access flags, cash, symbol prices, long/short holdings, long value, short value, and gross exposure.
 
-Selecting an individual target from the dashboard is also an explicit qualification request: if it is prepared, the dedicated validator may test it even when it currently shows DEPTH1. The normal validator safety/recovery criteria still apply before proof is persisted.
+If TIX API access is unavailable, the keeper publishes WAITING state and parks until access becomes available rather than crashing.
 
-Dashboard-launched validation is always quiet. `ui/actions.js` passes `--quiet` to single-target and mixed/all launchers. Manual terminal launches keep printed output unless `--quiet` is supplied.
+`kickstart.js` now starts `stocks/history-keeper.js` quietly alongside prepper and batch-history collection. The dedicated stock dashboard also starts the keeper quietly if it is not already running, so collection begins immediately when the dashboard is opened.
 
-### Validation stale-state fix
-A runtime screenshot revealed a stale-state mismatch: the Validation tab could keep showing `VALIDATING…` from an old state-file status while the header correctly stopped showing a live validation badge after telemetry became stale. `Status` and `Telemetry` also rendered `[object Object]` because `kv()` stringifies React elements.
-
-Fix:
+### Separate React Market Lab dashboard
 ```text
-ui/state.js
+stocks/dashboard.js
+stocks/styles.js
+run stocks/dashboard.js
 ```
-now snapshots actual `ns.scriptRunning()` state for `/diagnostics/multi-overlap-validate.js` and `/diagnostics/multi-overlap-mixed.js` as `validationRuntime`.
+This is intentionally separate from the main hacking control plane. One React tree is mounted; the async Netscript loop refreshes plain JS cache. React callbacks only change local selected-symbol state.
 
-`ui/views/validation.js` now:
+Current dashboard sections:
 ```text
-- decides whether validation is really running from validationRuntime.active, not stale state-file status
-- releases START VALIDATION once the actual processes are gone
-- reports RUNNING · STALE TELEMETRY when a process exists but state updates stop
-- renders Status and Telemetry as plain text through kv(), removing [object Object]
+Header: recorder/TIX/4S/trading-off status
+Hero: cash, progress toward $25b 4S API, long value, short value, unrealized P&L
+Price history: selectable symbol, SVG stock-style line chart, sample count, window change, tick volatility, observed price range
+Portfolio: current LONG/SHORT positions, shares, value, unrealized P&L, exposure summary
+Market watch: every stock with price, rolling-window change, volatility, samples; clicking a row changes the chart
 ```
+Trading is explicitly OFF. The old `stocks/terminal.js` placeholder remains but `stocks/dashboard.js` is now the preferred stock research surface.
 
-`ui/dashboard.js` header now uses the same real process truth. If validation is active and telemetry is fresh it shows `VALID <status>`; if process is active but telemetry is stale it shows `VALID STALE`. If no validator/mixed process exists, no live validation badge is shown regardless of old state-file contents.
+Long and short portfolio accounting are already separate in the snapshot/dashboard so future execution logic can support both directions without changing the data model.
 
-This makes the header, Validation tab button, and stale telemetry indication use one consistent runtime truth.
+### Stock next steps
+Do not build autonomous orders yet. First collect a meaningful pre-4S baseline and inspect runtime behavior/file growth. After 4S becomes available, signal source can switch to native forecast + volatility while preserving the same history/portfolio/dashboard layers.
 
-### Mixed validation coordinator
+Likely future focused modules:
 ```text
-diagnostics/multi-overlap-mixed.js
+stocks/signals.js
+stocks/allocator.js
+stocks/trader.js
+stocks/controller.js
 ```
-It supports:
-```text
-validate2   prepared VALIDATE2 targets needing proof
-all         every prepared target needing proof, including DEPTH1
-```
-It runs validators strictly sequentially so only one Port-14 owner exists. Quiet mode propagates to child validators.
+Economy/manual-goal cash reservation must remain authoritative over future stock deployment.
 
 ## Prepper
 `hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM.
 
-## Dashboard architecture
-Main dashboard remains one mounted React tree with separate view modules. `ui/state.js` caches Port 19 history plus overlap evidence/live-validation state and now actual validation process status. The async action bridge owns validator launches.
+## Runtime ports
+12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap and stock research state are file-based.
 
-## Runtime contracts
-Real `hacking/multi-target-runner.js` remains finite and per-target depth 1. Do not remove the uniqueness guard until multiple targets have dedicated `PROVEN2` evidence and runtime output is reviewed.
-
-Ports: 12 serialized batch, 14 timing events (one real coordinator only), 15 latest completed batch, 16 pipeline, 17 multi, 18 prepper, 19 rolling history, 20 global stress. Overlap validation live/evidence state is file-based.
-
-## Immediate validation
-The user's currently running mixed validation should not be interrupted solely for the UI fix. After it completes:
+## Immediate stock test
+After pulling:
 ```text
 run gitpull.js
+run stocks/history-keeper.js --quiet
+run stocks/dashboard.js
 ```
-Then restart/reload the main dashboard so `ui/state.js`, `ui/dashboard.js`, and `ui/views/validation.js` are re-imported.
-
-If a future validator genuinely stalls, the dashboard will now distinguish `VALID STALE` from an old completed/stopped process. Once the process exits, the launch button will recover automatically even if the last state-file status remains RUNNING/MIXED_NEXT.
-
-Use `MIXED` for qualified VALIDATE2 targets. Use `ALL PREPARED` for all prepared, not-yet-PROVEN2 targets including DEPTH1.
+The dashboard itself will start the keeper if needed, so manually starting the keeper is optional. Let it collect for at least several minutes before judging volatility; longer collection makes the baseline more useful.
 
 ## Priority
 ```text
-DONE global stress evidence + AUTOMULTI decision/supervisor
-DONE shared ranking cleanup
-DONE overlap candidate policy/advisor
-DONE simulator shared overlap policy
-DONE dedicated depth-2 validator + durable evidence
-DONE live validation telemetry
-DONE main-dashboard Validation tab + quiet launch
-DONE MIXED VALIDATE2 + ALL PREPARED scopes
-DONE validation stale-state/runtime-truth dashboard fix
 IN PROGRESS runtime validate depth 2 across multiple targets
-NEXT review mixed/all runtime evidence
+NEXT review mixed/all overlap evidence
 NEXT extend real MULTI planner to evidence-backed per-target depth 2
 NEXT separate total global in-flight cap from distinct-target count
-NEXT feed overlap capacity into AUTOMULTI and GUI
-LATER tighter target-local cadence only after non-crossing depth 2 is stable
-LATER failed-global-depth cooldown, UI refinements, watchdog
+PARALLEL collect pre-4S stock price history and validate Market Lab runtime/file growth
+LATER add stock signal/allocator/trader/controller after baseline and 4S access
+LATER feed overlap capacity into AUTOMULTI and GUI
+LATER tighter target-local cadence, failed-global-depth cooldown, UI refinements, watchdog
 ```
