@@ -51,16 +51,17 @@ Targets exercised included `phantasy`, `silver-helix`, `joesguns`, `sigma-cosmet
 
 Per-target real MULTI overlap remains hard-capped at 1. Port 19 same-target history and Port 20 global distinct-target stress evidence are separate safety signals.
 
-## Distributed target prepper V2
+## Distributed target prepper V3 adaptive focus
 
 ```text
 hacking/prepper.js
-model: DISTRIBUTED_TARGET_PREPPER_V2
+hacking/prepper-allocation.js
+model: DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS
 state: Port 18
-policy: GROW_THEN_WEAKEN
+policy: ADAPTIVE_FOCUS_GROW_THEN_WEAKEN
 ```
 
-V2 periodically scans the full eligible target universe through shared target logic, reserves a bounded slice of remote RAM across multiple hosts, and prepares different targets concurrently.
+The prepper still scans the full eligible target universe and reserves a bounded slice of remote RAM, but allocation is now adaptive. `hacking/prepper-allocation.js` compares different focus widths and estimates target-completion throughput. It may spread prep across several targets or concentrate several reserved hosts on the same target when that is projected to finish useful prep work faster.
 
 Defaults:
 
@@ -73,11 +74,42 @@ money ready threshold: >=99.5%
 security ready threshold: <= min +0.05
 ```
 
-Prep ordering is now deliberately money-first. If a target is below the money threshold, the prepper spends its assigned host on GROW even if security is high. Once money reaches the ready threshold, it switches that target to WEAKEN until security is within tolerance. This is intended to rush low-money servers toward usable economic state instead of spending early cycles cleaning security that subsequent grows would raise again.
+Prep ordering remains money-first. If a target is below the money threshold, the current stage is GROW even when security is elevated. After money reaches the threshold, the next stage becomes WEAKEN until security is within tolerance.
+
+Important same-target behavior:
+
+```text
+- one target may receive multiple GROW/WEAKEN jobs on different reserved hosts in the same prep wave
+- host allocations for a target are launched together from one calculated plan
+- a target is considered busy while any job from its current wave remains active
+- that target is not replanned until every job in its current wave finishes
+- after the wave finishes, live money/security is read again before another stage is admitted
+```
+
+This avoids duplicate re-planning against partially completed same-target grow effects while still allowing unused prep hosts to work on other non-busy targets.
 
 Production excludes all fresh Port 18 `reservedHosts[]` entries through `lib/execution.js`. Existing production work on a newly selected prep host drains naturally before prep uses it.
 
-Port 18 publishes aggregate prep state plus `prepTargets[]` entries containing hostname, current/max money, money ratio, security delta, action, active host, and advisory ETA. Port 18 also publishes `policy: GROW_THEN_WEAKEN`.
+Port 18 V3 publishes the existing aggregate prep state plus:
+
+```text
+activeTargetCount
+activeJobs[] with waveId / target / action / threads / host
+prepTargets[].activeJobs
+prepTargets[].activeThreads
+prepTargets[].hosts[]
+focus {
+  mode
+  width
+  targets[]
+  estimatedMakespanMs
+  estimatedTargetsPerHour
+  waveId
+  launchedJobs
+}
+```
+
+The focus estimator is advisory. It optimizes current prep-stage throughput using live grow/weaken thread demand, durations, and reserved-host capacities; each finished wave is followed by a fresh calculation from actual server state.
 
 ## Modular dashboard refactor
 
@@ -123,21 +155,11 @@ Feature parity retained:
 - stale pipeline freshness gating
 ```
 
-### New Targets prep-progress card
+### Targets prep-progress card
 
-The Targets tab contains `Servers below max money` using Port 18 prep telemetry. It shows:
+The Targets tab contains `Servers below max money` using Port 18 prep telemetry. It shows server, money %, active/queued GROW or WEAKEN state, advisory ETA, and current host/security information.
 
-```text
-SERVER
-MONEY %
-STATE        active/queued GROW or WEAKEN
-ETA 100%     advisory prep estimate
-HOST / SEC   active reserved host or security delta
-```
-
-The card also shows prepared count, below-max count, active prep count, reserved prep RAM, and reserved host count.
-
-Important: the ETA is advisory. It is estimated from current grow/weaken timing, queue position, and reserved prep-host capacity; target state can change before completion. The estimator now follows the grow-first ordering and includes a projected weaken phase after the remaining grow work.
+The V3 telemetry now exposes multiple hosts/threads per target, but the current card still presents the compatibility `host` field first. A future small UI improvement can render focused host count/thread totals directly.
 
 ## GUI runtime model that must not regress
 
@@ -180,7 +202,7 @@ Controller MULTI repeats finite waves automatically. COMPLETE re-evaluates and l
 15 latest completed batch
 16 single-target pipeline state
 17 multi-target scheduler/executor state
-18 distributed prepper state
+18 adaptive distributed prepper state
 19 rolling per-target safety history
 20 progressive global stress-test state
 ```
@@ -189,24 +211,24 @@ See `docs/RUNTIME_STATE.md` for the current contract.
 
 ## Immediate validation sequence
 
-The modular dashboard is live-validated for startup/rendering and the Targets prep card is displaying fresh Port 18 state.
-
 ```text
-1. pull main and restart startup/prepper so GROW_THEN_WEAKEN policy is live
-2. rapidly switch all six tabs repeatedly; dashboard must remain alive
-3. watch Targets -> Servers below max money
-4. confirm low-money targets prefer GROW even when security is elevated
-5. confirm each target switches to WEAKEN only after money reaches >=99.5%
-6. confirm prepared count rises after the weaken cleanup phase
-7. inspect ps home / ps <prep-host> if a target appears stuck
+1. run gitpull.js
+2. restart startup/prepper so V3 + prepper-allocation.js are live
+3. run diagnostics/mem-audit.js and confirm no unmanaged files
+4. watch Targets -> Servers below max money
+5. use ps on two or more reserved prep hosts and confirm the same target can appear simultaneously when focus mode concentrates
+6. confirm Port 18 / GUI money percentage jumps faster for focused targets
+7. confirm a focused target is not assigned a second wave until all jobs from its current wave have finished
+8. confirm targets switch from concentrated GROW to WEAKEN only after money reaches >=99.5%
+9. confirm prepared count rises and no prep jobs collide with production hosts
 ```
 
-Because the new `ui/*` support files are ordinary `.js` files outside `lib/`, the current `diagnostics/mem-audit.js` labels them as `script` even though they are imported modules. That audit classification is cosmetic; the important checks are managed/unmanaged status and dashboard RAM.
+Because the new `ui/*` support files are ordinary `.js` files outside `lib/`, the current `diagnostics/mem-audit.js` labels them as `script` even though they are imported modules. That audit classification is cosmetic.
 
 ## Next development sequence after prep validation
 
 ```text
-1. Let prepper V2 raise prepared-target count above five under grow-first policy.
+1. Let adaptive prep raise prepared-target count above five.
 2. Re-run stress test through depth 6; depth 5 is already proven.
 3. Improve stress BLOCKED behavior so it observes Port 18 readiness instead of relaunching a blocked runner every 10 seconds.
 4. Persist/consume proven global stress depth as an evidence ceiling for production MULTI, never as a forced depth.
