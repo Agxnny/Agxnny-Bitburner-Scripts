@@ -2,6 +2,64 @@
 
 GitHub `main` is the source of truth. Read this file first, then fetch current live files before editing. Target is Bitburner v3.x; live testing is v3.0.1.
 
+## Engineering constraints: prefer modules over monoliths
+
+This project now has an explicit maintainability rule: prefer small modules with narrow responsibilities that work together over large monolithic scripts.
+
+Soft size targets:
+
+```text
+ordinary module / script        aim for <= 300 lines
+review / split threshold        ~400 lines
+exception threshold             >500 lines requires a clear reason
+UI view module                  ideally 100-250 lines
+shared UI component module      ideally 100-250 lines
+entrypoint / coordinator        keep as small as practical; orchestration only
+individual function             usually <= 40-60 lines
+```
+
+These are engineering guardrails, not arbitrary hard failures. A cohesive file may exceed them when splitting would make the design worse, but growth beyond the review threshold should trigger a deliberate check for separable responsibilities.
+
+Preferred decomposition rules:
+
+```text
+- one clear responsibility per module
+- keep React/UI rendering separate from Netscript I/O
+- keep state transport, actions, formatting, styles, and views separable
+- reuse shared helpers instead of copying logic between runners/views
+- avoid circular imports
+- avoid tiny one-function files when they do not create a meaningful boundary
+- do not add abstraction solely to reduce line count
+- preserve Bitburner RAM awareness when introducing imports
+- large coordinators should delegate calculation/state/rendering to pure helper modules
+- new features should normally extend an existing focused module or add a focused module, not enlarge a monolith
+```
+
+For GUI work specifically, preserve the single-mounted React tree and Netscript-free React callbacks. The asynchronous Netscript loop owns ports/files/process launches; React consumes cached plain-JS state and emits plain-JS requests.
+
+The current monolithic `ui/dashboard.js` is a known exception and should be replaced by a parity-first modular refactor before substantial new GUI features are added. The intended shape is approximately:
+
+```text
+ui/
+  dashboard.js          small entrypoint / async bridge
+  state.js              snapshot collection
+  actions.js            request/action bridge
+  styles.js             shared style objects
+  components/
+    layout.js
+    controls.js
+    telemetry.js
+  views/
+    overview.js
+    targets.js
+    economy.js
+    batch.js
+    network.js
+    diagnostics.js
+```
+
+Feature parity comes before cleanup or redesign. Existing tabs, controls, cards, collapse behavior, MULTI controls, batch telemetry, economy/network views, and safety behavior must survive the refactor. The distributed-prepper target-progress card should be added after or as part of that modular Targets view.
+
 ## Control modes
 
 ```text
@@ -71,9 +129,9 @@ run hacking/prepper.js 0.125 64 1024
 
 Arguments are `reserveRatio minReserveGb maxReserveGb`.
 
-Port 18 V2 publishes `reservedHosts`, `reservedRamGb`, `targetCount`, `preparedCount`, `needsPrepCount`, `activeCount`, `activeJobs`, `demandTargets`, `nextTargets`, and completed wave count. `reservedHost` is retained as a compatibility alias for the first reserved host.
+Port 18 V2 publishes `reservedHosts`, `reservedRamGb`, `targetCount`, `preparedCount`, `needsPrepCount`, `activeCount`, `activeJobs`, `prepTargets`, `demandTargets`, `nextTargets`, and completed wave count. Each `prepTargets` entry includes current/max money, money ratio, security delta, current/next prep action, active host, and estimated prep ETA. `reservedHost` is retained as a compatibility alias for the first reserved host.
 
-`lib/execution.js` now understands both legacy one-host Port 18 state and V2 multi-host reservations. A fresh V2 reservation excludes every listed reserved host from the production execution pool.
+`lib/execution.js` understands both legacy one-host Port 18 state and V2 multi-host reservations. A fresh V2 reservation excludes every listed reserved host from the production execution pool.
 
 Important runtime validation still required after pull: verify the new prepper starts, reserves a reasonable amount of RAM, increases prepared target count, and production pool excludes all reserved prep hosts without collisions.
 
@@ -158,21 +216,24 @@ This per-target evidence is separate from global distinct-target stress evidence
 
 Batch tab contains Multi-target controls and Multi-target activity. Same profile/top-target/live-batch/hack/gap fields can launch a finite wave or start/update controller MULTI. Quick Controls has Multi. Activity shows active targets and timing progress. All normal and hero cards are collapsible with React-local state; callbacks remain Netscript-free. Stale Port 16 pipeline state is freshness-gated.
 
-The V2 prepper has richer Port 18 telemetry but the dashboard has not yet been upgraded to render all new fields.
+The current dashboard is intentionally scheduled for a parity-first modular refactor. Port 18 already exposes the telemetry required for a Targets-tab preparation card showing servers below full money, their percentage, current prep state, and ETA.
 
 ## Current limitations / next sequence
 
 ```text
-1. Pull main and restart startup so prepper V2 + execution reservation support are live together.
-2. Run diagnostics/mem-audit.js and confirm managed/unmanaged counts remain clean.
-3. Inspect prepper Port 18 / GUI and ps output: verify multiple reserved hosts, sensible reserved RAM, and concurrent prep jobs.
-4. Let prepper raise prepared target count above 5.
-5. Re-run stress test through depth 6; depth 5 is already proven and depth 6 was only prep-limited.
-6. Improve stress BLOCKED behavior to wait on Port 18 readiness rather than relaunching every 10s.
-7. Wire proven global stress depth into controller MULTI as an evidence ceiling, not a forced depth.
-8. Validate repeated controller-owned MULTI waves and MULTI -> STANDBY drain.
-9. Move from whole-wave repetition to rolling per-target admissions.
-10. Add target-local recovery before continuous aggressive admission or same-target overlap.
+1. Modularize ui/dashboard.js with strict feature parity and the engineering constraints above.
+2. Add the Port 18 target-preparation card in the new Targets view.
+3. Pull main and restart startup so prepper V2 + execution reservation support + modular GUI are live together.
+4. Run diagnostics/mem-audit.js and confirm managed/unmanaged counts remain clean.
+5. Runtime-test rapid tab switching, collapse controls, controller buttons, MULTI controls, and GUI refresh behavior.
+6. Inspect prepper state / GUI and ps output: verify multiple reserved hosts, sensible reserved RAM, concurrent prep jobs, and ETA progress.
+7. Let prepper raise prepared target count above 5.
+8. Re-run stress test through depth 6; depth 5 is already proven and depth 6 was only prep-limited.
+9. Improve stress BLOCKED behavior to wait on Port 18 readiness rather than relaunching every 10s.
+10. Wire proven global stress depth into controller MULTI as an evidence ceiling, not a forced depth.
+11. Validate repeated controller-owned MULTI waves and MULTI -> STANDBY drain.
+12. Move from whole-wave repetition to rolling per-target admissions.
+13. Add target-local recovery before continuous aggressive admission or same-target overlap.
 ```
 
 Automatic worker watchdog remains deferred. XP scoring remains a proxy rather than exact Formula-based XP.
