@@ -18,6 +18,9 @@ import { readOverlapEvidence } from "/lib/multi-overlap-evidence.js";
 import { readOverlapValidationState } from "/lib/overlap-validation-state.js";
 import { readTelemetryState } from "/lib/telemetry.js";
 
+const OVERLAP_VALIDATOR = "/diagnostics/multi-overlap-validate.js";
+const OVERLAP_MIXED = "/diagnostics/multi-overlap-mixed.js";
+
 let cachedState = null;
 let stateVersion = 0;
 
@@ -45,7 +48,14 @@ export function refreshSnapshot(ns) {
         prepper: readPrepperState(ns),
         overlapEvidence: readOverlapEvidence(ns),
         overlapValidation: readOverlapValidationState(ns),
+        validationRuntime: validationRuntime(ns),
     };
     touchState();
     return cachedState;
+}
+
+function validationRuntime(ns) {
+    const validator = ns.scriptRunning(OVERLAP_VALIDATOR, "home");
+    const mixed = ns.scriptRunning(OVERLAP_MIXED, "home");
+    return { active: validator || mixed, validator, mixed };
 }
