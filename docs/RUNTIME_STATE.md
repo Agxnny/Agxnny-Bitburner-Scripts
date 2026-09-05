@@ -31,10 +31,21 @@
 Current execution modes:
 
 ```text
-STANDBY | HGW | BATCH | PIPELINE
+STANDBY | HGW | BATCH | PIPELINE | MULTI
 ```
 
 Startup initializes the production controller in `STANDBY`. The background prepper is independent of production mode, so STANDBY may still show grow/weaken maintenance on the dedicated reserved prep host.
+
+`MULTI` is controller-managed repeated finite multi-target waves. It does not enable same-target overlap; per-target depth remains 1.
+
+Controller `executionMode` now also publishes:
+
+```text
+multiRunning
+multiRunnerHost
+multiSafetyStopped
+multiConfig { profile, targetCount, globalDepth, hackFraction, stageGapMs }
+```
 
 ## Port 13 — controller requests
 
@@ -43,12 +54,15 @@ PREP_TARGET
 RESUME_AUTO
 SET_MANUAL_TARGET
 CLEAR_MANUAL_TARGET
-SET_EXECUTION_MODE STANDBY|HGW|BATCH|PIPELINE
+SET_EXECUTION_MODE STANDBY|HGW|BATCH|PIPELINE|MULTI
+START_MULTI { profile, targetCount, globalDepth, hackPercent, stageGapMs }
 ```
 
-Mode changes wait for a safe boundary. PIPELINE admission stops on a pending mode request and the already-admitted wave drains naturally before the controller completes the transition. This behavior is runtime-validated for PIPELINE -> STANDBY.
+`START_MULTI` validates and stores the requested multi-target configuration, then transitions the controller to MULTI at the next safe boundary. If MULTI is already active, the new configuration applies to the next wave.
 
-The GUI-launched finite multi-target runner does not add a Port 13 command. The dashboard's async Netscript loop launches it directly only after verifying the controller is fully settled in STANDBY with zero active controller jobs.
+Mode changes wait for a safe boundary. A pending transition stops new admissions. If a multi-target wave is active, the controller waits for that finite wave to finish rather than killing it.
+
+`RESUME_AUTO` clears a MULTI safety stop as well as the existing pipeline/prep hold states.
 
 ## Port 14 — batch timing event queue
 
@@ -68,9 +82,7 @@ The real multi-target executor routes Port 14 events by unique `batchId` to inde
 
 Port 15 accepts compatible serialized, single-target pipeline, and real multi-target completion payloads. It remains latest-only. `hacking/batch-history.js` watches this snapshot and folds genuinely new completed batches into Port 19.
 
-The collector treats the Port 15 snapshot already present at collector startup as stale/observed, requires a completion timestamp at or after collector startup, and deduplicates batch IDs.
-
-Multi-target executor V2 generates a unique run ID on every invocation and unique batch IDs inside that run, preventing legitimate repeated finite waves from being discarded as duplicate history samples.
+Multi-target executor V2 generates a unique run ID on every invocation and unique batch IDs inside that run, preventing legitimate repeated waves from being discarded as duplicate history samples.
 
 ## Port 16 — single-target pipeline state
 
@@ -96,15 +108,15 @@ Persistent planning-only simulator:
 MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED
 ```
 
-The persistent simulator enforces Port 19 `recommendedDepth` as a hard per-target virtual cap and continuously frees/replaces expired virtual reservations through one shared host/time RAM calendar.
-
 Current real finite executor:
 
 ```text
 MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE
 ```
 
-`hacking/multi-target-runner.js` remains finite and deliberately conservative. It supports configurable distinct-target concurrency while keeping same-target overlap locked out:
+The same finite executor is used for both manual/GUI tests and controller-managed MULTI waves. Manual runs require controller STANDBY; controller-owned runs carry `--controller` and require controller mode MULTI.
+
+Real execution remains deliberately conservative:
 
 ```text
 globalLiveDepthCap: configurable 2-12
@@ -116,15 +128,12 @@ JIT stage dispatch
 one Port 14 consumer/router
 Port 15 completion publication
 unique runId + batchId
-controller must be fully STANDBY
 ```
 
-Important V2 state fields:
+Important V2 state fields include:
 
 ```text
-version: 2
-model: MULTI_TARGET_EXECUTOR_V2_CONFIGURABLE_FINITE
-finite: true
+controllerOwned
 runId
 profile
 status
@@ -137,20 +146,16 @@ completed[]
 updatedAt
 ```
 
-The executor validates positional arguments before planning. Extra/malformed pasted arguments are rejected instead of becoming `NaN` timing values.
-
-Each completion's landing summary includes explicit aggregate counters:
+Controller behavior after a wave exits:
 
 ```text
-expectedJobs
-reportedJobs
-missingJobs
-totalMissingJobs
+COMPLETE    -> admit another wave after re-evaluation/retry delay
+BLOCKED     -> retry later (for example while targets are still being prepped)
+SAFETY_STOP -> halt new MULTI admissions until Resume
+unexpected  -> halt admissions for review
 ```
 
-as well as per-stage counters, order, drift, spacing, and allocation spread.
-
-The runner refuses to start unless the controller is fully settled in STANDBY, no controller standalone jobs remain, and no conflicting single-target pipeline, serialized batch runner, persistent multi-target simulator, or second multi-target runner is active.
+Each completion's landing summary includes aggregate `expectedJobs`, `reportedJobs`, `missingJobs`, and `totalMissingJobs`, plus per-stage order, drift, spacing, and allocation spread.
 
 ## Port 18 — dedicated prepper / reserved-host state
 
@@ -161,6 +166,8 @@ DEDICATED_TARGET_PREPPER_V1
 ```
 
 `lib/execution.js` treats a Port 18 reservation as active only while its heartbeat is fresh. A fresh reserved host is excluded from normal production capacity.
+
+The dedicated prepper is especially important in MULTI mode because a BLOCKED wave caused by too few prepared top-ranked targets can be retried later without weakening the prepared-target gate.
 
 ## Port 19 — rolling real batch safety history
 
@@ -181,10 +188,12 @@ Higher depth recommendations require consecutive clean pipeline-style samples:
 8+ consecutive clean  -> depth 8 / HIGH
 ```
 
-The persistent simulator may use these recommendations, but the current real multi-target executor deliberately ignores higher same-target recommendations and remains hard-capped at one live batch per target.
+The persistent simulator may use these recommendations, but controller MULTI still ignores higher same-target recommendations and remains hard-capped at one live batch per target.
 
 ## GUI rule
 
 React callbacks only update local/plain-JS request state. Netscript port/file/process I/O stays in the asynchronous dashboard loop.
 
-The Batch tab now reads Port 17 and exposes finite multi-target controls for profile, top target count, distinct live batch count, hack fraction, and stage gap. The launch button is disabled unless the controller is parked in STANDBY and there are no active controller jobs.
+The Batch tab exposes both a one-shot **Finite wave** button and a **Start controller / Update controller** button using the same profile/target/depth/hack/gap fields. Quick Controls also includes a Multi button using those current fields.
+
+All content/hero cards remain collapsible with React-local collapse state.
