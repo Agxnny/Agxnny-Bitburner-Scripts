@@ -6,7 +6,6 @@ const KEEPER = "/stocks/history-keeper.js";
 const REFRESH_MS = 250;
 const FOUR_S_GOAL = 25e9;
 const CANDLE_VIEWS = [
-    { label: "1m", lookbackMs: 60_000, candleMs: 10_000 },
     { label: "5m", lookbackMs: 300_000, candleMs: 30_000 },
     { label: "15m", lookbackMs: 900_000, candleMs: 60_000 },
     { label: "30m", lookbackMs: 1_800_000, candleMs: 60_000 },
@@ -49,7 +48,7 @@ function App() {
     const symbols = Array.isArray(market.symbols) ? market.symbols : [];
     const [selected, setSelected] = React.useState(symbols[0]?.symbol ?? "");
     const [view, setView] = React.useState("candles");
-    const [candleView, setCandleView] = React.useState("1m");
+    const [candleView, setCandleView] = React.useState("5m");
     const [range, setRange] = React.useState(0);
     const active = symbols.some((row) => row.symbol === selected) ? selected : symbols[0]?.symbol ?? "";
     return el("div", { style: s.app },
