@@ -61,9 +61,12 @@ Latest user runtime evidence before depth-N rollout: joesguns validated cleanly;
 ## Stock research baseline
 Observation/history only; no autonomous trading yet. `lib/stock-history.js` retains all history going forward with `Date.now()` timestamps and explicit recorder gaps. `stocks/history-keeper.js` polls TIX every 200ms and persists only price-vector changes.
 
-`stocks/dashboard.js` CANDLES now uses true wall-clock lookback windows `5m/15m/30m/1h/4h` (1m removed). Mapping is approximately 5m→30s OHLC, 15m→1m, 30m→1m, 1h→1m, 4h→2m, so longer views naturally contain more candles. HISTORY · LINE provides `15m/1h/3h/6h/12h/24h/ALL`. Chart gap markers only render when a retained gap intersects the visible time window. Inactive chart/timeframe buttons use black borders; active uses blue accent.
+`stocks/dashboard.js` CANDLES uses true wall-clock lookback windows `5m/15m/30m/1h/4h` (1m removed). Mapping is approximately 5m→30s OHLC, 15m→1m, 30m→1m, 1h→1m, 4h→2m, so longer views naturally contain more candles. HISTORY · LINE provides `15m/1h/3h/6h/12h/24h/ALL`. Chart gap markers only render when a retained gap intersects the visible time window. Inactive chart/timeframe buttons use black borders; active uses blue accent.
 
 Startup launches both main and stock dashboards.
+
+### Startup GUI admission fix
+A runtime report showed `startup.js` could return `WARNING: Could not start the main GUI` when `ns.run()` could not admit the dashboard while startup itself still occupied home RAM. `startup.js` now delegates GUI startup to new low-RAM `/ui/dashboard-launcher.js`, then immediately spawns the normal kickstart chain. The launcher waits briefly so startup RAM is released, retries each dashboard up to 20 times, and if admission still fails prints required/free/max home RAM. This is intended to distinguish genuine RAM pressure from missing-script issues instead of silently losing the GUI.
 
 ## Prepper
 `hacking/prepper.js` + `hacking/prepper-allocation.js`, model `DISTRIBUTED_TARGET_PREPPER_V3_ADAPTIVE_FOCUS`, Port 18. Adaptive money-first prep with bounded reserved RAM. Automatic validation borrowing is NOT implemented yet.
