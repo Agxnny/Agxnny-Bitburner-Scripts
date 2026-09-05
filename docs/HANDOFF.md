@@ -79,17 +79,17 @@ controller-owned runs require controller MULTI mode
 no same-target overlap yet
 ```
 
-The runner now supports a controller-only `--controller` flag. That flag is not a positional argument and allows the main controller to own repeated MULTI waves while preserving the manual STANDBY preflight for one-shot tests.
+The runner supports a controller-only `--controller` flag. That flag is not a positional argument and allows the main controller to own repeated MULTI waves while preserving the manual STANDBY preflight for one-shot tests.
 
-## New controller-managed MULTI mode
+## Controller-managed MULTI mode
 
-`hacking/controller.js` now recognizes:
+`hacking/controller.js` recognizes:
 
 ```text
 STANDBY | HGW | BATCH | PIPELINE | MULTI
 ```
 
-New Port 13 request:
+Port 13 request:
 
 ```text
 START_MULTI { profile, targetCount, globalDepth, hackPercent, stageGapMs }
@@ -121,7 +121,7 @@ stage gap 200 ms
 
 These remain deliberately conservative: repeated waves are continuous at the controller level, but there is still no same-target overlap inside a wave.
 
-Controller state now publishes:
+Controller state publishes:
 
 ```text
 executionMode.multiRunning
@@ -130,9 +130,76 @@ executionMode.multiSafetyStopped
 executionMode.multiConfig
 ```
 
+## Progressive multi-target stress test
+
+New managed script:
+
+```text
+diagnostics/multi-target-stress.js
+```
+
+Current model/state:
+
+```text
+MULTI_TARGET_STRESS_V1
+Port 20
+```
+
+Default command:
+
+```text
+run diagnostics/multi-target-stress.js
+```
+
+Equivalent explicit defaults:
+
+```text
+run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 10
+```
+
+Arguments:
+
+```text
+profile mode: mixed | money | balanced | xp
+maxDepth: highest distinct-target concurrency to test, 2-12
+wavesPerDepth: clean waves required before increasing depth, 1-10
+targetCount: candidate target window, 2-12 and >= maxDepth
+hackFraction: default 0.10
+stageGapMs: default 200
+prepWaitMinutes: how long BLOCKED waves may wait/retry for prep, default 10
+```
+
+Stress-test behavior:
+
+```text
+starts at distinct-target depth 2
+requires every wave at a depth to complete cleanly before incrementing depth
+mixed mode rotates MONEY -> BALANCED -> XP to exercise a broader range of ranked targets
+uses the real finite multi-target runner, not simulation
+runs only while controller is fully STANDBY
+never overlaps two real multi-target coordinators
+BLOCKED waits/retries for the dedicated prepper up to the configured timeout
+first SAFETY_STOP / bad completion stops escalation immediately
+controller mode changes stop the test after the current finite wave drains
+records highest clean depth, clean wave count, unique targets, max drift, min spacing, blocked retries, and recent wave results on Port 20
+```
+
+This gives a repeatable downtime burn-in test for finding the highest observed clean distinct-target concurrency. It does not automatically promote production MULTI depth; results are evidence for later manual/controller tuning.
+
+After adding this script the expected managed-file audit becomes:
+
+```text
+54 installed managed JS files
+42 runnable scripts
+12 library modules
+0 unmanaged installed .js files
+```
+
+Runtime validation is still required after pull.
+
 ## Main GUI multi-target controls and activity
 
-The Batch tab now has:
+The Batch tab has:
 
 ```text
 Multi-target controls
@@ -153,7 +220,9 @@ The activity card shows current executor profile/run ID/owner, active-target cou
 
 All dashboard content cards and hero cards are collapsible with React-local state. React callbacks remain Netscript-free.
 
-The dashboard also now suppresses stale Port 16 pipeline state unless the controller says the pipeline is running or the Port 16 state is fresh, avoiding the earlier appearance of a pipeline still running many minutes after it stopped.
+The dashboard suppresses stale Port 16 pipeline state unless the controller says the pipeline is running or the Port 16 state is fresh, avoiding the earlier appearance of a pipeline still running many minutes after it stopped.
+
+The progressive stress test currently has a terminal command + Port 20 state contract. A compact GUI stress card can be added after the backend is runtime-validated rather than increasing dashboard complexity before the test behavior is proven.
 
 ## Rolling real batch safety history
 
@@ -194,15 +263,17 @@ The persistent simulator may use these caps. Real controller MULTI still ignores
 - Port 17: global multi-target planner/simulator/executor state.
 - Port 18: dedicated prepper/reserved-host state.
 - Port 19: rolling per-target real batch safety history.
+- Port 20: progressive multi-target stress-test state.
 
 ## Current important limitations
 
-- Controller MULTI is newly integrated and has not yet been runtime-validated after this commit.
+- Controller MULTI is newly integrated and still needs runtime validation across repeated controller-owned waves.
 - MULTI currently repeats whole finite waves; it is not yet a continuously rolling per-target admission scheduler.
 - Per-target real multi-target depth is intentionally fixed at 1.
 - Larger tests increase the number of distinct concurrent targets, not same-target pipeline depth.
 - Target-local failure/recovery is not yet implemented; current safety policy is a global MULTI admission stop until Resume.
 - Active multi-target timing card still shows H and W2 countdowns plus launched-stage progress rather than full four-stage live timings.
+- Stress test exercises distinct-target concurrency only; it does not test same-target overlap.
 - XP scoring remains a proxy, not exact Formula-based hacking XP.
 - Automatic worker watchdog termination remains deferred.
 
@@ -210,14 +281,13 @@ The persistent simulator may use these caps. Real controller MULTI still ignores
 
 ```text
 1. Pull latest main and restart startup
-2. Run diagnostics/mem-audit.js and confirm 53 managed JS / 41 scripts / 12 modules / 0 unmanaged
-3. In Batch controls use MONEY, top 6, live 3, hack 10%, gap 200
-4. Click Start controller (or Multi in Quick Controls)
-5. Verify controller transitions STANDBY -> MULTI and launches one home multi-target-runner
-6. Verify first controller-owned wave completes cleanly and a second wave is launched automatically
-7. Switch MULTI -> STANDBY during an active wave and verify no replacement wave is admitted; current wave finishes then controller parks
-8. If a wave SAFETY_STOPs, verify MULTI stops admitting until Resume
-9. Only after repeated controller-owned clean waves consider rolling admission and evidence-gated same-target depth
+2. Run diagnostics/mem-audit.js; expect 54 managed JS / 42 scripts / 12 modules / 0 unmanaged
+3. Finish controller MULTI validation at MONEY top 6 / live 3 / hack 10% / gap 200
+4. Verify repeated controller waves and MULTI -> STANDBY drain behavior
+5. During safe downtime with controller parked, run diagnostics/multi-target-stress.js mixed 6 2 12 0.10 200 10 for an initial burn-in
+6. If clean through depth 6, optionally extend to maxDepth 8 before trying higher values
+7. Record the first failing/blocked depth, target mix, drift, spacing, and exact failure reason
+8. Only after repeated clean evidence consider rolling admission and evidence-gated same-target depth
 ```
 
 ## Useful commands
@@ -228,4 +298,6 @@ run startup.js
 run diagnostics/mem-audit.js
 ps home
 run hacking/multi-target-runner.js money 6 0.10 200 3
+run diagnostics/multi-target-stress.js mixed 6 2 12 0.10 200 10
+run diagnostics/multi-target-stress.js mixed 8 2 12 0.10 200 10
 ```
