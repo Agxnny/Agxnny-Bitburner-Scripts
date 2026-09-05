@@ -22,7 +22,7 @@
 | 14 | Batch timing events | Event queue |
 | 15 | Latest completed batch | Latest-value snapshot |
 | 16 | Single-target pipeline planner/simulation/executor | Latest-value snapshot |
-| 17 | Global multi-target planner/simulator | Latest-value snapshot |
+| 17 | Global multi-target planner/simulator/executor | Latest-value snapshot |
 | 18 | Dedicated prepper / reserved-host state | Latest-value snapshot |
 | 19 | Rolling real batch safety history | Latest-value snapshot |
 
@@ -46,19 +46,27 @@ CLEAR_MANUAL_TARGET
 SET_EXECUTION_MODE STANDBY|HGW|BATCH|PIPELINE
 ```
 
-Mode changes wait for a safe boundary. For PIPELINE, later wave admission stops and already-admitted work drains before the controller applies the new mode.
+Mode changes wait for a safe boundary. PIPELINE admission stops on a pending mode request and the already-admitted wave drains naturally before the controller completes the transition. This behavior is now runtime-validated for PIPELINE -> STANDBY.
 
 ## Port 14 — batch timing event queue
 
-Workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error. Serialized BATCH and real PIPELINE remain mutually exclusive. The real pipeline coordinator owns and routes Port 14 by `batchId` while active.
+Workers emit `BATCH_STAGE_COMPLETE` events with batch/stage/job identity, threads, planned landing, finish time, and landing error.
 
-Neither multi-target planning script, the prepper, nor the batch-history collector consumes Port 14.
+Exactly one real coordinator may own Port 14 at a time. Current real consumers are:
+
+```text
+hacking/batch-runner.js
+hacking/pipeline-runner.js
+hacking/multi-target-runner.js
+```
+
+The first live multi-target prototype routes Port 14 events by `batchId` to independent target batches. Planning-only multi-target scripts, the prepper, and the batch-history collector do not consume Port 14.
 
 ## Port 15 — latest completed batch
 
-Port 15 accepts compatible serialized and pipeline completion payloads. It remains latest-only. `hacking/batch-history.js` watches this snapshot and folds genuinely new completed batches into Port 19.
+Port 15 accepts compatible serialized, single-target pipeline, and conservative multi-target completion payloads. It remains latest-only. `hacking/batch-history.js` watches this snapshot and folds genuinely new completed batches into Port 19.
 
-The collector treats the Port 15 snapshot already present at collector startup as stale/observed, requires a completion timestamp at or after collector startup, and deduplicates batch IDs. This prevents restarts or replayed latest-value snapshots from manufacturing extra safety evidence.
+The collector treats the Port 15 snapshot already present at collector startup as stale/observed, requires a completion timestamp at or after collector startup, and deduplicates batch IDs.
 
 ## Port 16 — single-target pipeline state
 
@@ -70,7 +78,7 @@ PIPELINE_ADMISSION_SIM_V3_DEPTH2
 PIPELINE_EXECUTOR_DEPTH2_V2
 ```
 
-## Port 17 — global multi-target planner / simulator
+## Port 17 — global multi-target state
 
 One-shot allocator:
 
@@ -78,42 +86,35 @@ One-shot allocator:
 MULTI_TARGET_ALLOCATOR_DRY_RUN_V2_SHARED
 ```
 
-Persistent simulator current model:
+Persistent planning-only simulator:
 
 ```text
 MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED
 ```
 
-The persistent simulator remains planning-only and launches no workers. It continuously expires virtual reservations, refreshes target readiness and live remote capacity, and re-admits work through one shared global host/time RAM calendar.
+The persistent simulator enforces Port 19 `recommendedDepth` as a hard per-target virtual cap and continuously frees/replaces expired virtual reservations through one shared host/time RAM calendar.
 
-Port 19 `recommendedDepth` is now enforced as a hard per-target virtual admission cap. No trusted pipeline history means depth 1. Targets with clean real pipeline evidence may earn higher simulated caps. If an already-running virtual depth exceeds a newly reduced cap, existing virtual batches are not killed; new admissions pause until depth naturally falls below the cap.
-
-Important state fields now include:
+First real multi-target prototype:
 
 ```text
-version: 3
-model: MULTI_TARGET_ADMISSION_SIM_V3_HISTORY_CAPPED
-enforcesBatchHistoryDepthCap: true
-batchHistory.online
-batchHistory.model
-batchHistory.updatedAt
-targets[].activeDepth
-targets[].safetyDepthCap
-targets[].safetyConfidence
-targets[].pipelineEvidence
-targets[].consecutiveCleanPipeline
-targets[].latestPipelineHealthy
-targets[].safetyReason
+MULTI_TARGET_EXECUTOR_V1_CONSERVATIVE
 ```
 
-Target scheduler states include:
+`hacking/multi-target-runner.js` is intentionally finite and conservative. It:
 
 ```text
-WAITING_PREP
-READY
-RUNNING
-AT_SAFETY_CAP
+global live depth: 2
+per-target live depth: 1
+prepared targets only
+one batch per distinct target
+one shared host/time RAM reservation calendar
+JIT stage dispatch
+one Port 14 consumer/router
+Port 15 completion publication
+no dynamic live depth promotion yet
 ```
+
+The real prototype refuses to start while the single-target pipeline runner, serialized batch runner, or persistent multi-target simulator is active. It is not yet controller-integrated and is intended only for explicit terminal validation.
 
 ## Port 18 — dedicated prepper / reserved-host state
 
@@ -123,7 +124,7 @@ Published by `hacking/prepper.js` with model:
 DEDICATED_TARGET_PREPPER_V1
 ```
 
-`lib/execution.js` treats a Port 18 reservation as active only while the heartbeat is fresh (currently 5 seconds). A fresh `reservedHost` is excluded from the normal remote execution pool. If the prepper stops and Port 18 becomes stale, the host automatically returns to production capacity.
+`lib/execution.js` treats a Port 18 reservation as active only while its heartbeat is fresh. A fresh reserved host is excluded from normal production capacity.
 
 ## Port 19 — rolling real batch safety history
 
@@ -133,37 +134,18 @@ Published by `hacking/batch-history.js` with model:
 ROLLING_BATCH_HISTORY_V2_PIPELINE_EVIDENCE
 ```
 
-The collector watches Port 15 for fresh `COMPLETE` batch IDs and keeps up to 16 real samples per target. Each sample records whether it came from a real pipeline completion, source model, order correctness, missing timing jobs, final money/security recovery, maximum landing drift, minimum spacing, allocation spread, gap, and batch interval.
-
-Per-target summary fields include:
-
-```text
-sampleCount
-pipelineSampleCount
-cleanSamples
-cleanPipelineSamples
-consecutiveClean
-recommendedDepth
-confidence
-latestHealthy
-lastFinishedAt
-maxAbsLandingErrorMs
-minSpacingMs
-maxRecoveryMoneyError
-maxSecurityDelta
-samples[]
-```
-
 A clean sample requires correct stage order, zero missing timing jobs, >=99.5% money recovery, <=+0.05 security, <=150 ms maximum absolute landing error, and >=75 ms minimum observed spacing.
 
-Higher depth recommendations require consecutive clean **pipeline** samples. Serialized single-batch completions may remain in history for diagnostics but cannot promote a target above depth 1.
+Higher depth recommendations require consecutive clean pipeline-style samples:
 
 ```text
-0-1 consecutive clean pipeline samples -> depth 1 / UNPROVEN
-2-3 consecutive clean pipeline samples -> depth 2 / LOW
-4-7 consecutive clean pipeline samples -> depth 4 / MEDIUM
-8+ consecutive clean pipeline samples  -> depth 8 / HIGH
+0-1 consecutive clean -> depth 1 / UNPROVEN
+2-3 consecutive clean -> depth 2 / LOW
+4-7 consecutive clean -> depth 4 / MEDIUM
+8+ consecutive clean  -> depth 8 / HIGH
 ```
+
+The persistent simulator may use these recommendations, but the first real multi-target executor deliberately ignores higher recommendations and remains hard-capped at one live batch per target.
 
 ## GUI rule
 
