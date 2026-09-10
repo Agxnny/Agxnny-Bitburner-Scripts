@@ -1,16 +1,19 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "releaseVersion": "v0.1.0",
+  "revisionId": "manifest-v2-baseline",
   "versionFile": "/VERSION.txt",
   "files": [
-    "/VERSION.txt",
-    "/stack-manifest.json",
-    "/core/config.js",
-    "/core/contracts.js",
-    "/core/state.js",
-    "/systems/data-collection/network.js",
-    "/systems/data-collection/resource-collector.js",
-    "/systems/ram-audit/audit.js"
+    { "path": "/VERSION.txt", "required": true, "fileVersion": 1, "change": "modified" },
+    { "path": "/stack-manifest.json", "required": true, "fileVersion": 2, "change": "modified" },
+    { "path": "/core/config.js", "required": true, "fileVersion": 2, "change": "modified" },
+    { "path": "/core/contracts.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/core/state.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/data-collection/network.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/data-collection/resource-collector.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/ram-audit/audit.js", "required": true, "fileVersion": 1, "change": "added" }
   ],
+  "removedFiles": [],
   "runtimeEntries": [
     {
       "path": "/systems/data-collection/resource-collector.js",
