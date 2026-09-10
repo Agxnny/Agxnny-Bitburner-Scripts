@@ -4,7 +4,7 @@
 
 This document refines the root repository `DESIGN.md` for the Data Collection subsystem. The root `DESIGN.md` remains authoritative if the two conflict.
 
-Implementation-specific transport formats, exact schemas, refresh intervals, and retry algorithms remain intentionally deferred until their consumers are implemented and validated.
+Implementation-specific transport filenames, exact serialized schemas, refresh intervals, and retry algorithms remain intentionally deferred until their consumers are implemented and validated.
 
 ## Purpose
 
@@ -88,9 +88,11 @@ Own observed fleet facts such as purchased-server identities, RAM, usage, availa
 
 Own observed local/available revision and release-version state used by the Update Watcher. Observation must remain separate from installation.
 
-## Shared State Contract
+## Shared State Architecture
 
-Each published domain snapshot should carry a small common metadata contract conceptually containing:
+Shared operational state is published as domain-oriented snapshots rather than one monolithic global object.
+
+A snapshot should conceptually carry:
 
 ```text
 domain
@@ -102,9 +104,27 @@ source
 data
 ```
 
-Exact field names and serialization are deferred.
+Exact serialized field names remain deferred.
 
-State should be domain-oriented rather than one monolithic global state object so that failure, freshness, loading, and schema evolution can remain isolated.
+The architectural default is durable, JSON-compatible domain snapshots/files, while ports are reserved for lightweight update/invalidation notifications rather than primary state storage. If implementation reveals a lower-RAM equivalent with the same durability, inspectability, and isolation properties, the transport may be deliberately revised without changing the state contract.
+
+### Publication Semantics
+
+A new snapshot replaces the current snapshot only after acquisition, normalization, and validation succeed.
+
+Readers must not observe half-written or partially replaced snapshots. Publication should therefore be atomic from the consumer's perspective even if implementation uses a temporary file or equivalent replacement mechanism.
+
+If refresh fails, the last known valid snapshot remains available and ages according to freshness policy.
+
+> Collection failure must not destroy the last known valid state unless that state is explicitly known to be invalid.
+
+If current knowledge proves previous state incorrect or unsafe to consume, the state may be explicitly invalidated.
+
+Failure of one collector should not unnecessarily terminate or invalidate unrelated domains.
+
+### Schema Compatibility
+
+Snapshots carry a schema version. Consumers must not silently interpret an incompatible schema as valid. Incompatible state is treated as invalid/unavailable for that consumer until a compatible snapshot exists.
 
 ## Freshness Model
 
@@ -119,7 +139,7 @@ UNAVAILABLE
 
 `STALE` means previously valid state may still be usable depending on the consumer. It is not equivalent to `INVALID` or `UNAVAILABLE`.
 
-Freshness requirements are domain-specific.
+Freshness requirements belong to consumer contracts rather than one universal timeout. Data Collection publishes age/freshness metadata; each consumer defines whether stale data is acceptable for a specific operation.
 
 Broad classes are:
 
@@ -129,32 +149,84 @@ Broad classes are:
 
 Exact cadences must be centrally configurable and remain deferred until implementation.
 
-## Publication and Failure Semantics
-
-A collector should publish a new valid snapshot only after a successful acquisition/normalization cycle.
-
-If refresh fails, the system should normally preserve the last known valid snapshot and allow it to age into `STALE` rather than replacing it with empty or misleading data.
-
-> Collection failure must not destroy the last known valid state unless that state is explicitly known to be invalid.
-
-If current knowledge proves previous state incorrect or unsafe to consume, the state may be explicitly invalidated.
-
-Failure of one collector should not unnecessarily terminate or invalidate unrelated domains.
-
-## State Transport
+## State Transport and Notifications
 
 Scheduler control ports are not the primary shared-state store.
 
-The system should expose standardized shared-state interfaces, likely using domain files and/or dedicated state mechanisms. Ports may carry lightweight notifications such as:
+Ports may carry lightweight notifications such as:
 
 - `DATA_UPDATED`;
 - `DATA_STALE`;
 - `COLLECTOR_FAILED`;
 - `STATE_INVALIDATED`.
 
-Ports remain live coordination/event channels rather than durable truth.
+Ports remain live coordination/event channels rather than durable truth. A consumer that misses a notification must still be able to recover by reading the current snapshot.
 
-Exact shared-state transport and persistence format are deferred.
+## State History
+
+Shared state primarily represents current decision truth. Large or indefinite history does not belong in the shared-state layer.
+
+Limited history may be retained where a specific consumer needs it, but long-running trend/history requirements should normally be handled as telemetry rather than by bloating authoritative state.
+
+## Telemetry Architecture
+
+State and telemetry are separate contracts.
+
+> State exists so systems can make decisions. Telemetry exists so humans and validation systems can understand, prove, and diagnose those decisions.
+
+A system must not require scraping logs or telemetry to reconstruct authoritative operational state.
+
+### Current Telemetry Summary
+
+Each major system should expose a compact current telemetry/health summary containing relevant items such as:
+
+```text
+health
+mode
+current activity
+last successful action
+last failure
+resource usage
+key counters
+last decision
+```
+
+The exact schema remains deferred, but summaries should be readable without consuming production control-plane messages.
+
+### Telemetry Events
+
+Important operational events may be emitted separately from current summaries, for example batch starts/failures, trades, allocation changes, authority changes, collector failures, objective changes, or update availability.
+
+Routine loop iterations and high-volume worker noise should not automatically become telemetry events.
+
+A common event envelope should conceptually include:
+
+```text
+type
+source
+timestamp
+severity
+correlationId
+payload
+```
+
+Common severity levels should remain small and conventional, such as `DEBUG`, `INFO`, `WARN`, and `ERROR`.
+
+Severity is distinct from the global system-health vocabulary. One error event does not automatically mean overall system health is `FAIL`.
+
+### Correlation
+
+Related cross-system operations should be traceable through a shared correlation identifier where practical. This allows a higher-level objective, resource request, approval, execution, state refresh, and result to be diagnosed as one operation without tightly coupling implementations.
+
+### Retention
+
+Telemetry history must be bounded. The system should retain only enough history to support recent diagnosis and validation. Exact counts/time windows remain configurable and deferred.
+
+Telemetry failure should normally not stop production logic. Shared-state failure may block or degrade consumers when they can no longer make safe decisions.
+
+> Dashboards observe the system; they are not part of the production control path.
+
+Telemetry and dashboards must not materially distort the RAM usage or timing behavior they measure.
 
 ## World Clock
 
@@ -184,28 +256,13 @@ Update detection and update installation remain separate responsibilities.
 
 Low-RAM should collect only data valuable enough to justify its RAM/API cost. Player, server/network, and resource state are expected to form the essential core, while other collectors may be slower or on-demand depending on active systems.
 
-Persistent collection should be minimized.
+Persistent collection and telemetry history should be minimized.
 
 ### Full Stack
 
-Full Stack may support broader persistent coverage, faster refresh of volatile domains, invalidation events, richer health metadata, and limited history where those capabilities provide measurable value.
+Full Stack may support broader persistent coverage, faster refresh of volatile domains, invalidation events, richer health metadata, correlated event telemetry, and limited history where those capabilities provide measurable value.
 
-Both modes should preserve compatible conceptual state contracts.
-
-## Telemetry
-
-Potential telemetry includes:
-
-- collector health;
-- last successful refresh;
-- refresh duration;
-- refresh failures;
-- stale record/domain count;
-- invalid record/domain count;
-- schema/version;
-- RAM cost by collector;
-- last invalidation;
-- consumer-visible freshness.
+Both modes preserve compatible conceptual state and telemetry contracts.
 
 ## Validation Expectations
 
@@ -213,21 +270,28 @@ Validation should prove that:
 
 - consumers can distinguish fresh, stale, invalid, and unavailable state;
 - failed refresh does not erase last known valid state;
+- readers do not observe partial snapshot publication;
+- incompatible schemas are rejected rather than silently misread;
 - one collector failure remains isolated where dependencies permit;
 - normalized state matches observed game state;
 - duplicate expensive acquisition is not introduced without explicit justification;
 - Low-RAM and Full-Stack collection behavior respects their resource goals;
-- control ports are not used as the sole durable state store.
+- control ports are not used as the sole durable state store;
+- missed update notifications do not prevent snapshot recovery;
+- telemetry failure does not unnecessarily stop production behavior;
+- telemetry history remains bounded;
+- dashboards do not become production dependencies.
 
 ## Deferred Implementation Details
 
 Intentionally deferred:
 
-- exact file/state transport;
+- exact filenames and directories for state snapshots;
 - exact serialized schemas and field names;
+- exact atomic-publication implementation;
 - exact refresh cadences;
 - cache/invalidation algorithms;
-- persistence format;
-- collector retry/backoff policy;
-- historical retention policy;
+- collector retry/backoff intervals;
+- telemetry storage/event transport details;
+- telemetry history limits;
 - exact process grouping of collectors.
