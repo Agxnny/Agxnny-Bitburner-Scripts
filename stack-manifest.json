@@ -1,11 +1,13 @@
 {
   "schemaVersion": 2,
   "releaseVersion": "v0.1.0",
+  "revisionSequence": 2,
   "revisionId": "manifest-v2-baseline",
+  "previousRevisionId": null,
   "versionFile": "/VERSION.txt",
   "files": [
     { "path": "/VERSION.txt", "required": true, "fileVersion": 1, "change": "modified" },
-    { "path": "/stack-manifest.json", "required": true, "fileVersion": 2, "change": "modified" },
+    { "path": "/stack-manifest.json", "required": true, "fileVersion": 3, "change": "modified" },
     { "path": "/core/config.js", "required": true, "fileVersion": 2, "change": "modified" },
     { "path": "/core/contracts.js", "required": true, "fileVersion": 1, "change": "added" },
     { "path": "/core/state.js", "required": true, "fileVersion": 1, "change": "added" },
