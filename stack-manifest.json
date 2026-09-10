@@ -1,19 +1,23 @@
 {
   "schemaVersion": 2,
   "releaseVersion": "v0.1.0",
-  "revisionSequence": 2,
-  "revisionId": "manifest-v2-baseline",
-  "previousRevisionId": null,
+  "revisionSequence": 3,
+  "revisionId": "rev-0003-update-watcher",
+  "previousRevisionId": "manifest-v2-baseline",
   "versionFile": "/VERSION.txt",
   "files": [
-    { "path": "/VERSION.txt", "required": true, "fileVersion": 1, "change": "modified" },
-    { "path": "/stack-manifest.json", "required": true, "fileVersion": 3, "change": "modified" },
-    { "path": "/core/config.js", "required": true, "fileVersion": 2, "change": "modified" },
-    { "path": "/core/contracts.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/core/state.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/systems/data-collection/network.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/systems/data-collection/resource-collector.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/systems/ram-audit/audit.js", "required": true, "fileVersion": 1, "change": "added" }
+    { "path": "/VERSION.txt", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/stack-manifest.json", "required": true, "fileVersion": 4, "change": "modified" },
+    { "path": "/core/config.js", "required": true, "fileVersion": 3, "change": "modified" },
+    { "path": "/core/contracts.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/core/state.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/systems/data-collection/network.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/systems/data-collection/resource-collector.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/systems/data-collection/update/manifest.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/data-collection/update/installed-state.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/data-collection/update/watcher.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/data-collection/update/validate.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/ram-audit/audit.js", "required": true, "fileVersion": 1, "change": "unchanged" }
   ],
   "removedFiles": [],
   "runtimeEntries": [
@@ -23,6 +27,22 @@
       "mode": "shared",
       "lifecycle": "persistent",
       "required": true,
+      "worker": false
+    },
+    {
+      "path": "/systems/data-collection/update/watcher.js",
+      "role": "updater",
+      "mode": "shared",
+      "lifecycle": "transient",
+      "required": false,
+      "worker": false
+    },
+    {
+      "path": "/systems/data-collection/update/validate.js",
+      "role": "test/validation",
+      "mode": "shared",
+      "lifecycle": "transient",
+      "required": false,
       "worker": false
     },
     {
