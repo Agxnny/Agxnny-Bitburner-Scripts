@@ -4,11 +4,21 @@
 export const PATHS = Object.freeze({
   version: "/VERSION.txt",
   manifest: "/stack-manifest.json",
+  installedRevision: "/data/state/installed-revision.json",
+  remoteManifestTemp: "/data/state/remote-stack-manifest.json",
   stateRoot: "/data/state",
   telemetryRoot: "/data/telemetry",
   ramAudit: "/data/state/ram-audit.json",
   resourceState: "/data/state/resources.json",
   updateState: "/data/state/update.json",
+});
+
+export const REPOSITORY = Object.freeze({
+  owner: "Agxnny",
+  name: "Agxnny-Bitburner-Scripts",
+  branch: "main",
+  rawBaseUrl: "https://raw.githubusercontent.com/Agxnny/Agxnny-Bitburner-Scripts/main",
+  manifestUrl: "https://raw.githubusercontent.com/Agxnny/Agxnny-Bitburner-Scripts/main/stack-manifest.json",
 });
 
 export const STATE_SCHEMA_VERSION = 1;
