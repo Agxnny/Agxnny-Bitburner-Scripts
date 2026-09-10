@@ -6,9 +6,19 @@ This document is the architectural and implementation source of truth for this r
 
 When implementation and `DESIGN.md` conflict, the implementation is considered incorrect unless this document is deliberately amended.
 
-The purpose of this document is to prevent architectural drift, uncontrolled scope expansion, skipped implementation stages, untestable systems, and monolithic scripts as the stack grows.
+The purpose of this document is to prevent architectural drift, uncontrolled scope expansion, skipped implementation stages, untestable systems, conflicting ownership, and monolithic scripts as the stack grows.
 
 Changes to these rules must be intentional. A convenient implementation shortcut is not sufficient reason to violate them.
+
+### 1.1 Design-Document Hierarchy
+
+The root `DESIGN.md` is the highest-level design authority for the project.
+
+Each major system or subsystem should also maintain a local `DESIGN.md` in its own directory once that subsystem is established. A subsystem design document records the subsystem's purpose, responsibilities, non-responsibilities, interfaces, ownership rules, lifecycle, mode behavior, telemetry, failure behavior, acceptance criteria, and intentionally deferred implementation details.
+
+Subsystem design documents may refine the root architecture but must not contradict it. If a subsystem requires a rule that conflicts with the root `DESIGN.md`, the root document must be deliberately amended first.
+
+Implementation details that are not yet justified should remain explicitly deferred rather than being prematurely locked into design documents.
 
 ---
 
@@ -24,7 +34,7 @@ Correctness and reliability come before theoretical optimization.
 
 Each component must have a clear responsibility and ownership boundary. Decision-making belongs in managers/controllers; execution workers should remain small and deterministic wherever practical.
 
-Two independent systems must not unknowingly own the same RAM, money, jobs, or subsystem state.
+Two independent systems must not unknowingly own the same RAM, money, jobs, targets, decisions, or subsystem state.
 
 ### 2.3 Central Coordination, Distributed Execution
 
@@ -86,19 +96,23 @@ The two modes are modes of one architecture, not separate codebases. They should
 
 Low-RAM Mode must not become an excuse for monolithic early-game scripts.
 
-### 3.4 Central Mode Selection
+### 3.4 Bootstrap and Mode Selection
 
-Operating mode is selected centrally. Individual workers and unrelated modules must not independently decide whether the stack is in Low-RAM or Full Stack Mode.
+The initial start/bootstrap script is not a persistent scheduler. It evaluates the initial operating conditions, launches the appropriate scheduler, and exits.
 
-The stack should eventually support:
+The start path should support:
 
 - `auto` — automatically determine the viable operating mode;
 - `low` — force Low-RAM Mode for testing or operation;
 - `full` — force Full Stack Mode for testing or operation.
 
+Individual workers and unrelated modules must not independently decide the stack's operating mode.
+
 ### 3.5 Viability-Based Transition
 
-The transition to Full Stack Mode should ultimately be based on usable resources and the actual cost of the advanced stack, rather than an arbitrary home-RAM number.
+The Low-RAM Scheduler remains responsible for periodically determining whether Full Stack has become viable and performing a clean handoff when appropriate.
+
+Full Stack should eventually support controlled fallback to Low-RAM Mode when resources are no longer sufficient. Transition thresholds should use hysteresis or equivalent protection so the stack does not repeatedly oscillate between modes.
 
 Conceptually:
 
@@ -110,7 +124,17 @@ full-stack viable =
      + safety reserve
 ```
 
-Mode transitions should be automatic and, where practical, reversible.
+Exact viability calculations are intentionally deferred until the required systems and their measured RAM costs are known.
+
+### 3.6 Lifecycle Separation
+
+The architecture distinguishes:
+
+1. **Initial boot** — bootstrap selects and launches the initial scheduler, then exits.
+2. **Mode transition** — the active scheduler performs a controlled handoff to the other scheduler.
+3. **Repository update** — a player-authorized update stops replaceable runtime code, installs and validates the approved revision, then restarts the stack.
+
+These are separate lifecycle mechanisms and must not be conflated.
 
 ---
 
@@ -177,9 +201,7 @@ Once implementation of a feature begins, the project must not skip past it to un
 
 Implementation may temporarily leave the active feature only to build a helper, module, interface, test facility, or prerequisite that is directly necessary to complete the active feature correctly.
 
-Helper work is subordinate to the active feature. It does not replace or cancel the parent feature.
-
-Once the required helper is complete, implementation returns immediately to the parent feature.
+Helper work is subordinate to the active feature. Once the required helper is complete, implementation returns immediately to the parent feature.
 
 ### 6.3 Minimal Helper Scope
 
@@ -191,7 +213,7 @@ Later-stage functionality must not be implemented unless it is directly required
 
 ### 6.5 Dependencies Before Dependents
 
-If an active feature reveals a required dependency, that dependency becomes temporary subordinate work. It must be implemented and validated before dependent work proceeds.
+If an active feature reveals a required dependency, that dependency becomes temporary subordinate work and must be implemented and validated before dependent work proceeds.
 
 ### 6.6 No Placeholder Completion
 
@@ -302,8 +324,6 @@ Testing dashboards are functional engineering infrastructure, not cosmetic addit
 
 Testing/validation UI and production operational dashboards must remain conceptually separate, although they may share reusable components and telemetry interfaces.
 
-The validation suite is optimized for proving correctness and diagnosing failures. Production dashboards are optimized for operating and understanding a validated system.
-
 ### 9.2 Data-Driven UI
 
 Feature-specific behavior must not be unnecessarily hard-coded into React presentation components.
@@ -322,62 +342,21 @@ The testing/validation suite has three primary functional tabs.
 
 ### 10.1 Active / In Development
 
-This is the primary engineering surface for the current active feature and any directly subordinate helper work.
-
-It should expose all information useful for active development and validation, including where applicable:
-
-- live telemetry;
-- current feature/module state;
-- test parameters;
-- expected values;
-- actual values;
-- acceptance criteria;
-- individual test results;
-- timing information;
-- resource usage;
-- errors and warnings;
-- explicitly approved debug/test controls.
-
-The goal is to make the active feature observable enough to prove whether it behaves correctly and diagnose why it does not.
+The primary engineering surface for the current active feature and directly subordinate helper work. It should expose relevant live telemetry, state, test parameters, expected and actual values, acceptance criteria, individual test results, timing, resource usage, errors, warnings, and explicitly approved debug controls.
 
 ### 10.2 Completed / Validated
 
-Features that have passed their completion gate move to the Completed / Validated surface rather than disappearing from observation.
-
-This tab should retain appropriate information such as:
-
-- validated features;
-- current health;
-- regression status;
-- latest validation result;
-- last validation time where useful;
-- persistent operational telemetry relevant to continued correctness.
-
-Completed features remain subject to regression and health monitoring.
+Validated features remain observable and should retain current health, regression status, latest validation result, last validation time where useful, and persistent telemetry relevant to continued correctness.
 
 ### 10.3 Overall Testing
 
-The Overall Testing tab provides a whole-stack health check across all known systems, whether complete, incomplete, active, disabled, or blocked.
+The Overall Testing tab provides whole-stack health across all known systems, including incomplete, active, disabled, degraded, and blocked systems.
 
-Its responsibilities include:
-
-- running or aggregating system-wide health checks;
-- showing all known modules/features;
-- dependency health;
-- mode-specific checks;
-- warnings and failures;
-- cross-system consistency checks;
-- an overall stack health assessment.
-
-Incomplete systems must not be hidden or falsely reported as healthy.
-
-The overall suite should eventually detect disagreements between systems that individual feature tests cannot detect, such as conflicting views of network state, resource ownership, scheduler state, or worker execution.
+It should eventually detect disagreements between systems that feature-local tests cannot detect, including resource/authority ownership conflicts, inconsistent state, scheduler disagreements, and worker execution conflicts.
 
 ---
 
 ## 11. Standard Health Vocabulary
-
-Validation and telemetry should use a shared health vocabulary so that modules and dashboards communicate consistently.
 
 Initial standard states are:
 
@@ -392,113 +371,249 @@ BLOCKED
 DISABLED
 ```
 
-Additional states may be introduced only when they express a genuinely distinct condition that cannot be represented cleanly by the existing vocabulary.
+Additional states may be introduced only when they express a genuinely distinct condition.
 
 ---
 
-## 12. Major System Architecture
+## 12. Main Scheduling and Orchestration Architecture
 
-The stack currently defines six major systems.
+### 12.1 Bootstrap
 
-### 12.1 Main Scheduler
+The bootstrap/start script performs initial mode selection, launches the correct scheduler, and exits. It is not the long-running orchestrator.
 
-The Main Scheduler is the overarching orchestrator. It owns system startup/shutdown coordination, operating-mode selection, resource-policy enforcement, priority coordination, and system health awareness.
+### 12.2 Low-RAM Scheduler
 
-It must not absorb subsystem-specific strategy such as target scoring, stock trading logic, augmentation selection, or purchased-server upgrade formulas.
+Purpose:
 
-### 12.2 Hacking System
+> Run the core stack with the lowest practical control-plane RAM overhead while protecting hacking income and retaining a clean upgrade path into Full Stack.
 
-The Hacking System owns the conversion of compute resources into hacking income and includes more than the direct `hack()` action. Its scope includes:
+The Low-RAM Scheduler should launch and supervise only required Low-RAM processes, conservatively allocate RAM, preserve the protected hacking baseline, periodically assess Full-Stack viability, and perform a clean handoff when Full Stack becomes viable.
 
+### 12.3 Full-Stack Scheduler
+
+Purpose:
+
+> Coordinate major systems, enforce global priorities/resource policy, and keep the full stack operating efficiently without duplicating domain-specific logic.
+
+The Full-Stack Scheduler coordinates systems through declared contracts. It should allocate resources, supervise lifecycle and health, coordinate dependencies, enforce global priority rules, and support controlled recovery and fallback.
+
+It must not absorb domain-specific strategy such as target scoring, stock trading logic, augmentation selection, or purchased-server upgrade formulas.
+
+### 12.4 Protected Hacking Baseline
+
+Hacking income is the highest baseline productive priority.
+
+> **The stack must protect a productive hacking-income baseline before allocating discretionary resources to secondary systems.**
+
+Explicitly higher-priority lifecycle/recovery operations may temporarily outrank this baseline when necessary to preserve stack correctness or recoverability.
+
+---
+
+## 13. Scheduler Communication
+
+### 13.1 Port-Based Control Plane
+
+Scheduler-to-system and system-to-scheduler communication uses assigned ports as the standard live coordination mechanism.
+
+Where port availability permits, each major system should have two dedicated directional channels:
+
+- Scheduler → System
+- System → Scheduler
+
+Exact numeric port assignments must be centrally declared. Systems must not contain unrelated magic port numbers or steal another system's assigned ports.
+
+### 13.2 Standard Message Envelope
+
+Control-plane messages should use a standardized envelope containing enough information to identify at least message type, source, target, timestamp, request/correlation identity where applicable, and payload.
+
+Exact schema details are deferred until implementation.
+
+### 13.3 Ports Are Not Durable Truth
+
+Ports carry live coordination state and events. They are not the sole durable source of system truth.
+
+Schedulers and systems must be able to reconstruct correct operation after restart without relying on stale historical port messages.
+
+Dashboards must not compete with scheduler control-plane ports for messages.
+
+---
+
+## 14. Global Authority and Ownership Model
+
+### 14.1 Purpose
+
+The scheduler maintains a global authority/ownership mechanism so that multiple systems do not independently make conflicting decisions about the same controllable entity or domain function.
+
+The mechanism is architectural coordination, not domain strategy.
+
+> **Anything whose autonomous control can conflict must have one clear decision authority at a time.**
+
+### 14.2 Decision Authority vs Resource Usage
+
+The architecture distinguishes:
+
+- **Control/decision authority** — which system is allowed to make autonomous strategic or lifecycle decisions about an entity or function.
+- **Usage allocation** — which systems may consume some portion of a resource under scheduler policy.
+
+Control ownership does not necessarily imply exclusive physical use of the underlying resource.
+
+For example, the Purchased Server Fleet System may own lifecycle authority for a purchased server while RAM on that server is allocated among other systems.
+
+### 14.3 Default and Temporary Authority
+
+A domain normally has a default owner. Another approved subsystem may temporarily take authority over a specific entity or function when performing coordinated cross-system behavior.
+
+While temporary authority is active, the default owner must not autonomously act on that controlled entity in a way that conflicts with the authority holder.
+
+### 14.4 Directed Actions
+
+Temporary authority does not require duplicating the default owner's execution machinery.
+
+An authority holder may issue an explicit directed command to the normal domain system, which may execute that requested operation without regaining autonomous decision authority.
+
+Conceptually:
+
+```text
+DEFAULT OWNER
+    ↓
+autonomous decisions allowed
+
+TEMPORARY AUTHORITY HOLDER CLAIMS ENTITY
+    ↓
+default owner's autonomous decisions suppressed for that entity
+    ↓
+authority holder may issue explicit directed actions
+    ↓
+default owner executes only those approved directed actions
+```
+
+### 14.5 Stock-Manipulation Example
+
+The normal Stock System owns autonomous trading decisions for stocks.
+
+If a future Stock Manipulation subsystem takes authority over a symbol while coordinating a pump/dump or related strategy, the normal Stock System must not independently buy, sell, short, cover, or rebalance that symbol while the claim is active.
+
+The manipulation controller may still issue explicit trade commands to the Stock System, allowing the Stock System to reuse its normal trade execution and position-management machinery without independently deciding to trade the controlled symbol.
+
+Exact manipulation logic, claim schema, trade rules, and strategy remain intentionally deferred until that subsystem is implemented.
+
+### 14.6 Cross-Domain Use
+
+The same authority model may later apply to:
+
+- hacking targets;
+- stock symbols/trading decisions;
+- purchased-server lifecycle actions;
+- player work/progression tasks;
+- money/capital decision domains;
+- testing or recovery controllers;
+- other controllable entities where autonomous systems could conflict.
+
+### 14.7 Authority Reconciliation
+
+When temporary authority is released, the returning default owner must reconcile current state before resuming autonomous decisions. It must not assume the controlled entity remained unchanged while another authority held control.
+
+### 14.8 Failure and Stale Claims
+
+Authority claims must eventually include a safe mechanism for detecting and reclaiming stale ownership after crashes or lost controllers. The exact lease, heartbeat, timeout, and recovery logic is deferred until implementation.
+
+### 14.9 Scheduler Boundary
+
+> **The scheduler arbitrates and records system-level authority; domain systems retain responsibility for domain-specific decisions and execution behavior.**
+
+The scheduler must not become a centralized implementation of every domain strategy merely because it coordinates authority.
+
+---
+
+## 15. Major Domain Systems
+
+### 15.1 Hacking System
+
+Purpose:
+
+> Convert available compute resources into reliable hacking income as efficiently as practical, while maintaining targets in appropriate money/security states and respecting scheduler resource allocations.
+
+Architectural responsibilities include:
+
+- target discovery/eligibility through shared data;
 - target selection;
-- server preparation;
 - target tuning;
-- grow/weaken/hack planning;
-- batch or cycle scheduling;
-- execution workers;
-- hacking-specific telemetry and validation.
+- server preparation;
+- RAM/thread calculation;
+- execution scheduling;
+- hack/grow/weaken workers;
+- hacking telemetry and validation;
+- recovery from actual target state after failures.
 
-### 12.3 Purchased Server Fleet System
+Target scoring formulas, preparation tolerances, batching algorithms, target counts, timing mathematics, and tuning logic are intentionally deferred until implementation and validation.
 
-The Purchased Server Fleet System exclusively owns purchased-server lifecycle decisions, including:
+### 15.2 Purchased Server Fleet System
 
-- fleet discovery;
-- purchasing;
-- upgrade decisions;
-- retirement/replacement;
-- naming and fleet policy;
-- purchased-server capacity telemetry.
+The Purchased Server Fleet System exclusively owns purchased-server lifecycle decisions, including fleet discovery, purchasing, upgrades, replacement/retirement, naming, and lifecycle policy.
 
-Other systems may consume fleet RAM through approved resource interfaces but must not independently buy, delete, replace, or upgrade purchased servers.
+Other systems may consume allocated fleet RAM but must not independently purchase, delete, replace, or upgrade purchased servers.
 
-### 12.4 Stock System
+### 15.3 Stock System
 
-The Stock System owns market trading decisions, including:
+The Stock System owns normal market trading decisions, including long/short position logic, position sizing, position management, execution, telemetry, and P&L.
 
-- market observation;
-- stock-price history required for strategy;
-- long-position logic;
-- short-position logic when available;
-- position sizing;
-- position management;
-- trading telemetry and P&L.
+Its default autonomous authority over a stock symbol may be temporarily suspended through the global authority mechanism when another approved subsystem is coordinating that symbol.
 
-The Stock System owns trading decisions. Higher-level resource/capital policy determines whether capital is available for trading.
+Higher-level capital/resource policy determines whether capital is available; domain trading strategy remains owned by the Stock System except where authority is explicitly delegated.
 
-### 12.5 Progression System
+### 15.4 Progression System
 
-The Progression System owns long-term player advancement decisions and actions, including where supported:
+The Progression System owns long-term player advancement decisions and actions, including work selection, stat growth, faction/company progression, augmentation evaluation/purchasing, and player-facing recommendations.
 
-- work selection;
-- stat increasing;
-- faction/company progression;
-- augmentation evaluation;
-- augmentation purchase planning;
-- automated augmentation purchasing when enabled;
-- player-facing progression recommendations.
+It should support advisory and automated behavior where appropriate.
 
-The Progression System should support both advisory and automated behavior where appropriate. It owns what progression action should occur; the Main Scheduler coordinates when that system may act.
+Progression owns what advancement action should occur; the scheduler coordinates when it may act and what globally constrained resources are available.
 
-### 12.6 Data Collection System
+### 15.5 Data Collection System
 
-The Data Collection System is the shared perception/information layer for the stack. It collects, normalizes, stores, and exposes information required by other systems, including where applicable:
+Purpose:
 
-- player information and stats;
-- progression state/points;
-- server and network information;
-- stock prices;
-- world/game clock;
-- capabilities/unlocks;
-- shared runtime state;
-- repository revision status.
+> Collect, normalize, timestamp, and expose game-state data so other systems can make decisions from a consistent view of the world instead of independently re-querying and re-deriving the same information.
 
-Systems should consume standardized data interfaces rather than independently creating conflicting representations of the same game state.
+Its domains may include player state, server/network state, RAM/resource state, progression state, faction/company state, augmentation state, stock state, purchased-server state, world clock, and repository/update state.
 
-Low-RAM Mode may use lighter-weight collection mechanisms while preserving the same conceptual contracts.
+Data Collection owns acquisition and normalization of shared state. Consuming systems own decisions made from that state.
+
+Shared data should expose enough metadata for consumers to distinguish fresh, stale-but-usable, invalid, and unavailable state.
+
+Exact transport, schemas, and refresh cadences remain deferred until consumer requirements are known.
+
+### 15.6 RAM Audit System
+
+Purpose:
+
+> Measure RAM cost of stack scripts, produce a machine-readable RAM requirement report for schedulers, and a human-readable audit for the player.
+
+Schedulers consume RAM Audit results; they do not independently recalculate script RAM requirements.
+
+RAM audit output is derived data. Current scripts and actual game RAM costs remain the source of truth.
+
+Mode selection must not rely on an audit that is missing, incompatible with the current stack revision, or known stale after an update.
 
 ---
 
-## 13. Repository Update Subsystem
+## 16. Repository Update Subsystem
 
-The Data Collection System includes a Repository Update subsystem with two separate responsibilities.
+The Data Collection System includes a Repository Update subsystem with separate Update Watcher and Revision Puller responsibilities.
 
-### 13.1 Update Watcher
+### 16.1 Update Watcher
 
-The Update Watcher may automatically check the approved GitHub repository for a newer revision and inform the player when one is available.
-
-It must never install, pull, replace, or delete scripts automatically.
+The Update Watcher may automatically detect whether a newer approved repository revision exists and inform the player.
 
 > **The stack may automatically detect updates, but it must never automatically install them.**
 
-### 13.2 Revision Puller
+### 16.2 Revision Puller
 
 The Revision Puller performs an update only after an explicit player command.
 
-Repository revisions should use a defined revision/version contract and, where appropriate, a manifest that identifies the approved files belonging to the revision.
+### 16.3 Controlled Update Sequence
 
-### 13.3 Controlled Update Sequence
-
-A player-authorized system update must follow a controlled replacement sequence:
+A player-authorized update follows this conceptual sequence:
 
 ```text
 PLAYER AUTHORIZES UPDATE
@@ -509,95 +624,88 @@ kill all non-persistent running scripts
         ↓
 delete superseded non-persistent scripts/files
         ↓
-pull and write the approved new revision
+pull and write approved revision
         ↓
 validate revision/update integrity
         ↓
-restart the normal stack under the new revision
+regenerate required derived data such as RAM audit
+        ↓
+restart normal stack
 ```
 
-The updater must not replace actively running non-persistent system scripts in place. Normal runtime scripts are stopped first, then the old revision is deleted/replaced.
+### 16.4 Persistent Script Exemption
 
-### 13.4 Persistent Script Exemption
+Persistence is explicit and opt-in. Only scripts deliberately flagged by centralized policy as `persistent` are exempt from normal update shutdown/replacement.
 
-Persistence is explicit and opt-in.
+Expected examples include the world clock and required persistent data-collection processes.
 
-Only scripts deliberately flagged by project policy as `persistent` are exempt from the normal update shutdown/replacement operation.
+If a normally persistent process cannot safely survive a revision boundary, the updater may restart it as part of the authorized update.
 
-Expected examples include:
-
-- world clock;
-- required persistent data-collection processes.
-
-A script must not infer or grant itself persistence merely because it is inconvenient to stop.
-
-The persistent set must be centrally declared through an approved manifest/configuration contract so that the Revision Puller can determine exemptions deterministically.
-
-### 13.5 Persistent Scripts During Updates
-
-Persistent scripts may remain running while non-persistent systems are replaced. Their continued operation must not cause them to execute incompatible code from a partially replaced revision.
-
-Therefore persistent modules must be designed with update boundaries in mind. If a persistent process depends on code that must change as part of a revision, the updater must either:
-
-- use a compatible stable interface that allows the process to remain alive; or
-- explicitly restart that persistent process as part of the authorized update despite its normal persistence classification.
-
-Persistence is an operational exemption, not permission to run incompatible old code indefinitely.
-
-### 13.6 Update Integrity
+### 16.5 Update Integrity
 
 The updater must not report the new revision as installed until the complete authorized replacement has succeeded and required integrity checks pass.
 
-A failed or partial download must not advance the recorded local revision.
-
-The design goal is to avoid knowingly leaving the stack in a half-updated state.
-
-### 13.7 Update Telemetry
-
-Repository status should be observable through validation/production telemetry, including where practical:
-
-- local revision;
-- latest approved remote revision;
-- update-available state;
-- last successful check;
-- last update result;
-- update failure information.
-
-`UPDATE_AVAILABLE` is repository state and should not automatically be treated as a system health failure.
+A failed or partial replacement must not advance the recorded local revision.
 
 ---
 
-## 14. State vs Telemetry
+## 17. State vs Telemetry
 
 The architecture distinguishes operational state from telemetry.
 
 **State** is information required to make decisions, such as player money, server security, available RAM, stock prices, positions, and progression state.
 
-**Telemetry** is information used to understand and validate behavior, such as scheduler cycle duration, target scores, prep completion, profit rates, RAM utilization, trade P&L, API-read counts, update checks, errors, and decision traces.
+**Telemetry** is information used to understand and validate behavior, such as scheduler cycle duration, target scores, prep completion, profit rates, RAM utilization, trade P&L, update checks, errors, and decision traces.
 
 Both may feed dashboards, but they serve different architectural purposes and should not be conflated.
 
 ---
 
-## 15. Rules Still To Be Defined
+## 18. Versioning
 
-The following areas remain intentionally open until requirements for the script stack are discussed and approved:
+Project releases use the literal format:
+
+```text
+vMAJOR.MINOR.PATCH
+```
+
+Examples include `v0.4.2` and `v1.0.0`.
+
+Semantic-versioning style meaning is used:
+
+- **MAJOR** — intentionally incompatible architectural/interface changes;
+- **MINOR** — backward-compatible features or capabilities;
+- **PATCH** — fixes/refinements without a new feature contract.
+
+Version information is release-level metadata and must have one authoritative local source rather than duplicated constants throughout the codebase.
+
+The same release version should be exposed consistently through update metadata, validation dashboards, production dashboards, and other revision surfaces.
+
+`v0.x.x` is appropriate during initial development. `v1.0.0` should be declared deliberately when the first stable release is considered ready.
+
+---
+
+## 19. Rules Still To Be Defined
+
+The following remain intentionally open until their requirements are discussed and approved:
 
 - project goals and explicit non-goals;
 - exact feature roadmap and dependency order;
-- folder and naming conventions;
-- inter-module communication mechanisms;
-- persistent/shared state strategy;
-- RAM ownership and allocation policy;
-- money/spending ownership policy;
+- final folder and naming conventions beyond the subsystem-design requirement;
+- shared-state transport and persistence strategy;
+- exact scheduler port assignments and message schemas;
+- exact authority-claim schema, lease/recovery mechanics, and directed-command protocol;
+- RAM allocation policy details;
+- money/spending allocation policy details;
 - exact Low-RAM → Full Stack viability calculation;
 - error handling and retry standards;
 - telemetry schema and transport;
 - React dashboard architecture and component conventions;
 - production dashboard requirements;
 - coding style and documentation standards;
-- exact repository manifest/version format;
+- exact repository manifest format;
 - persistent-script declaration mechanism;
-- updater rollback/recovery strategy.
+- updater rollback/recovery strategy;
+- domain strategy algorithms intentionally deferred to implementation.
 
-These open items must not be silently decided through implementation when they materially affect architecture. They should be discussed and added to this document when their requirements become clear.
+These open items must not be silently decided through implementation when they materially affect architecture. They should be discussed and added to the appropriate root or subsystem design document when their requirements become clear.
