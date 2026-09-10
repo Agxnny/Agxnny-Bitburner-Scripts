@@ -1,12 +1,14 @@
-import { PATHS, FRESHNESS_MS } from "/core/config.js";
+import { PATHS } from "/core/config.js";
 import { HEALTH } from "/core/contracts.js";
 import { publishDomainState } from "/core/state.js";
 import { discoverNetwork, rootedRamHosts } from "/systems/data-collection/network.js";
 
+const DEFAULT_INTERVAL_MS = 500;
+
 export async function main(ns) {
   const flags = ns.flags([
     ["once", false],
-    ["interval", FRESHNESS_MS.fast],
+    ["interval", DEFAULT_INTERVAL_MS],
   ]);
 
   ns.disableLog("scan");
@@ -32,7 +34,7 @@ export async function main(ns) {
     }
 
     if (flags.once) break;
-    await ns.sleep(Math.max(250, Number(flags.interval) || FRESHNESS_MS.fast));
+    await ns.sleep(Math.max(250, Number(flags.interval) || DEFAULT_INTERVAL_MS));
   } while (true);
 }
 
@@ -95,12 +97,7 @@ function summarizeHosts(hosts) {
 }
 
 function emptySummary() {
-  return {
-    maxRam: 0,
-    usedRam: 0,
-    freeRam: 0,
-    processCount: 0,
-  };
+  return { maxRam: 0, usedRam: 0, freeRam: 0, processCount: 0 };
 }
 
 function safeScriptRam(ns, filename, hostname) {
