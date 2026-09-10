@@ -31,8 +31,6 @@ export async function main(ns) {
     return alarm(ns, "HANDOFF_STAGE_MISSING", `Staged puller missing: ${stagedPath}`);
   }
 
-  // The handoff normally starts only after pull.js has scheduled us, but wait
-  // defensively until the old process is gone before replacing its source file.
   for (let i = 0; i < 100 && oldPid > 0 && ns.isRunning(oldPid, "home"); i += 1) {
     await ns.sleep(50);
   }
@@ -41,22 +39,33 @@ export async function main(ns) {
     return alarm(ns, "HANDOFF_OLD_PULLER_STILL_RUNNING", `PID ${oldPid} did not exit in time.`);
   }
 
-  if (ns.fileExists(targetPath, "home") && !ns.rm(targetPath, "home")) {
-    return alarm(ns, "HANDOFF_REMOVE_FAILED", `Could not remove old ${targetPath}.`);
+  // Bitburner's mv API is not a reliable replacement primitive for this
+  // self-update path. Copy the staged text into the canonical file instead,
+  // verify the exact contents, then remove the staging file.
+  const stagedContent = ns.read(stagedPath);
+  if (!stagedContent) {
+    return alarm(ns, "HANDOFF_STAGE_EMPTY", `Staged puller is empty or unreadable: ${stagedPath}`);
   }
 
-  if (!ns.mv("home", stagedPath, targetPath)) {
-    return alarm(ns, "HANDOFF_REPLACE_FAILED", `Could not move staged puller into ${targetPath}.`);
-  }
+  ns.write(targetPath, stagedContent, "w");
 
   if (!ns.fileExists(targetPath, "home")) {
-    return alarm(ns, "HANDOFF_VERIFY_FAILED", `Replacement ${targetPath} is missing after move.`);
+    return alarm(ns, "HANDOFF_VERIFY_FAILED", `Replacement ${targetPath} is missing after write.`);
+  }
+
+  const installedContent = ns.read(targetPath);
+  if (installedContent !== stagedContent) {
+    return alarm(ns, "HANDOFF_VERIFY_MISMATCH", `Replacement ${targetPath} does not match staged puller contents.`);
+  }
+
+  if (ns.fileExists(stagedPath, "home") && !ns.rm(stagedPath, "home")) {
+    ns.tprint(`WARNING HANDOFF_STAGE_CLEANUP_FAILED: ${stagedPath} could not be removed; installed puller was verified successfully.`);
   }
 
   ns.write(installedStatePath, JSON.stringify(record, null, 2), "w");
 
   ns.tprint(`UPDATE_COMPLETE: ${record.releaseVersion} / ${record.revisionId}`);
-  ns.tprint("Self-update handoff complete; /pull.js has been replaced and installed revision metadata finalized.");
+  ns.tprint("Self-update handoff complete; /pull.js was replaced, content-verified, and installed revision metadata finalized.");
 }
 
 function alarm(ns, code, message) {
