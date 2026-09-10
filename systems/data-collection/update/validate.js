@@ -1,3 +1,6 @@
+import { PATHS } from "/core/config.js";
+import { HEALTH } from "/core/contracts.js";
+import { publishDomainState } from "/core/state.js";
 import {
   classifyInstallAttempt,
   compareRevisions,
@@ -22,11 +25,26 @@ export async function main(ns) {
   ];
 
   const failed = tests.filter((result) => !result.pass);
+  const data = {
+    health: failed.length === 0 ? HEALTH.PASS : HEALTH.FAIL,
+    total: tests.length,
+    passed: tests.length - failed.length,
+    failed: failed.length,
+    tests,
+  };
+
+  publishDomainState(ns, PATHS.updateValidationState, {
+    domain: "update-validation",
+    source: ns.getScriptName(),
+    valid: failed.length === 0,
+    data,
+  });
+
   for (const result of tests) {
     ns.tprint(`${result.pass ? "PASS" : "FAIL"} - ${result.name}${result.error ? `: ${result.error}` : ""}`);
   }
 
-  ns.tprint(`Update manifest validation: ${tests.length - failed.length}/${tests.length} passed.`);
+  ns.tprint(`Update manifest validation: ${data.passed}/${data.total} passed.`);
   if (failed.length > 0) throw new Error(`${failed.length} update validation test(s) failed`);
 }
 
