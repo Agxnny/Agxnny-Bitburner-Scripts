@@ -2,13 +2,13 @@ const PROCESSES = [
   "/systems/data-collection/resource-collector.js",
   "/systems/data-collection/server-collector.js",
   "/systems/data-collection/player-collector.js",
+  "/systems/data-collection/update/watcher.js",
   "/ui/tail-memory.js",
 ];
 
 const ONE_SHOTS = [
   "/systems/ram-audit/audit.js",
   "/systems/data-collection/update/validate.js",
-  "/systems/data-collection/update/watcher.js",
 ];
 
 const DASHBOARD = "/ui/validation-dashboard.js";
