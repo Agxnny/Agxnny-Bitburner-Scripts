@@ -3,33 +3,58 @@ import { classifyFreshness, readJson } from "/core/state.js";
 import { formatMoney, formatRam } from "/ui/format.js";
 
 export async function main(ns) {
-  const flags = ns.flags([["interval", 1000]]);
+  const flags = ns.flags([
+    ["ui-interval", 100],
+    ["data-interval", 500],
+  ]);
+  const uiInterval = Math.max(50, Number(flags["ui-interval"]) || 100);
+  const dataInterval = Math.max(100, Number(flags["data-interval"]) || 500);
+
   ns.disableLog("ALL");
   ns.ui.openTail();
   try { ns.ui.resizeTail(1180, 760); } catch {}
 
   let activeTab = "active";
+  let lastDataRead = 0;
+  let rawSnapshots = readRawSnapshots(ns);
+
   const React = globalThis.React;
   if (!React) throw new Error("React is not available in this Bitburner runtime");
   const h = React.createElement;
 
   while (true) {
-    const snapshots = readSnapshots(ns);
+    const now = Date.now();
+    if (now - lastDataRead >= dataInterval) {
+      rawSnapshots = readRawSnapshots(ns);
+      lastDataRead = now;
+    }
+
+    const snapshots = decorateSnapshots(rawSnapshots, now);
     ns.clearLog();
     ns.printRaw(renderDashboard(h, snapshots, activeTab, (tab) => { activeTab = tab; }));
-    await ns.sleep(Math.max(250, Number(flags.interval) || 1000));
+    await ns.sleep(uiInterval);
   }
 }
 
-function readSnapshots(ns) {
-  const now = Date.now();
+function readRawSnapshots(ns) {
   return {
-    resources: decorate(readJson(ns, PATHS.resourceState), FRESHNESS_MS.fast, now),
-    servers: decorate(readJson(ns, PATHS.serverState), FRESHNESS_MS.medium, now),
-    player: decorate(readJson(ns, PATHS.playerState), FRESHNESS_MS.medium, now),
-    ramAudit: decorate(readJson(ns, PATHS.ramAudit), FRESHNESS_MS.slow, now),
-    update: decorate(readJson(ns, PATHS.updateState), FRESHNESS_MS.slow, now),
-    updateValidation: decorate(readJson(ns, PATHS.updateValidationState), FRESHNESS_MS.slow, now),
+    resources: readJson(ns, PATHS.resourceState),
+    servers: readJson(ns, PATHS.serverState),
+    player: readJson(ns, PATHS.playerState),
+    ramAudit: readJson(ns, PATHS.ramAudit),
+    update: readJson(ns, PATHS.updateState),
+    updateValidation: readJson(ns, PATHS.updateValidationState),
+  };
+}
+
+function decorateSnapshots(raw, now) {
+  return {
+    resources: decorate(raw.resources, FRESHNESS_MS.fast, now),
+    servers: decorate(raw.servers, FRESHNESS_MS.medium, now),
+    player: decorate(raw.player, FRESHNESS_MS.medium, now),
+    ramAudit: decorate(raw.ramAudit, FRESHNESS_MS.slow, now),
+    update: decorate(raw.update, FRESHNESS_MS.slow, now),
+    updateValidation: decorate(raw.updateValidation, FRESHNESS_MS.slow, now),
   };
 }
 
