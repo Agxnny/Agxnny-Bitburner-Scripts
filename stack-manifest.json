@@ -1,23 +1,28 @@
 {
   "schemaVersion": 2,
   "releaseVersion": "v0.1.0",
-  "revisionSequence": 3,
-  "revisionId": "rev-0003-update-watcher",
-  "previousRevisionId": "manifest-v2-baseline",
+  "revisionSequence": 4,
+  "revisionId": "rev-0004-validation-dashboard",
+  "previousRevisionId": "rev-0003-update-watcher",
   "versionFile": "/VERSION.txt",
   "files": [
     { "path": "/VERSION.txt", "required": true, "fileVersion": 1, "change": "unchanged" },
-    { "path": "/stack-manifest.json", "required": true, "fileVersion": 4, "change": "modified" },
-    { "path": "/core/config.js", "required": true, "fileVersion": 3, "change": "modified" },
+    { "path": "/stack-manifest.json", "required": true, "fileVersion": 5, "change": "modified" },
+    { "path": "/pull.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/core/config.js", "required": true, "fileVersion": 4, "change": "modified" },
     { "path": "/core/contracts.js", "required": true, "fileVersion": 1, "change": "unchanged" },
     { "path": "/core/state.js", "required": true, "fileVersion": 1, "change": "unchanged" },
     { "path": "/systems/data-collection/network.js", "required": true, "fileVersion": 1, "change": "unchanged" },
     { "path": "/systems/data-collection/resource-collector.js", "required": true, "fileVersion": 1, "change": "unchanged" },
-    { "path": "/systems/data-collection/update/manifest.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/systems/data-collection/update/installed-state.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/systems/data-collection/update/watcher.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/systems/data-collection/update/validate.js", "required": true, "fileVersion": 1, "change": "added" },
-    { "path": "/systems/ram-audit/audit.js", "required": true, "fileVersion": 1, "change": "unchanged" }
+    { "path": "/systems/data-collection/server-collector.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/data-collection/player-collector.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/systems/data-collection/update/manifest.js", "required": true, "fileVersion": 2, "change": "modified" },
+    { "path": "/systems/data-collection/update/installed-state.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/systems/data-collection/update/watcher.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/systems/data-collection/update/validate.js", "required": true, "fileVersion": 2, "change": "modified" },
+    { "path": "/systems/ram-audit/audit.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/ui/validation-dashboard.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/validation/start.js", "required": true, "fileVersion": 1, "change": "added" }
   ],
   "removedFiles": [],
   "runtimeEntries": [
@@ -27,6 +32,30 @@
       "mode": "shared",
       "lifecycle": "persistent",
       "required": true,
+      "worker": false
+    },
+    {
+      "path": "/systems/data-collection/server-collector.js",
+      "role": "collector",
+      "mode": "shared",
+      "lifecycle": "persistent",
+      "required": true,
+      "worker": false
+    },
+    {
+      "path": "/systems/data-collection/player-collector.js",
+      "role": "collector",
+      "mode": "shared",
+      "lifecycle": "persistent",
+      "required": true,
+      "worker": false
+    },
+    {
+      "path": "/ui/validation-dashboard.js",
+      "role": "dashboard",
+      "mode": "shared",
+      "lifecycle": "persistent",
+      "required": false,
       "worker": false
     },
     {
@@ -52,9 +81,27 @@
       "lifecycle": "transient",
       "required": true,
       "worker": false
+    },
+    {
+      "path": "/validation/start.js",
+      "role": "test/validation",
+      "mode": "shared",
+      "lifecycle": "transient",
+      "required": false,
+      "worker": false
+    },
+    {
+      "path": "/pull.js",
+      "role": "updater",
+      "mode": "shared",
+      "lifecycle": "transient",
+      "required": false,
+      "worker": false
     }
   ],
   "persistent": [
-    "/systems/data-collection/resource-collector.js"
+    "/systems/data-collection/resource-collector.js",
+    "/systems/data-collection/server-collector.js",
+    "/systems/data-collection/player-collector.js"
   ]
 }
