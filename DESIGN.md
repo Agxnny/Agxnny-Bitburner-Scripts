@@ -396,42 +396,190 @@ Additional states may be introduced only when they express a genuinely distinct 
 
 ---
 
-## 12. Initial Architectural Direction
+## 12. Major System Architecture
 
-The eventual stack is expected to follow a hierarchy broadly similar to:
+The stack currently defines six major systems.
 
-```text
-bootstrap
-   │
-   ├── infrastructure
-   │     ├── network discovery/rooting
-   │     ├── purchased servers
-   │     └── resource accounting
-   │
-   ├── hacking
-   │     ├── target selection
-   │     ├── preparation
-   │     ├── scheduling
-   │     └── workers
-   │
-   ├── economy
-   │     ├── hacknet
-   │     ├── stocks
-   │     └── spending policy
-   │
-   └── progression
-         ├── factions
-         ├── augmentations
-         ├── sleeves
-         ├── gangs
-         └── corporations
-```
+### 12.1 Main Scheduler
 
-This diagram is directional rather than a commitment to implement every listed subsystem. Actual scope and implementation order will be defined deliberately before construction.
+The Main Scheduler is the overarching orchestrator. It owns system startup/shutdown coordination, operating-mode selection, resource-policy enforcement, priority coordination, and system health awareness.
+
+It must not absorb subsystem-specific strategy such as target scoring, stock trading logic, augmentation selection, or purchased-server upgrade formulas.
+
+### 12.2 Hacking System
+
+The Hacking System owns the conversion of compute resources into hacking income and includes more than the direct `hack()` action. Its scope includes:
+
+- target selection;
+- server preparation;
+- target tuning;
+- grow/weaken/hack planning;
+- batch or cycle scheduling;
+- execution workers;
+- hacking-specific telemetry and validation.
+
+### 12.3 Purchased Server Fleet System
+
+The Purchased Server Fleet System exclusively owns purchased-server lifecycle decisions, including:
+
+- fleet discovery;
+- purchasing;
+- upgrade decisions;
+- retirement/replacement;
+- naming and fleet policy;
+- purchased-server capacity telemetry.
+
+Other systems may consume fleet RAM through approved resource interfaces but must not independently buy, delete, replace, or upgrade purchased servers.
+
+### 12.4 Stock System
+
+The Stock System owns market trading decisions, including:
+
+- market observation;
+- stock-price history required for strategy;
+- long-position logic;
+- short-position logic when available;
+- position sizing;
+- position management;
+- trading telemetry and P&L.
+
+The Stock System owns trading decisions. Higher-level resource/capital policy determines whether capital is available for trading.
+
+### 12.5 Progression System
+
+The Progression System owns long-term player advancement decisions and actions, including where supported:
+
+- work selection;
+- stat increasing;
+- faction/company progression;
+- augmentation evaluation;
+- augmentation purchase planning;
+- automated augmentation purchasing when enabled;
+- player-facing progression recommendations.
+
+The Progression System should support both advisory and automated behavior where appropriate. It owns what progression action should occur; the Main Scheduler coordinates when that system may act.
+
+### 12.6 Data Collection System
+
+The Data Collection System is the shared perception/information layer for the stack. It collects, normalizes, stores, and exposes information required by other systems, including where applicable:
+
+- player information and stats;
+- progression state/points;
+- server and network information;
+- stock prices;
+- world/game clock;
+- capabilities/unlocks;
+- shared runtime state;
+- repository revision status.
+
+Systems should consume standardized data interfaces rather than independently creating conflicting representations of the same game state.
+
+Low-RAM Mode may use lighter-weight collection mechanisms while preserving the same conceptual contracts.
 
 ---
 
-## 13. Rules Still To Be Defined
+## 13. Repository Update Subsystem
+
+The Data Collection System includes a Repository Update subsystem with two separate responsibilities.
+
+### 13.1 Update Watcher
+
+The Update Watcher may automatically check the approved GitHub repository for a newer revision and inform the player when one is available.
+
+It must never install, pull, replace, or delete scripts automatically.
+
+> **The stack may automatically detect updates, but it must never automatically install them.**
+
+### 13.2 Revision Puller
+
+The Revision Puller performs an update only after an explicit player command.
+
+Repository revisions should use a defined revision/version contract and, where appropriate, a manifest that identifies the approved files belonging to the revision.
+
+### 13.3 Controlled Update Sequence
+
+A player-authorized system update must follow a controlled replacement sequence:
+
+```text
+PLAYER AUTHORIZES UPDATE
+        ↓
+identify persistent scripts
+        ↓
+kill all non-persistent running scripts
+        ↓
+delete superseded non-persistent scripts/files
+        ↓
+pull and write the approved new revision
+        ↓
+validate revision/update integrity
+        ↓
+restart the normal stack under the new revision
+```
+
+The updater must not replace actively running non-persistent system scripts in place. Normal runtime scripts are stopped first, then the old revision is deleted/replaced.
+
+### 13.4 Persistent Script Exemption
+
+Persistence is explicit and opt-in.
+
+Only scripts deliberately flagged by project policy as `persistent` are exempt from the normal update shutdown/replacement operation.
+
+Expected examples include:
+
+- world clock;
+- required persistent data-collection processes.
+
+A script must not infer or grant itself persistence merely because it is inconvenient to stop.
+
+The persistent set must be centrally declared through an approved manifest/configuration contract so that the Revision Puller can determine exemptions deterministically.
+
+### 13.5 Persistent Scripts During Updates
+
+Persistent scripts may remain running while non-persistent systems are replaced. Their continued operation must not cause them to execute incompatible code from a partially replaced revision.
+
+Therefore persistent modules must be designed with update boundaries in mind. If a persistent process depends on code that must change as part of a revision, the updater must either:
+
+- use a compatible stable interface that allows the process to remain alive; or
+- explicitly restart that persistent process as part of the authorized update despite its normal persistence classification.
+
+Persistence is an operational exemption, not permission to run incompatible old code indefinitely.
+
+### 13.6 Update Integrity
+
+The updater must not report the new revision as installed until the complete authorized replacement has succeeded and required integrity checks pass.
+
+A failed or partial download must not advance the recorded local revision.
+
+The design goal is to avoid knowingly leaving the stack in a half-updated state.
+
+### 13.7 Update Telemetry
+
+Repository status should be observable through validation/production telemetry, including where practical:
+
+- local revision;
+- latest approved remote revision;
+- update-available state;
+- last successful check;
+- last update result;
+- update failure information.
+
+`UPDATE_AVAILABLE` is repository state and should not automatically be treated as a system health failure.
+
+---
+
+## 14. State vs Telemetry
+
+The architecture distinguishes operational state from telemetry.
+
+**State** is information required to make decisions, such as player money, server security, available RAM, stock prices, positions, and progression state.
+
+**Telemetry** is information used to understand and validate behavior, such as scheduler cycle duration, target scores, prep completion, profit rates, RAM utilization, trade P&L, API-read counts, update checks, errors, and decision traces.
+
+Both may feed dashboards, but they serve different architectural purposes and should not be conflated.
+
+---
+
+## 15. Rules Still To Be Defined
 
 The following areas remain intentionally open until requirements for the script stack are discussed and approved:
 
@@ -448,6 +596,8 @@ The following areas remain intentionally open until requirements for the script 
 - React dashboard architecture and component conventions;
 - production dashboard requirements;
 - coding style and documentation standards;
-- release/versioning policy.
+- exact repository manifest/version format;
+- persistent-script declaration mechanism;
+- updater rollback/recovery strategy.
 
 These open items must not be silently decided through implementation when they materially affect architecture. They should be discussed and added to this document when their requirements become clear.
