@@ -11,6 +11,7 @@ export const PATHS = Object.freeze({
   ramAudit: "/data/state/ram-audit.json",
   resourceState: "/data/state/resources.json",
   updateState: "/data/state/update.json",
+  updateValidationState: "/data/state/update-validation.json",
 });
 
 export const REPOSITORY = Object.freeze({
