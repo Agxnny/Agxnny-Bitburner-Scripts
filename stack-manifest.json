@@ -1,15 +1,15 @@
 {
   "schemaVersion": 2,
   "releaseVersion": "v0.1.0",
-  "revisionSequence": 5,
-  "revisionId": "rev-0005-puller-handoff",
-  "previousRevisionId": "rev-0004-validation-dashboard",
+  "revisionSequence": 6,
+  "revisionId": "rev-0006-bitburner-3-tail-fix",
+  "previousRevisionId": "rev-0005-puller-handoff",
   "versionFile": "/VERSION.txt",
   "files": [
     { "path": "/VERSION.txt", "required": true, "fileVersion": 1, "change": "unchanged" },
-    { "path": "/stack-manifest.json", "required": true, "fileVersion": 6, "change": "modified" },
-    { "path": "/pull.js", "required": true, "fileVersion": 2, "change": "modified" },
-    { "path": "/pull-handoff.js", "required": true, "fileVersion": 1, "change": "added" },
+    { "path": "/stack-manifest.json", "required": true, "fileVersion": 7, "change": "modified" },
+    { "path": "/pull.js", "required": true, "fileVersion": 2, "change": "unchanged" },
+    { "path": "/pull-handoff.js", "required": true, "fileVersion": 1, "change": "unchanged" },
     { "path": "/core/config.js", "required": true, "fileVersion": 4, "change": "unchanged" },
     { "path": "/core/contracts.js", "required": true, "fileVersion": 1, "change": "unchanged" },
     { "path": "/core/state.js", "required": true, "fileVersion": 1, "change": "unchanged" },
@@ -22,91 +22,21 @@
     { "path": "/systems/data-collection/update/watcher.js", "required": true, "fileVersion": 1, "change": "unchanged" },
     { "path": "/systems/data-collection/update/validate.js", "required": true, "fileVersion": 2, "change": "unchanged" },
     { "path": "/systems/ram-audit/audit.js", "required": true, "fileVersion": 1, "change": "unchanged" },
-    { "path": "/ui/validation-dashboard.js", "required": true, "fileVersion": 1, "change": "unchanged" },
+    { "path": "/ui/validation-dashboard.js", "required": true, "fileVersion": 2, "change": "modified" },
     { "path": "/validation/start.js", "required": true, "fileVersion": 1, "change": "unchanged" }
   ],
   "removedFiles": [],
   "runtimeEntries": [
-    {
-      "path": "/systems/data-collection/resource-collector.js",
-      "role": "collector",
-      "mode": "shared",
-      "lifecycle": "persistent",
-      "required": true,
-      "worker": false
-    },
-    {
-      "path": "/systems/data-collection/server-collector.js",
-      "role": "collector",
-      "mode": "shared",
-      "lifecycle": "persistent",
-      "required": true,
-      "worker": false
-    },
-    {
-      "path": "/systems/data-collection/player-collector.js",
-      "role": "collector",
-      "mode": "shared",
-      "lifecycle": "persistent",
-      "required": true,
-      "worker": false
-    },
-    {
-      "path": "/ui/validation-dashboard.js",
-      "role": "dashboard",
-      "mode": "shared",
-      "lifecycle": "persistent",
-      "required": false,
-      "worker": false
-    },
-    {
-      "path": "/systems/data-collection/update/watcher.js",
-      "role": "updater",
-      "mode": "shared",
-      "lifecycle": "transient",
-      "required": false,
-      "worker": false
-    },
-    {
-      "path": "/systems/data-collection/update/validate.js",
-      "role": "test/validation",
-      "mode": "shared",
-      "lifecycle": "transient",
-      "required": false,
-      "worker": false
-    },
-    {
-      "path": "/systems/ram-audit/audit.js",
-      "role": "audit",
-      "mode": "shared",
-      "lifecycle": "transient",
-      "required": true,
-      "worker": false
-    },
-    {
-      "path": "/validation/start.js",
-      "role": "test/validation",
-      "mode": "shared",
-      "lifecycle": "transient",
-      "required": false,
-      "worker": false
-    },
-    {
-      "path": "/pull.js",
-      "role": "updater",
-      "mode": "shared",
-      "lifecycle": "transient",
-      "required": false,
-      "worker": false
-    },
-    {
-      "path": "/pull-handoff.js",
-      "role": "updater",
-      "mode": "shared",
-      "lifecycle": "transient",
-      "required": false,
-      "worker": false
-    }
+    { "path": "/systems/data-collection/resource-collector.js", "role": "collector", "mode": "shared", "lifecycle": "persistent", "required": true, "worker": false },
+    { "path": "/systems/data-collection/server-collector.js", "role": "collector", "mode": "shared", "lifecycle": "persistent", "required": true, "worker": false },
+    { "path": "/systems/data-collection/player-collector.js", "role": "collector", "mode": "shared", "lifecycle": "persistent", "required": true, "worker": false },
+    { "path": "/ui/validation-dashboard.js", "role": "dashboard", "mode": "shared", "lifecycle": "persistent", "required": false, "worker": false },
+    { "path": "/systems/data-collection/update/watcher.js", "role": "updater", "mode": "shared", "lifecycle": "transient", "required": false, "worker": false },
+    { "path": "/systems/data-collection/update/validate.js", "role": "test/validation", "mode": "shared", "lifecycle": "transient", "required": false, "worker": false },
+    { "path": "/systems/ram-audit/audit.js", "role": "audit", "mode": "shared", "lifecycle": "transient", "required": true, "worker": false },
+    { "path": "/validation/start.js", "role": "test/validation", "mode": "shared", "lifecycle": "transient", "required": false, "worker": false },
+    { "path": "/pull.js", "role": "updater", "mode": "shared", "lifecycle": "transient", "required": false, "worker": false },
+    { "path": "/pull-handoff.js", "role": "updater", "mode": "shared", "lifecycle": "transient", "required": false, "worker": false }
   ],
   "persistent": [
     "/systems/data-collection/resource-collector.js",
