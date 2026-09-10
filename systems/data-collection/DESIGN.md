@@ -4,11 +4,11 @@
 
 This document refines the root repository `DESIGN.md` for the Data Collection subsystem. The root `DESIGN.md` remains authoritative if the two conflict.
 
-Implementation-specific schemas, transports, and refresh algorithms remain intentionally deferred until their consumers are defined.
+Implementation-specific transport formats, exact schemas, refresh intervals, and retry algorithms remain intentionally deferred until their consumers are implemented and validated.
 
 ## Purpose
 
-> Collect, normalize, timestamp, and expose game-state data so other systems can make decisions from a consistent view of the world instead of independently re-querying and re-deriving the same information.
+> Collect, normalize, timestamp, validate, and expose shared game-state data so other systems can make decisions from a consistent view of reality instead of independently re-querying or re-deriving the same information.
 
 ## Ownership Boundary
 
@@ -19,71 +19,148 @@ Consuming systems own decisions made from that state.
 Examples:
 
 - Data Collection reports faction reputation and augmentation information; Progression decides what to do.
-- Data Collection reports market state and positions; Stock System decides how to trade.
+- Data Collection reports market state and positions; Stock decides how to trade.
 - Data Collection reports server/RAM state; Hacking and Scheduler decide how to use it.
+- Data Collection reports purchased-server state; Fleet owns lifecycle decisions.
 
-Major systems should not duplicate expensive acquisition when equivalent valid shared data already exists unless they have an explicit latency/correctness requirement that justifies bypassing shared state.
+> No major system should duplicate expensive acquisition when equivalent valid shared data already exists unless an explicit latency or correctness requirement justifies bypassing shared state.
 
 ## State Domains
 
-The system may include modules for:
+The system should support the following logical domains:
 
-- player state;
-- server/network state;
-- RAM/resource state;
-- progression state;
-- faction/company state;
-- augmentation state;
-- stock state;
-- purchased-server state;
-- world clock;
-- repository/update state.
+```text
+Data Collection System
+├── Player State Collector
+├── Server / Network State Collector
+├── RAM / Resource State Collector
+├── Progression State Collector
+├── Faction / Company State Collector
+├── Augmentation State Collector
+├── Stock State Collector
+├── Purchased Server State Collector
+├── World Clock
+├── Repository / Update State
+└── Shared State Publisher / Validation
+```
 
-Modules should remain separate where their acquisition cost, freshness requirements, failure modes, or consumers differ materially.
+Logical modularity does not require one persistent process per collector. Collectors may share a process when doing so materially reduces RAM without creating unclear ownership or coupling.
 
-## Freshness
+## Collector Responsibilities
 
-Shared state must allow consumers to determine whether data is:
+### Player State
 
-- fresh;
-- stale but potentially usable;
-- invalid;
-- unavailable.
+Own normalized player-level state such as money, skills/stats, city, current work/activity, jobs, faction membership, and relevant unlock/capability information.
 
-Records should eventually carry enough metadata to establish source, timestamp/age, validity, and schema/version where useful.
+### Server / Network State
 
-Different data classes may use different refresh cadences. Exact cadences are centrally configurable and intentionally deferred until implementation.
+Own network discovery and normalized server state such as reachability, root access, hacking requirements, money/security, RAM capacity, and other broadly shared server facts.
 
-## Operating Modes
+### RAM / Resource State
 
-### Low-RAM
+Own the current runtime resource picture: total, used, free, allocatable, reserved, draining, or maintenance RAM/hosts where those concepts are implemented.
 
-Low-RAM Mode should collect only what is useful enough to justify its RAM/API cost.
+This is distinct from RAM Audit:
 
-It may use slower cadences, on-demand collection, and fewer persistent collectors while maintaining compatible conceptual state contracts.
+> RAM Audit answers "what does the software cost?"; Resource State answers "what RAM exists right now?"
 
-### Full Stack
+### Progression State
 
-Full Stack may support broader persistent collection, faster refresh, stronger invalidation, richer telemetry, and historical sampling where those capabilities provide measurable value.
+Own broad progression facts that do not belong more naturally to a specialized collector, such as major unlocks, reset-related state, installed augmentation summary, and capability milestones. It should remain thin enough to avoid duplicating specialized faction/company and augmentation domains.
+
+### Faction / Company State
+
+Own memberships, invitations, reputation, favor where useful, employment, roles, company reputation, and related organization state.
+
+### Augmentation State
+
+Own augmentation availability/acquisition facts including owned/installed state, faction sources, prices, reputation requirements, prerequisites, and availability.
+
+### Stock State
+
+Own normalized market observations and portfolio state, including symbols, prices, positions, and capability-dependent market information that is currently available.
+
+### Purchased Server State
+
+Own observed fleet facts such as purchased-server identities, RAM, usage, availability, and relevant limits. Fleet retains lifecycle authority.
+
+### Repository / Update State
+
+Own observed local/available revision and release-version state used by the Update Watcher. Observation must remain separate from installation.
+
+## Shared State Contract
+
+Each published domain snapshot should carry a small common metadata contract conceptually containing:
+
+```text
+domain
+schemaVersion
+generatedAt
+valid
+freshness
+source
+data
+```
+
+Exact field names and serialization are deferred.
+
+State should be domain-oriented rather than one monolithic global state object so that failure, freshness, loading, and schema evolution can remain isolated.
+
+## Freshness Model
+
+Consumers must be able to distinguish at least:
+
+```text
+FRESH
+STALE
+INVALID
+UNAVAILABLE
+```
+
+`STALE` means previously valid state may still be usable depending on the consumer. It is not equivalent to `INVALID` or `UNAVAILABLE`.
+
+Freshness requirements are domain-specific.
+
+Broad classes are:
+
+- **Fast** — volatile server money/security, current free RAM/resource availability, stock state.
+- **Medium** — player money/stats/current work, faction/company reputation, purchased-server state.
+- **Slow** — augmentation/static progression metadata, repository revision, relatively static capability data.
+
+Exact cadences must be centrally configurable and remain deferred until implementation.
+
+## Publication and Failure Semantics
+
+A collector should publish a new valid snapshot only after a successful acquisition/normalization cycle.
+
+If refresh fails, the system should normally preserve the last known valid snapshot and allow it to age into `STALE` rather than replacing it with empty or misleading data.
+
+> Collection failure must not destroy the last known valid state unless that state is explicitly known to be invalid.
+
+If current knowledge proves previous state incorrect or unsafe to consume, the state may be explicitly invalidated.
+
+Failure of one collector should not unnecessarily terminate or invalidate unrelated domains.
 
 ## State Transport
 
 Scheduler control ports are not the primary shared-state store.
 
-The system should expose standardized shared-state interfaces, likely using files and/or dedicated state mechanisms, while ports may be used for lightweight notifications such as:
+The system should expose standardized shared-state interfaces, likely using domain files and/or dedicated state mechanisms. Ports may carry lightweight notifications such as:
 
 - `DATA_UPDATED`;
 - `DATA_STALE`;
 - `COLLECTOR_FAILED`;
 - `STATE_INVALIDATED`.
 
-Exact transport and schema are deferred until system consumers are specified.
+Ports remain live coordination/event channels rather than durable truth.
+
+Exact shared-state transport and persistence format are deferred.
 
 ## World Clock
 
-The world clock is expected to be a small persistent shared service that provides a consistent stack time reference for scheduling, state timestamps, and telemetry.
+The world clock should be deliberately tiny and persistent, providing a consistent stack time reference for state timestamps, scheduler timing, durations, and telemetry.
 
-It should survive normal mode transitions and repository updates where compatible. If an update makes the running clock incompatible, the authorized updater may restart it.
+It should survive normal mode transitions and repository updates where compatible. If a revision makes it unsafe to preserve, the authorized updater may restart it.
 
 ## Repository Update Subsystem
 
@@ -101,33 +178,56 @@ May replace the local stack only after explicit player authorization and must fo
 
 Update detection and update installation remain separate responsibilities.
 
-## Failure Isolation
+## Operating Modes
 
-Failure of one collector should not unnecessarily terminate unrelated collectors.
+### Low-RAM
 
-Consumers should observe the affected state as stale, invalid, or unavailable and react according to their own requirements.
+Low-RAM should collect only data valuable enough to justify its RAM/API cost. Player, server/network, and resource state are expected to form the essential core, while other collectors may be slower or on-demand depending on active systems.
+
+Persistent collection should be minimized.
+
+### Full Stack
+
+Full Stack may support broader persistent coverage, faster refresh of volatile domains, invalidation events, richer health metadata, and limited history where those capabilities provide measurable value.
+
+Both modes should preserve compatible conceptual state contracts.
 
 ## Telemetry
 
-Potential Data Collection telemetry includes:
+Potential telemetry includes:
 
 - collector health;
 - last successful refresh;
 - refresh duration;
-- stale-state count;
-- failed reads;
-- state/schema version;
+- refresh failures;
+- stale record/domain count;
+- invalid record/domain count;
+- schema/version;
 - RAM cost by collector;
-- relevant invalidation events.
+- last invalidation;
+- consumer-visible freshness.
+
+## Validation Expectations
+
+Validation should prove that:
+
+- consumers can distinguish fresh, stale, invalid, and unavailable state;
+- failed refresh does not erase last known valid state;
+- one collector failure remains isolated where dependencies permit;
+- normalized state matches observed game state;
+- duplicate expensive acquisition is not introduced without explicit justification;
+- Low-RAM and Full-Stack collection behavior respects their resource goals;
+- control ports are not used as the sole durable state store.
 
 ## Deferred Implementation Details
 
 Intentionally deferred:
 
-- exact file/port/state transport;
-- exact schemas;
+- exact file/state transport;
+- exact serialized schemas and field names;
 - exact refresh cadences;
 - cache/invalidation algorithms;
 - persistence format;
-- collector retry policy;
-- historical retention policy.
+- collector retry/backoff policy;
+- historical retention policy;
+- exact process grouping of collectors.
