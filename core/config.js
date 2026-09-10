@@ -14,6 +14,8 @@ export const PATHS = Object.freeze({
   playerState: "/data/state/player.json",
   updateState: "/data/state/update.json",
   updateValidationState: "/data/state/update-validation.json",
+  activeValidationState: "/data/state/active-validation.json",
+  scriptHealthState: "/data/state/script-health.json",
 });
 
 export const REPOSITORY = Object.freeze({
