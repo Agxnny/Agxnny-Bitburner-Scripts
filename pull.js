@@ -29,23 +29,29 @@ export async function main(ns) {
 
   const plan = buildPlan(ns, installed, target, Boolean(flags.repair));
   printPlan(ns, relation, target, plan);
-  const runtimeState = snapshotManagedRuntime(ns, target);
-  closeManagedTails(ns, runtimeState);
-  stopForUpdate(ns, runtimeState, target, plan);
+
+  const persistent = new Set(target.persistent ?? []);
+  const persistentRuntime = snapshotPersistentRuntime(ns, persistent);
+  closeAllTails(ns);
+  killNonPersistent(ns, persistent);
+  recycleChangedPersistent(ns, persistentRuntime, plan);
 
   if (ns.fileExists(STAGED_PULL, "home")) ns.rm(STAGED_PULL, "home");
   const failures = [];
   let pullerStaged = false;
+
   for (const file of plan.fetch) {
     const destination = file.path === PULL_PATH ? STAGED_PULL : file.path;
     const downloaded = await ns.wget(cacheBust(`${RAW_BASE}${file.path}`, `${target.revisionId}-${file.fileVersion}`), destination, "home");
     if (!downloaded) failures.push(file.path);
     if (downloaded && file.path === PULL_PATH) pullerStaged = true;
   }
+
   for (const path of plan.remove) {
     if (path === PULL_PATH || path === HANDOFF_PATH) { failures.push(path); continue; }
     if (ns.fileExists(path, "home") && !ns.rm(path, "home")) failures.push(path);
   }
+
   for (const file of target.files) {
     if (!file.required) continue;
     const present = file.path === PULL_PATH && pullerStaged ? ns.fileExists(STAGED_PULL, "home") : ns.fileExists(file.path, "home");
@@ -56,7 +62,7 @@ export async function main(ns) {
   if (uniqueFailures.length) {
     ns.tprint("ALARM UPDATE_FAILED: required target revision was not installed completely.");
     for (const path of uniqueFailures) ns.tprint(`  FAILED ${path}`);
-    restoreRuntime(ns, runtimeState);
+    restartPersistent(ns, persistentRuntime);
     return;
   }
 
@@ -64,54 +70,74 @@ export async function main(ns) {
   const record = { installedAt: Date.now(), releaseVersion: target.releaseVersion, revisionSequence: target.revisionSequence, revisionId: target.revisionId, outcome: result, manifest: target };
 
   if (pullerStaged) {
-    if (!ns.fileExists(HANDOFF_PATH, "home")) { restoreRuntime(ns, runtimeState); return fail(ns, `Self-update required but ${HANDOFF_PATH} is missing`); }
-    const handoffPid = ns.exec(HANDOFF_PATH, "home", 1, "--old-pid", ns.pid, "--staged", STAGED_PULL, "--target", PULL_PATH, "--installed-state", INSTALLED_STATE, "--record", JSON.stringify(record), "--runtime", JSON.stringify(runtimeState));
-    if (handoffPid === 0) { restoreRuntime(ns, runtimeState); return fail(ns, "Could not start pull self-update handoff helper"); }
+    if (!ns.fileExists(HANDOFF_PATH, "home")) { restartPersistent(ns, persistentRuntime); return fail(ns, `Self-update required but ${HANDOFF_PATH} is missing`); }
+    const handoffPid = ns.exec(HANDOFF_PATH, "home", 1,
+      "--old-pid", ns.pid,
+      "--staged", STAGED_PULL,
+      "--target", PULL_PATH,
+      "--installed-state", INSTALLED_STATE,
+      "--record", JSON.stringify(record),
+      "--runtime", JSON.stringify(persistentRuntime),
+    );
+    if (handoffPid === 0) { restartPersistent(ns, persistentRuntime); return fail(ns, "Could not start pull self-update handoff helper"); }
     ns.tprint(`Handoff helper started as PID ${handoffPid}; pull.js will now exit.`);
     return;
   }
 
   ns.write(INSTALLED_STATE, JSON.stringify(record, null, 2), "w");
-  restoreRuntime(ns, runtimeState);
+  restartPersistent(ns, persistentRuntime);
   ns.tprint(`${result}: ${target.releaseVersion} / ${target.revisionId}`);
+  ns.tprint("Pull complete. Only scripts declared persistent were preserved/restarted; all other home scripts remain stopped.");
 }
 
-function snapshotManagedRuntime(ns, manifest) {
-  const managed = new Set((manifest.runtimeEntries ?? []).map((e) => e.path));
-  const processes = [];
+function snapshotPersistentRuntime(ns, persistent) {
+  const result = [];
   for (const p of ns.ps("home")) {
-    if (!managed.has(p.filename) || p.pid === ns.pid) continue;
-    const running = ns.getRunningScript(p.pid, "home");
-    processes.push({ pid: p.pid, filename: p.filename, threads: p.threads, args: p.args, tail: running?.tailProperties ? { ...running.tailProperties } : null });
+    if (p.pid === ns.pid || !persistent.has(p.filename)) continue;
+    result.push({ pid: p.pid, filename: p.filename, threads: p.threads, args: p.args });
   }
-  return processes;
+  return result;
 }
-function closeManagedTails(ns, runtime) { for (const p of runtime) if (p.tail) try { ns.ui.closeTail(p.pid); } catch {} }
-function stopForUpdate(ns, runtime, manifest, plan) {
-  const persistent = new Set(manifest.persistent ?? []);
+
+function closeAllTails(ns) {
+  for (const p of ns.ps("home")) {
+    if (p.pid === ns.pid) continue;
+    const running = ns.getRunningScript(p.pid, "home");
+    if (!running?.tailProperties) continue;
+    try { ns.ui.closeTail(p.pid); } catch {}
+  }
+}
+
+function killNonPersistent(ns, persistent) {
+  for (const p of ns.ps("home")) {
+    if (p.pid === ns.pid || persistent.has(p.filename)) continue;
+    ns.tprint(`  STOP NON-PERSISTENT ${p.filename} pid=${p.pid}`);
+    ns.kill(p.pid);
+  }
+}
+
+function recycleChangedPersistent(ns, runtime, plan) {
   const changed = new Set(plan.fetch.map((f) => f.path));
   const removed = new Set(plan.remove);
   for (const p of runtime) {
-    const mustRecycle = !persistent.has(p.filename) || changed.has(p.filename) || removed.has(p.filename);
-    if (mustRecycle && ns.isRunning(p.pid, "home")) {
-      ns.tprint(`  STOP ${persistent.has(p.filename) ? "CHANGED PERSISTENT" : "NON-PERSISTENT"} ${p.filename}`);
+    if (!changed.has(p.filename) && !removed.has(p.filename)) continue;
+    if (ns.isRunning(p.pid, "home")) {
+      ns.tprint(`  STOP CHANGED PERSISTENT ${p.filename} pid=${p.pid}`);
       ns.kill(p.pid);
     }
   }
 }
-function restoreRuntime(ns, runtime) {
+
+function restartPersistent(ns, runtime) {
   for (const p of runtime) {
-    let pid = p.pid;
-    if (!ns.isRunning(pid, "home")) {
-      if (!ns.fileExists(p.filename, "home")) continue;
-      pid = ns.exec(p.filename, "home", { threads: p.threads }, ...p.args);
-      if (pid === 0) { ns.tprint(`WARNING RESTART_FAILED: ${p.filename}`); continue; }
-      ns.tprint(`  RESTART ${p.filename} pid=${pid}`);
-    }
-    if (p.tail) restoreTail(ns, pid, p.tail);
+    if (ns.isRunning(p.pid, "home")) continue;
+    if (!ns.fileExists(p.filename, "home")) continue;
+    const pid = ns.exec(p.filename, "home", { threads: Number(p.threads) || 1 }, ...(p.args ?? []));
+    if (pid === 0) ns.tprint(`WARNING RESTART_FAILED: ${p.filename}`);
+    else ns.tprint(`  RESTART PERSISTENT ${p.filename} pid=${pid}`);
   }
 }
-function restoreTail(ns, pid, tail) { try { ns.ui.openTail(pid); ns.ui.moveTail(tail.x, tail.y, pid); ns.ui.resizeTail(tail.width, tail.height, pid); } catch (error) { ns.tprint(`WARNING TAIL_RESTORE_FAILED pid=${pid}: ${String(error)}`); } }
+
 function buildPlan(ns, installed, target, repair) {
   const installedByPath = new Map((installed?.files ?? []).map((f) => [f.path, f]));
   const fetch = [], unchanged = [];
@@ -123,7 +149,15 @@ function buildPlan(ns, installed, target, repair) {
   }
   return { fetch, unchanged, remove: [...(target.removedFiles ?? [])] };
 }
-function compareRevision(installed, target) { if (!installed || !Number.isInteger(installed.revisionSequence)) return "FRESH_INSTALL"; if (target.revisionSequence > installed.revisionSequence) return "FORWARD_UPDATE"; if (target.revisionSequence < installed.revisionSequence) return "OLDER_REVISION_DETECTED"; if (target.revisionId === installed.revisionId) return "SAME_REVISION_REPULL"; return "REVISION_MISMATCH"; }
+
+function compareRevision(installed, target) {
+  if (!installed || !Number.isInteger(installed.revisionSequence)) return "FRESH_INSTALL";
+  if (target.revisionSequence > installed.revisionSequence) return "FORWARD_UPDATE";
+  if (target.revisionSequence < installed.revisionSequence) return "OLDER_REVISION_DETECTED";
+  if (target.revisionId === installed.revisionId) return "SAME_REVISION_REPULL";
+  return "REVISION_MISMATCH";
+}
+
 function validateManifest(m) {
   const errors = [];
   if (!m || typeof m !== "object") return { valid: false, errors: ["manifest must be an object"] };
@@ -132,11 +166,25 @@ function validateManifest(m) {
   if (typeof m.revisionId !== "string" || !m.revisionId) errors.push("revisionId missing/invalid");
   if (typeof m.releaseVersion !== "string" || !m.releaseVersion) errors.push("releaseVersion missing/invalid");
   if (!Array.isArray(m.files)) errors.push("files missing/invalid");
-  else { const seen = new Set(); for (const file of m.files) { if (!file || typeof file.path !== "string" || !file.path.startsWith("/")) errors.push("invalid file path"); else if (seen.has(file.path)) errors.push(`duplicate file path ${file.path}`); else seen.add(file.path); if (!Number.isInteger(file.fileVersion) || file.fileVersion < 1) errors.push(`invalid fileVersion ${file.path ?? "?"}`); } }
+  else {
+    const seen = new Set();
+    for (const file of m.files) {
+      if (!file || typeof file.path !== "string" || !file.path.startsWith("/")) errors.push("invalid file path");
+      else if (seen.has(file.path)) errors.push(`duplicate file path ${file.path}`);
+      else seen.add(file.path);
+      if (!Number.isInteger(file.fileVersion) || file.fileVersion < 1) errors.push(`invalid fileVersion ${file.path ?? "?"}`);
+    }
+  }
   if (!Array.isArray(m.removedFiles)) errors.push("removedFiles missing/invalid");
+  if (!Array.isArray(m.persistent)) errors.push("persistent missing/invalid");
   return { valid: errors.length === 0, errors };
 }
+
 function readJson(ns, path) { const raw = ns.read(path); if (!raw) return null; try { return JSON.parse(raw); } catch { return null; } }
 function cacheBust(url, token) { return `${url}${url.includes("?") ? "&" : "?"}bb=${encodeURIComponent(token)}`; }
-function printPlan(ns, relation, target, plan) { ns.tprint(`${relation}: target ${target.releaseVersion} / ${target.revisionId}`); ns.tprint(`Plan: fetch=${plan.fetch.length}, unchanged=${plan.unchanged.length}, remove=${plan.remove.length}`); for (const f of plan.fetch) ns.tprint(`  FETCH ${f.change.toUpperCase().padEnd(9)} ${f.path}`); }
+function printPlan(ns, relation, target, plan) {
+  ns.tprint(`${relation}: target ${target.releaseVersion} / ${target.revisionId}`);
+  ns.tprint(`Plan: fetch=${plan.fetch.length}, unchanged=${plan.unchanged.length}, remove=${plan.remove.length}`);
+  for (const f of plan.fetch) ns.tprint(`  FETCH ${f.change.toUpperCase().padEnd(9)} ${f.path}`);
+}
 function fail(ns, message) { ns.tprint(`ALARM UPDATE_FAILED: ${message}`); }
