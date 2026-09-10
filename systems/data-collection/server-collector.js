@@ -1,10 +1,12 @@
-import { PATHS, FRESHNESS_MS } from "/core/config.js";
+import { PATHS } from "/core/config.js";
 import { HEALTH } from "/core/contracts.js";
 import { publishDomainState } from "/core/state.js";
 import { discoverNetwork } from "/systems/data-collection/network.js";
 
+const DEFAULT_INTERVAL_MS = 1000;
+
 export async function main(ns) {
-  const flags = ns.flags([["once", false], ["interval", FRESHNESS_MS.medium]]);
+  const flags = ns.flags([["once", false], ["interval", DEFAULT_INTERVAL_MS]]);
   ns.disableLog("scan");
   ns.disableLog("sleep");
 
@@ -31,7 +33,7 @@ export async function main(ns) {
     }
 
     if (flags.once) break;
-    await ns.sleep(Math.max(500, Number(flags.interval) || FRESHNESS_MS.medium));
+    await ns.sleep(Math.max(500, Number(flags.interval) || DEFAULT_INTERVAL_MS));
   } while (true);
 }
 
