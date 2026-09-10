@@ -2,6 +2,9 @@ import { PATHS, FRESHNESS_MS } from "/core/config.js";
 import { classifyFreshness, readJson } from "/core/state.js";
 import { formatMoney, formatRam } from "/ui/format.js";
 
+const ACTIVE_TEST_RUNNER = "/validation/active-tests.js";
+const SCRIPT_HEALTH_RUNNER = "/validation/script-health.js";
+
 export async function main(ns) {
   const flags = ns.flags([["ui-interval", 100], ["data-interval", 500]]);
   const uiInterval = Math.max(50, Number(flags["ui-interval"]) || 100);
@@ -10,21 +13,35 @@ export async function main(ns) {
   let activeTab = "active", lastDataRead = 0, rawSnapshots = readRawSnapshots(ns);
   const React = globalThis.React; if (!React) throw new Error("React is not available in this Bitburner runtime");
   const h = React.createElement;
+  const actions = {
+    runActiveTests: () => launchOnce(ns, ACTIVE_TEST_RUNNER, "Active tests"),
+    runScriptHealth: () => launchOnce(ns, SCRIPT_HEALTH_RUNNER, "Script health check"),
+  };
   while (true) {
     const now = Date.now();
     if (now - lastDataRead >= dataInterval) { rawSnapshots = readRawSnapshots(ns); lastDataRead = now; }
     const snapshots = decorateSnapshots(rawSnapshots, now);
-    ns.clearLog(); ns.printRaw(renderDashboard(h, snapshots, activeTab, (tab) => { activeTab = tab; }));
+    ns.clearLog(); ns.printRaw(renderDashboard(h, snapshots, activeTab, (tab) => { activeTab = tab; }, actions));
     await ns.sleep(uiInterval);
   }
 }
-function readRawSnapshots(ns) { return { resources: readJson(ns, PATHS.resourceState), servers: readJson(ns, PATHS.serverState), player: readJson(ns, PATHS.playerState), ramAudit: readJson(ns, PATHS.ramAudit), update: readJson(ns, PATHS.updateState), updateValidation: readJson(ns, PATHS.updateValidationState) }; }
-function decorateSnapshots(raw, now) { return { resources: decorate(raw.resources, FRESHNESS_MS.fast, now), servers: decorate(raw.servers, FRESHNESS_MS.medium, now), player: decorate(raw.player, FRESHNESS_MS.medium, now), ramAudit: decorate(raw.ramAudit, FRESHNESS_MS.slow, now), update: decorate(raw.update, FRESHNESS_MS.slow, now), updateValidation: decorate(raw.updateValidation, FRESHNESS_MS.slow, now) }; }
+function launchOnce(ns, script, label) {
+  if (!ns.fileExists(script, "home")) { ns.tprint(`${label}: missing ${script}`); return; }
+  if (ns.isRunning(script, "home")) { ns.tprint(`${label}: already running`); return; }
+  const pid = ns.run(script, 1);
+  if (pid === 0) ns.tprint(`${label}: failed to start`);
+}
+function readRawSnapshots(ns) { return { resources: readJson(ns, PATHS.resourceState), servers: readJson(ns, PATHS.serverState), player: readJson(ns, PATHS.playerState), ramAudit: readJson(ns, PATHS.ramAudit), update: readJson(ns, PATHS.updateState), updateValidation: readJson(ns, PATHS.updateValidationState), activeValidation: readJson(ns, PATHS.activeValidationState), scriptHealth: readJson(ns, PATHS.scriptHealthState) }; }
+function decorateSnapshots(raw, now) { return { resources: decorate(raw.resources, FRESHNESS_MS.fast, now), servers: decorate(raw.servers, FRESHNESS_MS.medium, now), player: decorate(raw.player, FRESHNESS_MS.medium, now), ramAudit: decorate(raw.ramAudit, FRESHNESS_MS.slow, now), update: decorate(raw.update, FRESHNESS_MS.slow, now), updateValidation: decorate(raw.updateValidation, FRESHNESS_MS.slow, now), activeValidation: decorate(raw.activeValidation, FRESHNESS_MS.slow, now), scriptHealth: decorate(raw.scriptHealth, FRESHNESS_MS.slow, now) }; }
 function decorate(snapshot, maxAgeMs, now) { return { snapshot, freshness: classifyFreshness(snapshot, maxAgeMs, now), ageMs: snapshot?.generatedAt ? Math.max(0, now - snapshot.generatedAt) : Infinity }; }
-function renderDashboard(h, s, activeTab, setTab) {
+function renderDashboard(h, s, activeTab, setTab, actions) {
   const tabs = [["active", "Active / In Development"], ["completed", "Completed / Validated"], ["overall", "Overall Testing"]];
   return h("div", { style: rootStyle },
     h("div", { style: headerStyle }, h("div", null, h("div", { style: titleStyle }, "Agxnny Stack Validation"), h("div", { style: subStyle }, "Shared-state engineering dashboard")), h(StatusPill, { h, label: overallHealth(s) })),
+    h("div", { style: controlRowStyle },
+      h("button", { onClick: actions.runActiveTests, style: actionButtonStyle }, "Run Active Tests"),
+      h("button", { onClick: actions.runScriptHealth, style: actionButtonStyle }, "Script Health Check"),
+      h("span", { style: controlStatusStyle }, `Active: ${manualSummary(s.activeValidation)} · Health: ${manualSummary(s.scriptHealth)}`)),
     h("div", { style: tabRowStyle }, ...tabs.map(([id, label]) => h("button", { key: id, onClick: () => setTab(id), style: { ...tabStyle, ...(activeTab === id ? activeTabStyle : {}) } }, label))),
     activeTab === "active" ? h(ActiveView, { h, s }) : activeTab === "completed" ? h(CompletedView, { h, s }) : h(OverallView, { h, s }));
 }
@@ -38,8 +55,16 @@ function ActiveView({ h, s }) {
       h(MetricCard, { h, title: "Player Money", value: formatMoney(p?.money), meta: `Hack ${p?.skills?.hacking ?? "—"} · ${freshnessMeta(s.player)}` }),
       h(MetricCard, { h, title: "RAM Audit", value: validationHealth(s.ramAudit), meta: `${a?.scriptCount ?? 0} entrypoints · ${a?.durationMs ?? "—"}ms` }),
       h(MetricCard, { h, title: "Repository", value: u?.status ?? "NO DATA", meta: revisionMeta(u) })),
+    h("div", { style: manualGridStyle },
+      h(ManualCard, { h, title: "Active Feature Tests", state: s.activeValidation }),
+      h(ManualCard, { h, title: "Script Health", state: s.scriptHealth })),
     h("div", { style: splitStyle }, h(Panel, { h, title: "RAM by Host" }, h(HostTable, { h, hosts: r?.hosts ?? [] })), h(Panel, { h, title: "Update / Validation" }, h(UpdatePanel, { h, update: s.update, validation: s.updateValidation }))),
     h(Panel, { h, title: "Running Processes" }, h(ProcessTable, { h, hosts: r?.hosts ?? [] })));
+}
+function ManualCard({ h, title, state }) {
+  const d = state.snapshot?.data;
+  const details = !d ? "Not run yet" : `${d.passed ?? 0}/${d.total ?? 0} pass · ${age(state.ageMs)} ago`;
+  return h("div", { style: cardStyle }, h("div", { style: labelStyle }, title), h("div", { style: metricStyle }, validationHealth(state)), h("div", { style: subStyle }, details));
 }
 function CompletedView({ h, s }) { return h("div", { style: gridStyle }, h(StateCard, { h, name: "Resource Collector", state: s.resources }), h(StateCard, { h, name: "Server Collector", state: s.servers }), h(StateCard, { h, name: "Player Collector", state: s.player }), h(StateCard, { h, name: "RAM Audit", state: s.ramAudit }), h(StateCard, { h, name: "Update Watcher", state: s.update }), h(StateCard, { h, name: "Update Tests", state: s.updateValidation })); }
 function OverallView({ h, s }) { return h(Panel, { h, title: "Whole-stack validation" }, h("div", null, ...Object.entries(s).map(([name, item]) => h("div", { key: name, style: rowStyle }, h("span", { style: { flex: 1 } }, name), h("b", null, validationHealth(item)), h("span", { style: monoStyle }, age(item.ageMs)))))); }
@@ -71,9 +96,9 @@ function validationHealth(x) {
   if (x.freshness === "STALE" || x.freshness === "UNAVAILABLE") return "DEGRADED";
   const d = x.snapshot.data ?? {};
   if (d.status === "FAIL" || d.health === "FAIL") return "FAIL";
+  if (d.status === "BLOCKED" || d.health === "BLOCKED") return "BLOCKED";
   if (d.status === "DEGRADED" || d.health === "DEGRADED") return "DEGRADED";
-  if (d.status === "CURRENT") return "PASS";
-  if (d.status === "PASS" || d.health === "PASS") return "PASS";
+  if (d.status === "CURRENT" || d.status === "PASS" || d.health === "PASS") return "PASS";
   if (Number.isFinite(d.total) && Number.isFinite(d.passed)) return d.total > 0 && d.passed === d.total ? "PASS" : "FAIL";
   return x.snapshot.valid ? "PASS" : "UNTESTED";
 }
@@ -82,17 +107,19 @@ function overallHealth(s) {
   const health = required.map(validationHealth);
   if (health.includes("FAIL")) return "FAIL";
   if (health.includes("DEGRADED")) return "DEGRADED";
-  if (health.includes("NO DATA") || health.includes("UNTESTED")) return "IN DEVELOPMENT";
+  if (health.includes("NO DATA") || health.includes("UNTESTED") || health.includes("BLOCKED")) return "IN DEVELOPMENT";
   return "PASS";
 }
+function manualSummary(state) { return !state?.snapshot ? "NOT RUN" : `${validationHealth(state)} (${age(state.ageMs)})`; }
 function ramPair(x) { return x ? `${formatRam(x.usedRam)} / ${formatRam(x.maxRam)}` : "NO DATA"; }
 function age(ms) { return Number.isFinite(ms) ? `${(ms / 1000).toFixed(1)}s` : "—"; }
 function freshnessMeta(x) { return `${x.freshness} · ${age(x.ageMs)}`; }
 function revisionMeta(u) { return u?.remote?.revisionId ?? u?.target?.revisionId ?? u?.revisionId ?? "—"; }
 const rootStyle = { fontFamily: "sans-serif", padding: "12px", background: "#101114", minHeight: "100%", color: "#e6e6e6" };
 const headerStyle = { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }, titleStyle = { fontSize: "22px", fontWeight: 700 }, subStyle = { opacity: 0.68, fontSize: "12px", marginTop: "4px" };
+const controlRowStyle = { display: "flex", gap: "8px", alignItems: "center", marginBottom: "10px", flexWrap: "wrap" }, actionButtonStyle = { padding: "7px 11px", border: "1px solid #6a7079", borderRadius: "6px", background: "#23272e", color: "inherit", cursor: "pointer", fontWeight: 700 }, controlStatusStyle = { opacity: 0.7, fontSize: "11px", marginLeft: "4px" };
 const tabRowStyle = { display: "flex", gap: "8px", marginBottom: "12px" }, tabStyle = { padding: "7px 10px", border: "1px solid #555", borderRadius: "6px", background: "#191b20", color: "inherit", cursor: "pointer" }, activeTabStyle = { borderColor: "#ddd", background: "#292d35" };
-const gridStyle = { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "8px", marginBottom: "8px" }, splitStyle = { display: "grid", gridTemplateColumns: "2fr 1fr", gap: "8px", marginBottom: "8px" };
+const gridStyle = { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "8px", marginBottom: "8px" }, manualGridStyle = { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginBottom: "8px" }, splitStyle = { display: "grid", gridTemplateColumns: "2fr 1fr", gap: "8px", marginBottom: "8px" };
 const cardStyle = { background: "#191b20", border: "1px solid #30333a", borderRadius: "7px", padding: "10px" }, panelStyle = { ...cardStyle, marginBottom: "8px" }, labelStyle = { opacity: 0.72, fontSize: "12px" }, metricStyle = { fontSize: "18px", fontWeight: 700, marginTop: "3px" }, panelTitleStyle = { fontWeight: 700, marginBottom: "7px" };
 const rowStyle = { display: "flex", justifyContent: "space-between", gap: "12px", padding: "3px 0", borderBottom: "1px solid #25282e" };
 const tableViewportStyle = { maxHeight: "330px", overflowY: "auto", paddingRight: "4px" }, processViewportStyle = { maxHeight: "220px", overflowY: "auto", paddingRight: "4px" };
