@@ -5,6 +5,7 @@ import { buildChangePlan, compareRevisions, summarizeManifest, validateManifest 
 import { readInstalledRevision, summarizeInstalledRecord } from "/systems/data-collection/update/installed-state.js";
 
 const DEFAULT_INTERVAL_MS = 60_000;
+const UPDATE_PROMPT = "/ui/update-prompt.js";
 
 export async function main(ns) {
   const flags = ns.flags([["once", false], ["interval", DEFAULT_INTERVAL_MS]]);
@@ -20,9 +21,20 @@ export async function main(ns) {
       data: result,
     });
     printSummary(ns, result);
+    if (result.status === "UPDATE_AVAILABLE") launchUpdatePrompt(ns);
     if (flags.once) break;
     await ns.sleep(Math.max(5_000, Number(flags.interval) || DEFAULT_INTERVAL_MS));
   } while (true);
+}
+
+function launchUpdatePrompt(ns) {
+  if (!ns.fileExists(UPDATE_PROMPT, "home")) {
+    ns.print(`[ALARM] UPDATE_PROMPT_MISSING: ${UPDATE_PROMPT}`);
+    return;
+  }
+  if (ns.scriptRunning(UPDATE_PROMPT, "home")) return;
+  const pid = ns.exec(UPDATE_PROMPT, "home", 1);
+  if (pid === 0) ns.print("[ALARM] UPDATE_PROMPT_LAUNCH_FAILED");
 }
 
 export async function checkForUpdates(ns) {
@@ -47,38 +59,18 @@ export async function checkForUpdates(ns) {
   const alarm = classifyAlarm(status);
 
   return {
-    valid: !["REVISION_MISMATCH"].includes(status),
-    checkedAt,
-    health: healthForStatus(status),
-    severity: alarm.severity,
-    alarm: alarm.active,
-    status,
-    message: alarm.message,
+    valid: !["REVISION_MISMATCH"].includes(status), checkedAt, health: healthForStatus(status), severity: alarm.severity,
+    alarm: alarm.active, status, message: alarm.message,
     repository: { owner: REPOSITORY.owner, name: REPOSITORY.name, branch: REPOSITORY.branch },
-    installed: summarizeInstalledRecord(installedRecord),
-    localManifest: summarizeManifest(localManifest),
-    remote: summarizeManifest(remoteManifest),
-    changes: changePlan,
-    errors: [],
+    installed: summarizeInstalledRecord(installedRecord), localManifest: summarizeManifest(localManifest), remote: summarizeManifest(remoteManifest),
+    changes: changePlan, errors: [],
   };
 }
 
 function failureResult({ checkedAt, status, message, errors = [], installedRecord = null, localManifest = null, remoteManifest = null }) {
-  return {
-    valid: false,
-    checkedAt,
-    health: HEALTH.FAIL,
-    severity: SEVERITY.ERROR,
-    alarm: true,
-    status,
-    message,
-    repository: { owner: REPOSITORY.owner, name: REPOSITORY.name, branch: REPOSITORY.branch },
-    installed: summarizeInstalledRecord(installedRecord),
-    localManifest: summarizeManifest(localManifest),
-    remote: summarizeManifest(remoteManifest),
-    changes: null,
-    errors,
-  };
+  return { valid: false, checkedAt, health: HEALTH.FAIL, severity: SEVERITY.ERROR, alarm: true, status, message,
+    repository: { owner: REPOSITORY.owner, name: REPOSITORY.name, branch: REPOSITORY.branch }, installed: summarizeInstalledRecord(installedRecord),
+    localManifest: summarizeManifest(localManifest), remote: summarizeManifest(remoteManifest), changes: null, errors };
 }
 
 function classifyAlarm(status) {
@@ -95,12 +87,9 @@ function classifyAlarm(status) {
 
 function healthForStatus(status) {
   switch (status) {
-    case "CURRENT":
-    case "UPDATE_AVAILABLE": return HEALTH.PASS;
-    case "SAME_REVISION":
-    case "LOCAL_REVISION_UNKNOWN": return HEALTH.DEGRADED;
-    case "REMOTE_OLDER":
-    case "REVISION_MISMATCH": return HEALTH.FAIL;
+    case "CURRENT": case "UPDATE_AVAILABLE": return HEALTH.PASS;
+    case "SAME_REVISION": case "LOCAL_REVISION_UNKNOWN": return HEALTH.DEGRADED;
+    case "REMOTE_OLDER": case "REVISION_MISMATCH": return HEALTH.FAIL;
     default: return HEALTH.DEGRADED;
   }
 }
