@@ -2,6 +2,7 @@ const PROCESSES = [
   "/systems/data-collection/resource-collector.js",
   "/systems/data-collection/server-collector.js",
   "/systems/data-collection/player-collector.js",
+  "/ui/tail-memory.js",
 ];
 
 const ONE_SHOTS = [
