@@ -1,13 +1,14 @@
 // Central configuration for cross-cutting stack behavior.
 // Domain-specific tuning belongs with the owning subsystem unless multiple systems need it.
 
-export const STACK_VERSION = "v0.1.0";
-
 export const PATHS = Object.freeze({
+  version: "/VERSION.txt",
+  manifest: "/stack-manifest.json",
   stateRoot: "/data/state",
   telemetryRoot: "/data/telemetry",
   ramAudit: "/data/state/ram-audit.json",
   resourceState: "/data/state/resources.json",
+  updateState: "/data/state/update.json",
 });
 
 export const STATE_SCHEMA_VERSION = 1;
