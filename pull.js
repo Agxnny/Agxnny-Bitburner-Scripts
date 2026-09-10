@@ -30,11 +30,26 @@ export async function main(ns) {
   const plan = buildPlan(ns, installed, target, Boolean(flags.repair));
   printPlan(ns, relation, target, plan);
 
-  const persistent = new Set(target.persistent ?? []);
+  const persistent = new Set((target.persistent ?? []).map(canonicalPath));
   const persistentRuntime = snapshotPersistentRuntime(ns, persistent);
   closeAllTails(ns);
-  killNonPersistent(ns, persistent);
-  recycleChangedPersistent(ns, persistentRuntime, plan);
+
+  // Deterministic update boundary: kill every home process except this puller.
+  // Persistent processes are restored after the update; everything else stays stopped.
+  const beforeKill = ns.ps("home").filter((p) => p.pid !== ns.pid);
+  if (beforeKill.length > 0) {
+    ns.tprint(`Stopping ${beforeKill.length} home script process(es) before update...`);
+    ns.killall("home", true);
+    await ns.sleep(50);
+  }
+
+  const survivors = ns.ps("home").filter((p) => p.pid !== ns.pid);
+  if (survivors.length > 0) {
+    ns.tprint("ALARM UPDATE_ABORTED: scripts survived the pre-update kill boundary:");
+    for (const p of survivors) ns.tprint(`  SURVIVOR ${p.filename} pid=${p.pid}`);
+    restartPersistent(ns, persistentRuntime);
+    return;
+  }
 
   if (ns.fileExists(STAGED_PULL, "home")) ns.rm(STAGED_PULL, "home");
   const failures = [];
@@ -87,13 +102,13 @@ export async function main(ns) {
   ns.write(INSTALLED_STATE, JSON.stringify(record, null, 2), "w");
   restartPersistent(ns, persistentRuntime);
   ns.tprint(`${result}: ${target.releaseVersion} / ${target.revisionId}`);
-  ns.tprint("Pull complete. Only scripts declared persistent were preserved/restarted; all other home scripts remain stopped.");
+  ns.tprint("Pull complete. Only previously-running persistent scripts were restarted; all other home scripts remain stopped.");
 }
 
 function snapshotPersistentRuntime(ns, persistent) {
   const result = [];
   for (const p of ns.ps("home")) {
-    if (p.pid === ns.pid || !persistent.has(p.filename)) continue;
+    if (p.pid === ns.pid || !persistent.has(canonicalPath(p.filename))) continue;
     result.push({ pid: p.pid, filename: p.filename, threads: p.threads, args: p.args });
   }
   return result;
@@ -108,26 +123,6 @@ function closeAllTails(ns) {
   }
 }
 
-function killNonPersistent(ns, persistent) {
-  for (const p of ns.ps("home")) {
-    if (p.pid === ns.pid || persistent.has(p.filename)) continue;
-    ns.tprint(`  STOP NON-PERSISTENT ${p.filename} pid=${p.pid}`);
-    ns.kill(p.pid);
-  }
-}
-
-function recycleChangedPersistent(ns, runtime, plan) {
-  const changed = new Set(plan.fetch.map((f) => f.path));
-  const removed = new Set(plan.remove);
-  for (const p of runtime) {
-    if (!changed.has(p.filename) && !removed.has(p.filename)) continue;
-    if (ns.isRunning(p.pid, "home")) {
-      ns.tprint(`  STOP CHANGED PERSISTENT ${p.filename} pid=${p.pid}`);
-      ns.kill(p.pid);
-    }
-  }
-}
-
 function restartPersistent(ns, runtime) {
   for (const p of runtime) {
     if (ns.isRunning(p.pid, "home")) continue;
@@ -136,6 +131,11 @@ function restartPersistent(ns, runtime) {
     if (pid === 0) ns.tprint(`WARNING RESTART_FAILED: ${p.filename}`);
     else ns.tprint(`  RESTART PERSISTENT ${p.filename} pid=${pid}`);
   }
+}
+
+function canonicalPath(path) {
+  const value = String(path ?? "").trim();
+  return value.startsWith("/") ? value : `/${value}`;
 }
 
 function buildPlan(ns, installed, target, repair) {
