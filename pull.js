@@ -13,7 +13,8 @@ export async function main(ns) {
   ]);
 
   ns.tprint("Fetching remote stack manifest...");
-  const ok = await ns.wget(MANIFEST_URL, REMOTE_MANIFEST, "home");
+  const manifestUrl = cacheBust(MANIFEST_URL, `check-${Date.now()}`);
+  const ok = await ns.wget(manifestUrl, REMOTE_MANIFEST, "home");
   if (!ok) return fail(ns, "Could not download remote manifest");
 
   const target = readJson(ns, REMOTE_MANIFEST);
@@ -50,7 +51,8 @@ export async function main(ns) {
   let pullerStaged = false;
 
   for (const file of plan.fetch) {
-    const url = `${RAW_BASE}${file.path}`;
+    const baseUrl = `${RAW_BASE}${file.path}`;
+    const url = cacheBust(baseUrl, `${target.revisionId}-${file.fileVersion}`);
     const destination = file.path === PULL_PATH ? STAGED_PULL : file.path;
     const downloaded = await ns.wget(url, destination, "home");
     if (!downloaded) failures.push(file.path);
@@ -180,6 +182,10 @@ function readJson(ns, path) {
   const raw = ns.read(path);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return null; }
+}
+
+function cacheBust(url, token) {
+  return `${url}${url.includes("?") ? "&" : "?"}bb=${encodeURIComponent(token)}`;
 }
 
 function printPlan(ns, relation, target, plan) {
