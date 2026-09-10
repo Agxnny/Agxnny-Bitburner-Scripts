@@ -82,8 +82,15 @@ export function compareRevisions(installed, target) {
   if (!Number.isInteger(installedSequence)) return "LOCAL_REVISION_UNKNOWN";
   if (targetSequence > installedSequence) return "UPDATE_AVAILABLE";
   if (targetSequence < installedSequence) return "REMOTE_OLDER";
-  if (target.revisionId === installed.revisionId) return "SAME_REVISION";
+  if (target.revisionId === installed.revisionId) return "CURRENT";
   return "REVISION_MISMATCH";
+}
+
+export function classifyInstallAttempt(installed, target) {
+  const comparison = compareRevisions(installed, target);
+  if (comparison === "CURRENT") return "SAME_REVISION_REPULL";
+  if (comparison === "REMOTE_OLDER") return "OLDER_REVISION_DETECTED";
+  return comparison;
 }
 
 export function buildChangePlan(ns, installedManifest, targetManifest) {
