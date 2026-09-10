@@ -4,8 +4,8 @@ import { classifyFreshness, readJson } from "/core/state.js";
 export async function main(ns) {
   const flags = ns.flags([["interval", 1000]]);
   ns.disableLog("ALL");
-  ns.tail();
-  try { ns.resizeTail(1180, 760); } catch {}
+  ns.ui.openTail();
+  try { ns.ui.resizeTail(1180, 760); } catch {}
 
   let activeTab = "active";
   const React = globalThis.React;
