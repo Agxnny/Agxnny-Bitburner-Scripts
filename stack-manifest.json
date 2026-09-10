@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "versionFile": "/VERSION.txt",
+  "files": [
+    "/core/config.js",
+    "/core/contracts.js",
+    "/core/state.js"
+  ],
+  "persistent": []
+}
