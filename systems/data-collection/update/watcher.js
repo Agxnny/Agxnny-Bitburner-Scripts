@@ -43,8 +43,9 @@ export async function checkForUpdates(ns) {
     });
   }
 
+  const manifestUrl = `${REPOSITORY.manifestUrl}${REPOSITORY.manifestUrl.includes("?") ? "&" : "?"}bb=${checkedAt}`;
   const downloaded = await ns.wget(
-    REPOSITORY.manifestUrl,
+    manifestUrl,
     PATHS.remoteManifestTemp,
     "home",
   );
