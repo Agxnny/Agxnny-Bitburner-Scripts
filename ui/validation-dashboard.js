@@ -1,5 +1,6 @@
 import { PATHS, FRESHNESS_MS } from "/core/config.js";
 import { classifyFreshness, readJson } from "/core/state.js";
+import { formatMoney, formatRam } from "/ui/format.js";
 
 export async function main(ns) {
   const flags = ns.flags([["interval", 1000]]);
@@ -79,7 +80,7 @@ function ActiveView({ h, s }) {
       h(MetricCard, { h, title: "Home RAM", value: ramPair(r?.home), meta: freshnessMeta(s.resources) }),
       h(MetricCard, { h, title: "Remote RAM", value: ramPair(r?.remote), meta: `${r?.remote?.processCount ?? 0} processes` }),
       h(MetricCard, { h, title: "Total RAM Pool", value: ramPair(r?.total), meta: `${r?.usableRamHostCount ?? 0} RAM hosts` }),
-      h(MetricCard, { h, title: "Player Money", value: money(p?.money), meta: `Hack ${p?.skills?.hacking ?? "—"}` }),
+      h(MetricCard, { h, title: "Player Money", value: formatMoney(p?.money), meta: `Hack ${p?.skills?.hacking ?? "—"}` }),
       h(MetricCard, { h, title: "RAM Audit", value: a?.status ?? "NO DATA", meta: `${a?.scriptCount ?? 0} entrypoints` }),
       h(MetricCard, { h, title: "Repository", value: u?.status ?? "NO DATA", meta: revisionMeta(u) }),
     ),
@@ -141,7 +142,7 @@ function HostTable({ h, hosts }) {
   return h("div", null,
     h(TableHeader, { h, cols: ["Host", "Used", "Free", "Total", "Procs"] }),
     ...rows.map((x) => h("div", { key: x.hostname, style: tableRowStyle },
-      cell(h, x.hostname, 2), cell(h, ram(x.usedRam)), cell(h, ram(x.freeRam)), cell(h, ram(x.maxRam)), cell(h, x.processCount),
+      cell(h, x.hostname, 2), cell(h, formatRam(x.usedRam)), cell(h, formatRam(x.freeRam)), cell(h, formatRam(x.maxRam)), cell(h, x.processCount),
     )),
   );
 }
@@ -152,7 +153,7 @@ function ProcessTable({ h, hosts }) {
   return h("div", null,
     h(TableHeader, { h, cols: ["Host", "Script", "Threads", "RAM"] }),
     ...rows.map((x) => h("div", { key: `${x.host}-${x.pid}`, style: tableRowStyle },
-      cell(h, x.host), cell(h, x.filename, 3), cell(h, x.threads), cell(h, ram(x.ramUsed)),
+      cell(h, x.host), cell(h, x.filename, 3), cell(h, x.threads), cell(h, formatRam(x.ramUsed)),
     )),
   );
 }
@@ -179,9 +180,7 @@ function overallHealth(s) {
   if (states.some((x) => x.freshness === "STALE")) return "DEGRADED";
   return "UNTESTED";
 }
-function ramPair(x) { return x ? `${ram(x.usedRam)} / ${ram(x.maxRam)}` : "NO DATA"; }
-function ram(v) { return `${Number(v || 0).toFixed(1)} GB`; }
-function money(v) { return Number.isFinite(v) ? `$${Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "NO DATA"; }
+function ramPair(x) { return x ? `${formatRam(x.usedRam)} / ${formatRam(x.maxRam)}` : "NO DATA"; }
 function age(ms) { return Number.isFinite(ms) ? `${(ms / 1000).toFixed(1)}s` : "—"; }
 function freshnessMeta(x) { return `${x.freshness} · ${age(x.ageMs)}`; }
 function revisionMeta(u) { return u?.remote?.revisionId ?? u?.target?.revisionId ?? u?.revisionId ?? "—"; }
