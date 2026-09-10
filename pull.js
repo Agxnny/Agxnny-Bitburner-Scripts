@@ -2,6 +2,9 @@ const RAW_BASE = "https://raw.githubusercontent.com/Agxnny/Agxnny-Bitburner-Scri
 const MANIFEST_URL = `${RAW_BASE}/stack-manifest.json`;
 const REMOTE_MANIFEST = "/data/state/remote-stack-manifest.json";
 const INSTALLED_STATE = "/data/state/installed-revision.json";
+const PULL_PATH = "/pull.js";
+const STAGED_PULL = "/data/state/pull.next.js";
+const HANDOFF_PATH = "/pull-handoff.js";
 
 export async function main(ns) {
   const flags = ns.flags([
@@ -41,19 +44,33 @@ export async function main(ns) {
   const plan = buildPlan(ns, installed, target, Boolean(flags.repair));
   printPlan(ns, relation, target, plan);
 
+  if (ns.fileExists(STAGED_PULL, "home")) ns.rm(STAGED_PULL, "home");
+
   const failures = [];
+  let pullerStaged = false;
+
   for (const file of plan.fetch) {
     const url = `${RAW_BASE}${file.path}`;
-    const downloaded = await ns.wget(url, file.path, "home");
+    const destination = file.path === PULL_PATH ? STAGED_PULL : file.path;
+    const downloaded = await ns.wget(url, destination, "home");
     if (!downloaded) failures.push(file.path);
+    if (downloaded && file.path === PULL_PATH) pullerStaged = true;
   }
 
   for (const path of plan.remove) {
+    if (path === PULL_PATH || path === HANDOFF_PATH) {
+      failures.push(path);
+      continue;
+    }
     if (ns.fileExists(path, "home") && !ns.rm(path, "home")) failures.push(path);
   }
 
   for (const file of target.files) {
-    if (file.required && !ns.fileExists(file.path, "home")) failures.push(file.path);
+    if (!file.required) continue;
+    const present = file.path === PULL_PATH && pullerStaged
+      ? ns.fileExists(STAGED_PULL, "home")
+      : ns.fileExists(file.path, "home");
+    if (!present) failures.push(file.path);
   }
 
   const uniqueFailures = [...new Set(failures)];
@@ -64,17 +81,47 @@ export async function main(ns) {
     return;
   }
 
+  const result = relation === "SAME_REVISION_REPULL"
+    ? "REPAIR_COMPLETE"
+    : installed
+      ? "UPDATE_COMPLETE"
+      : "FRESH_INSTALL_COMPLETE";
+
   const record = {
     installedAt: Date.now(),
     releaseVersion: target.releaseVersion,
     revisionSequence: target.revisionSequence,
     revisionId: target.revisionId,
+    outcome: result,
     manifest: target,
   };
-  ns.write(INSTALLED_STATE, JSON.stringify(record, null, 2), "w");
 
-  const result = relation === "SAME_REVISION_REPULL" ? "REPAIR_COMPLETE" :
-    installed ? "UPDATE_COMPLETE" : "FRESH_INSTALL_COMPLETE";
+  if (pullerStaged) {
+    if (!ns.fileExists(HANDOFF_PATH, "home")) {
+      return fail(ns, `Self-update required but ${HANDOFF_PATH} is missing`);
+    }
+
+    ns.tprint(`HANDOFF_REQUIRED: staged replacement for ${PULL_PATH}.`);
+    const handoffPid = ns.exec(
+      HANDOFF_PATH,
+      "home",
+      1,
+      "--old-pid", ns.pid,
+      "--staged", STAGED_PULL,
+      "--target", PULL_PATH,
+      "--installed-state", INSTALLED_STATE,
+      "--record", JSON.stringify(record),
+    );
+
+    if (handoffPid === 0) {
+      return fail(ns, "Could not start pull self-update handoff helper");
+    }
+
+    ns.tprint(`Handoff helper started as PID ${handoffPid}; pull.js will now exit so it can be replaced.`);
+    return;
+  }
+
+  ns.write(INSTALLED_STATE, JSON.stringify(record, null, 2), "w");
   ns.tprint(`${result}: ${target.releaseVersion} / ${target.revisionId}`);
   ns.tprint(`Fetched ${plan.fetch.length}, unchanged ${plan.unchanged.length}, removed ${plan.remove.length}.`);
 }
