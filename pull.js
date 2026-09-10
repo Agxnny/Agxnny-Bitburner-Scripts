@@ -15,6 +15,7 @@ export async function main(ns) {
   const target = readJson(ns, REMOTE_MANIFEST);
   const validation = validateManifest(target);
   if (!validation.valid) return fail(ns, `Remote manifest invalid: ${validation.errors.join("; ")}`);
+
   const installedRecord = readJson(ns, INSTALLED_STATE);
   const installed = installedRecord?.manifest ?? null;
   const relation = compareRevision(installed, target);
@@ -30,24 +31,18 @@ export async function main(ns) {
   const plan = buildPlan(ns, installed, target, Boolean(flags.repair));
   printPlan(ns, relation, target, plan);
 
+  closeAllHomeTails(ns);
+
   const persistent = new Set((target.persistent ?? []).map(canonicalPath));
-  const persistentRuntime = snapshotPersistentRuntime(ns, persistent);
-  closeAllTails(ns);
+  const workers = new Set((target.runtimeEntries ?? []).filter((entry) => entry.worker === true).map((entry) => canonicalPath(entry.path)));
 
-  // Deterministic update boundary: kill every home process except this puller.
-  // Persistent processes are restored after the update; everything else stays stopped.
-  const beforeKill = ns.ps("home").filter((p) => p.pid !== ns.pid);
-  if (beforeKill.length > 0) {
-    ns.tprint(`Stopping ${beforeKill.length} home script process(es) before update...`);
-    ns.killall("home", true);
-    await ns.sleep(50);
-  }
+  const homeShutdown = await stopHomeNonPersistent(ns, persistent);
+  const remoteShutdown = await stopRemoteWorkers(ns, workers);
 
-  const survivors = ns.ps("home").filter((p) => p.pid !== ns.pid);
-  if (survivors.length > 0) {
-    ns.tprint("ALARM UPDATE_ABORTED: scripts survived the pre-update kill boundary:");
-    for (const p of survivors) ns.tprint(`  SURVIVOR ${p.filename} pid=${p.pid}`);
-    restartPersistent(ns, persistentRuntime);
+  if (!homeShutdown.ok || !remoteShutdown.ok) {
+    ns.tprint("ALARM UPDATE_ABORTED: shutdown boundary did not complete.");
+    for (const p of homeShutdown.survivors) ns.tprint(`  HOME SURVIVOR ${p.filename} pid=${p.pid}`);
+    for (const p of remoteShutdown.survivors) ns.tprint(`  REMOTE WORKER SURVIVOR ${p.host} ${p.filename} pid=${p.pid}`);
     return;
   }
 
@@ -77,7 +72,7 @@ export async function main(ns) {
   if (uniqueFailures.length) {
     ns.tprint("ALARM UPDATE_FAILED: required target revision was not installed completely.");
     for (const path of uniqueFailures) ns.tprint(`  FAILED ${path}`);
-    restartPersistent(ns, persistentRuntime);
+    ns.tprint("Persistent scripts were left alone; stopped non-persistent and worker scripts remain stopped.");
     return;
   }
 
@@ -85,51 +80,86 @@ export async function main(ns) {
   const record = { installedAt: Date.now(), releaseVersion: target.releaseVersion, revisionSequence: target.revisionSequence, revisionId: target.revisionId, outcome: result, manifest: target };
 
   if (pullerStaged) {
-    if (!ns.fileExists(HANDOFF_PATH, "home")) { restartPersistent(ns, persistentRuntime); return fail(ns, `Self-update required but ${HANDOFF_PATH} is missing`); }
+    if (!ns.fileExists(HANDOFF_PATH, "home")) return fail(ns, `Self-update required but ${HANDOFF_PATH} is missing`);
     const handoffPid = ns.exec(HANDOFF_PATH, "home", 1,
       "--old-pid", ns.pid,
       "--staged", STAGED_PULL,
       "--target", PULL_PATH,
       "--installed-state", INSTALLED_STATE,
       "--record", JSON.stringify(record),
-      "--runtime", JSON.stringify(persistentRuntime),
+      "--runtime", "[]",
     );
-    if (handoffPid === 0) { restartPersistent(ns, persistentRuntime); return fail(ns, "Could not start pull self-update handoff helper"); }
+    if (handoffPid === 0) return fail(ns, "Could not start pull self-update handoff helper");
     ns.tprint(`Handoff helper started as PID ${handoffPid}; pull.js will now exit.`);
     return;
   }
 
   ns.write(INSTALLED_STATE, JSON.stringify(record, null, 2), "w");
-  restartPersistent(ns, persistentRuntime);
   ns.tprint(`${result}: ${target.releaseVersion} / ${target.revisionId}`);
-  ns.tprint("Pull complete. Only previously-running persistent scripts were restarted; all other home scripts remain stopped.");
+  ns.tprint("Pull complete. Manifest-persistent home scripts were left running; all other home scripts and all manifest worker scripts on remote hosts remain stopped.");
 }
 
-function snapshotPersistentRuntime(ns, persistent) {
+async function stopHomeNonPersistent(ns, persistent) {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const candidates = ns.ps("home").filter((p) => p.pid !== ns.pid && !persistent.has(canonicalPath(p.filename)));
+    if (candidates.length === 0) return { ok: true, survivors: [] };
+    for (const p of candidates) {
+      ns.tprint(`  STOP HOME ${p.filename} pid=${p.pid}`);
+      ns.kill(p.pid);
+    }
+    await ns.sleep(100);
+  }
+  const survivors = ns.ps("home").filter((p) => p.pid !== ns.pid && !persistent.has(canonicalPath(p.filename)));
+  return { ok: survivors.length === 0, survivors };
+}
+
+async function stopRemoteWorkers(ns, workers) {
+  if (workers.size === 0) return { ok: true, survivors: [] };
+  const hosts = discoverNetwork(ns).filter((host) => host !== "home");
+
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const candidates = collectRemoteWorkers(ns, hosts, workers);
+    if (candidates.length === 0) return { ok: true, survivors: [] };
+    for (const p of candidates) {
+      ns.tprint(`  STOP WORKER ${p.host} ${p.filename} pid=${p.pid}`);
+      ns.kill(p.pid, p.host);
+    }
+    await ns.sleep(100);
+  }
+
+  const survivors = collectRemoteWorkers(ns, hosts, workers);
+  return { ok: survivors.length === 0, survivors };
+}
+
+function collectRemoteWorkers(ns, hosts, workers) {
   const result = [];
-  for (const p of ns.ps("home")) {
-    if (p.pid === ns.pid || !persistent.has(canonicalPath(p.filename))) continue;
-    result.push({ pid: p.pid, filename: p.filename, threads: p.threads, args: p.args });
+  for (const host of hosts) {
+    for (const p of ns.ps(host)) {
+      if (workers.has(canonicalPath(p.filename))) result.push({ host, ...p });
+    }
   }
   return result;
 }
 
-function closeAllTails(ns) {
+function discoverNetwork(ns) {
+  const seen = new Set(["home"]);
+  const queue = ["home"];
+  for (let i = 0; i < queue.length; i += 1) {
+    for (const next of ns.scan(queue[i])) {
+      if (seen.has(next)) continue;
+      seen.add(next);
+      queue.push(next);
+    }
+  }
+  return queue;
+}
+
+function closeAllHomeTails(ns) {
   for (const p of ns.ps("home")) {
     if (p.pid === ns.pid) continue;
     const running = ns.getRunningScript(p.pid, "home");
     if (!running?.tailProperties) continue;
     try { ns.ui.closeTail(p.pid); } catch {}
-  }
-}
-
-function restartPersistent(ns, runtime) {
-  for (const p of runtime) {
-    if (ns.isRunning(p.pid, "home")) continue;
-    if (!ns.fileExists(p.filename, "home")) continue;
-    const pid = ns.exec(p.filename, "home", { threads: Number(p.threads) || 1 }, ...(p.args ?? []));
-    if (pid === 0) ns.tprint(`WARNING RESTART_FAILED: ${p.filename}`);
-    else ns.tprint(`  RESTART PERSISTENT ${p.filename} pid=${pid}`);
   }
 }
 
@@ -166,7 +196,10 @@ function validateManifest(m) {
   if (typeof m.revisionId !== "string" || !m.revisionId) errors.push("revisionId missing/invalid");
   if (typeof m.releaseVersion !== "string" || !m.releaseVersion) errors.push("releaseVersion missing/invalid");
   if (!Array.isArray(m.files)) errors.push("files missing/invalid");
-  else {
+  if (!Array.isArray(m.runtimeEntries)) errors.push("runtimeEntries missing/invalid");
+  if (!Array.isArray(m.removedFiles)) errors.push("removedFiles missing/invalid");
+  if (!Array.isArray(m.persistent)) errors.push("persistent missing/invalid");
+  if (Array.isArray(m.files)) {
     const seen = new Set();
     for (const file of m.files) {
       if (!file || typeof file.path !== "string" || !file.path.startsWith("/")) errors.push("invalid file path");
@@ -175,8 +208,6 @@ function validateManifest(m) {
       if (!Number.isInteger(file.fileVersion) || file.fileVersion < 1) errors.push(`invalid fileVersion ${file.path ?? "?"}`);
     }
   }
-  if (!Array.isArray(m.removedFiles)) errors.push("removedFiles missing/invalid");
-  if (!Array.isArray(m.persistent)) errors.push("persistent missing/invalid");
   return { valid: errors.length === 0, errors };
 }
 
