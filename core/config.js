@@ -10,6 +10,8 @@ export const PATHS = Object.freeze({
   telemetryRoot: "/data/telemetry",
   ramAudit: "/data/state/ram-audit.json",
   resourceState: "/data/state/resources.json",
+  serverState: "/data/state/servers.json",
+  playerState: "/data/state/player.json",
   updateState: "/data/state/update.json",
   updateValidationState: "/data/state/update-validation.json",
 });
@@ -26,16 +28,12 @@ export const STATE_SCHEMA_VERSION = 1;
 export const TELEMETRY_SCHEMA_VERSION = 1;
 export const MESSAGE_SCHEMA_VERSION = 1;
 
-// Freshness thresholds are intentionally broad defaults. Individual consumers
-// may enforce stricter requirements when correctness depends on newer data.
 export const FRESHNESS_MS = Object.freeze({
   fast: 5_000,
   medium: 30_000,
   slow: 300_000,
 });
 
-// Keep telemetry bounded. This is a safety ceiling, not a promise that every
-// system retains this many records.
 export const TELEMETRY = Object.freeze({
   maxEventsPerStream: 250,
 });
