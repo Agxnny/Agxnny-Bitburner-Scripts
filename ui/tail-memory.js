@@ -11,11 +11,11 @@ export async function main(ns) {
 
   while (true) {
     const manifest = readJson(ns, MANIFEST_PATH, null);
-    const managed = new Set((manifest?.runtimeEntries ?? []).map((entry) => entry.path));
+    const managed = new Set((manifest?.runtimeEntries ?? []).map((entry) => canonicalPath(entry.path)));
     let changed = false;
 
     for (const process of ns.ps("home")) {
-      if (!managed.has(process.filename) || process.pid === ns.pid) continue;
+      if (!managed.has(canonicalPath(process.filename)) || process.pid === ns.pid) continue;
       const running = ns.getRunningScript(process.pid, "home");
       const tail = running?.tailProperties ?? null;
       if (!tail) continue;
@@ -31,6 +31,11 @@ export async function main(ns) {
     if (changed) ns.write(STATE_PATH, JSON.stringify(layout, null, 2), "w");
     await ns.sleep(Math.max(100, Number(flags.interval) || DEFAULT_INTERVAL_MS));
   }
+}
+
+function canonicalPath(path) {
+  const value = String(path ?? "").trim();
+  return value.startsWith("/") ? value : `/${value}`;
 }
 
 function sameGeometry(a, b) {
