@@ -2,9 +2,34 @@
   "schemaVersion": 1,
   "versionFile": "/VERSION.txt",
   "files": [
+    "/VERSION.txt",
+    "/stack-manifest.json",
     "/core/config.js",
     "/core/contracts.js",
-    "/core/state.js"
+    "/core/state.js",
+    "/systems/data-collection/network.js",
+    "/systems/data-collection/resource-collector.js",
+    "/systems/ram-audit/audit.js"
   ],
-  "persistent": []
+  "runtimeEntries": [
+    {
+      "path": "/systems/data-collection/resource-collector.js",
+      "role": "collector",
+      "mode": "shared",
+      "lifecycle": "persistent",
+      "required": true,
+      "worker": false
+    },
+    {
+      "path": "/systems/ram-audit/audit.js",
+      "role": "audit",
+      "mode": "shared",
+      "lifecycle": "transient",
+      "required": true,
+      "worker": false
+    }
+  ],
+  "persistent": [
+    "/systems/data-collection/resource-collector.js"
+  ]
 }
