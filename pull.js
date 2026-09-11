@@ -6,12 +6,6 @@ const PULL_PATH = "/pull.js";
 const STAGED_PULL = "/data/state/pull.next.js";
 const HANDOFF_PATH = "/pull-handoff.js";
 
-const TERMINAL_ALIASES = [
-  ["teststart", "run /validation/start.js"], ["tests", "run /validation/active-tests.js"],
-  ["health", "run /validation/script-health.js"], ["ramaudit", "run /systems/ram-audit/audit.js"],
-  ["update", "run /pull.js"], ["repair", "run /pull.js --repair"],
-];
-
 export async function main(ns) {
   const flags = ns.flags([["repair", false], ["force", false]]);
   ns.tprint("Fetching remote stack manifest...");
@@ -20,7 +14,7 @@ export async function main(ns) {
   if (!validation.valid) return fail(ns, `Remote manifest invalid: ${validation.errors.join("; ")}`);
   const installedRecord = readJson(ns, INSTALLED_STATE), installed = installedRecord?.manifest ?? null;
   const relation = compareRevision(installed, target);
-  if (relation === "SAME_REVISION_REPULL" && !flags.repair && !flags.force) { installAliases(ns, target); ns.tprint(`ALARM SAME_REVISION_REPULL: ${target.revisionId} is already installed.`); ns.tprint("Use --repair only to restore missing/corrupt managed files at the same revision."); return; }
+  if (relation === "SAME_REVISION_REPULL" && !flags.repair && !flags.force) { ns.tprint(`ALARM SAME_REVISION_REPULL: ${target.revisionId} is already installed.`); ns.tprint("Use --repair only to restore missing/corrupt managed files at the same revision."); return; }
   if (relation === "OLDER_REVISION_DETECTED" && !flags.force) return fail(ns, `OLDER_REVISION_DETECTED installed=${installed?.revisionId ?? "unknown"}, target=${target.revisionId}`);
   if (relation === "REVISION_MISMATCH" && !flags.force) return fail(ns, "REVISION_MISMATCH: equal revisionSequence but different revisionId");
 
@@ -31,8 +25,6 @@ export async function main(ns) {
   printPlan(ns, relation, target, plan, changedPersistent);
   closeAllHomeTails(ns);
 
-  // Unchanged persistent services stay alive. Changed persistent services are deliberately
-  // recycled so the newly downloaded code actually becomes the running service.
   const persistentRestart = await stopChangedPersistent(ns, changedPersistent);
   const workers = new Set((target.runtimeEntries ?? []).filter((e) => e.worker === true).map((e) => canonicalPath(e.path)));
   const homeShutdown = await stopHomeNonPersistent(ns, persistent), remoteShutdown = await stopRemoteWorkers(ns, workers);
@@ -52,7 +44,6 @@ export async function main(ns) {
   const uniqueFailures = [...new Set(failures)];
   if (uniqueFailures.length) { ns.tprint("ALARM UPDATE_FAILED: required target revision was not installed completely."); for (const path of uniqueFailures) ns.tprint(`  FAILED ${path}`); ns.tprint("Changed persistent services remain stopped because the target revision did not validate."); return; }
 
-  installAliases(ns, target);
   const result = relation === "SAME_REVISION_REPULL" ? "REPAIR_COMPLETE" : installed ? "UPDATE_COMPLETE" : "FRESH_INSTALL_COMPLETE";
   const record = { installedAt: Date.now(), releaseVersion: target.releaseVersion, revisionSequence: target.revisionSequence, revisionId: target.revisionId, outcome: result, manifest: target };
   if (pullerStaged) {
@@ -70,7 +61,6 @@ export async function main(ns) {
 function snapshotPersistentRuntime(ns, changed) { const result=[]; for (const p of ns.ps("home")) if (changed.has(canonicalPath(p.filename))) result.push({ filename: canonicalPath(p.filename), threads:p.threads, args:p.args ?? [] }); return result; }
 async function stopChangedPersistent(ns, changed) { if (!changed.size) return {ok:true,survivors:[]}; for(let attempt=1;attempt<=5;attempt++){const c=ns.ps("home").filter(p=>p.pid!==ns.pid&&changed.has(canonicalPath(p.filename))); if(!c.length)return {ok:true,survivors:[]}; for(const p of c){ns.tprint(`  RESTART PERSISTENT ${p.filename} pid=${p.pid}`);ns.kill(p.pid);} await ns.sleep(100);} const survivors=ns.ps("home").filter(p=>p.pid!==ns.pid&&changed.has(canonicalPath(p.filename))); return {ok:!survivors.length,survivors}; }
 function restartRuntime(ns,runtime){for(const p of runtime){const pid=ns.exec(p.filename,"home",{threads:Number(p.threads)||1},...(p.args??[])); if(pid===0)ns.tprint(`WARNING PERSISTENT_RESTART_FAILED: ${p.filename}`); else ns.tprint(`  RESTARTED PERSISTENT ${p.filename} pid=${pid}`);}}
-function installAliases(ns,target){const aliases=[...TERMINAL_ALIASES];if((target.files??[]).some(f=>canonicalPath(f.path)==="/start.js"))aliases.unshift(["start","run /start.js"]);for(const[name,sub]of aliases){try{ns.ui.alias(name,sub,true);}catch(e){ns.tprint(`WARNING ALIAS_FAILED ${name}: ${String(e)}`);}}ns.tprint(`Aliases ready: ${aliases.map(([n])=>n).join(", ")}`);}
 async function stopHomeNonPersistent(ns,persistent){for(let a=1;a<=5;a++){const c=ns.ps("home").filter(p=>p.pid!==ns.pid&&!persistent.has(canonicalPath(p.filename)));if(!c.length)return{ok:true,survivors:[]};for(const p of c){ns.tprint(`  STOP HOME ${p.filename} pid=${p.pid}`);ns.kill(p.pid);}await ns.sleep(100);}const s=ns.ps("home").filter(p=>p.pid!==ns.pid&&!persistent.has(canonicalPath(p.filename)));return{ok:!s.length,survivors:s};}
 async function stopRemoteWorkers(ns,workers){if(!workers.size)return{ok:true,survivors:[]};const hosts=discoverNetwork(ns).filter(h=>h!=="home");for(let a=1;a<=5;a++){const c=collectRemoteWorkers(ns,hosts,workers);if(!c.length)return{ok:true,survivors:[]};for(const p of c){ns.tprint(`  STOP WORKER ${p.host} ${p.filename} pid=${p.pid}`);ns.kill(p.pid,p.host);}await ns.sleep(100);}const s=collectRemoteWorkers(ns,hosts,workers);return{ok:!s.length,survivors:s};}
 function collectRemoteWorkers(ns,hosts,workers){const r=[];for(const h of hosts)for(const p of ns.ps(h))if(workers.has(canonicalPath(p.filename)))r.push({host:h,...p});return r;}
